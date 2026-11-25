@@ -802,6 +802,8 @@ public class GameTracker
     private string originalPlaybackId = null;
     private string originalCaptureId = null;
     private bool switchedAudio = false;
+    private string lastFiredPlayerMissile = "";
+    private Dictionary<string, string> targetIdToMissile = new Dictionary<string, string>();
 
     public void Start()
     {
@@ -907,6 +909,8 @@ public class GameTracker
         string myNickEsc = "";
         string currentAircraft = "В ангаре / Меню";
         string currentCallsign = "В ангаре / Меню";
+        string currentMission = "";
+        string currentCrewRole = "";
         int kills = 0;
         bool inSortie = false;
         DateTime sortieStart = DateTime.Now;
@@ -1085,28 +1089,66 @@ public class GameTracker
                                     }
                                 }
 
+                                // 1.5. Определяем название загруженной миссии или карты из Player.log
+                                Match mScen = Regex.Match(chunk, @"(?:Loading campaign mission|Loading workshop scenario|Starting mission|Selected scenario|Scenario name)[:\s]+(?<val>[^\r\n\(\[]+)", RegexOptions.IgnoreCase);
+                                if (mScen.Success)
+                                {
+                                    string sc = mScen.Groups["val"].Value.Trim().Trim('"', '\'', '.', ' ');
+                                    if (sc.Length > 2 && sc.Length < 60 &&
+                                        !Regex.IsMatch(sc, @"^(?:none|async|true|false|null|scene|level)$", RegexOptions.IgnoreCase))
+                                    {
+                                        currentMission = sc;
+                                        AppLogger.Log("TRACKER", "Обнаружена миссия/карта: " + currentMission);
+                                    }
+                                }
+
                                 // 2. Сброс при выходе из миссии (сингл или МП)
                                 if (inSortie && Regex.IsMatch(chunk, @"(?:PlayerSpawn destroyed\.|selectedSlot\s*=>\s*-1)", RegexOptions.IgnoreCase))
                                 {
-                                    WriteFlightLog("LANDED", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Завершение вылета / выход в брифинг");
+                                    string acWithRole = FormatAircraftWithRole(currentAircraft, currentCrewRole);
+                                    WriteFlightLog("LANDED", acWithRole, currentCallsign, GetDurStr(sortieStart), kills, "Завершение вылета / выход в брифинг");
                                     currentAircraft = "В ангаре / Меню";
                                     currentCallsign = "В ангаре / Меню";
+                                    currentMission = "";
+                                    currentCrewRole = "";
                                     inSortie = false;
                                     AppLogger.Log("TRACKER", "Вылет завершён (выход в брифинг / меню).");
                                 }
 
-                                // 3. Мультиплеер: занятие слота ("Setting up slot UI: Allied 22 (Mike 1-1) = shutze")
+                                // 3. Мультиплеер: занятие слота и определение роли в двухместном экипаже
                                 if (!string.IsNullOrEmpty(myNickEsc))
                                 {
-                                    MatchCollection slotMatches = Regex.Matches(chunk, @"Setting up slot UI:[^\r\n]*?\((?<val>[^)]+)\)\s*=\s*" + myNickEsc + @"\b", RegexOptions.IgnoreCase);
+                                    MatchCollection slotMatches = Regex.Matches(chunk, @"Setting up slot UI:(?<line>[^\r\n]*?\((?<val>[^)]+)\)[^\r\n]*?=\s*" + myNickEsc + @"\b[^\r\n]*)", RegexOptions.IgnoreCase);
                                     if (slotMatches.Count > 0)
                                     {
-                                        string lastCs = slotMatches[slotMatches.Count - 1].Groups["val"].Value.Trim();
+                                        Match lastSlot = slotMatches[slotMatches.Count - 1];
+                                        string lastCs = lastSlot.Groups["val"].Value.Trim();
+                                        string slotLine = lastSlot.Groups["line"].Value;
                                         SettingsManager.Set("LastSlotCallsign", lastCs);
+
+                                        bool isSecondSeat = Regex.IsMatch(slotLine, @"\b(?:Gunner|Copilot|Co-Pilot|EWO|WSO|BackSeat|Rear|Seat\s*1|Seat\s*2|\[1\])\b", RegexOptions.IgnoreCase);
+                                        SettingsManager.Set("LastSlotSecondSeat", isSecondSeat ? "true" : "false");
+
                                         if (inSortie)
+                                        {
                                             currentCallsign = lastCs;
+                                            currentCrewRole = ResolveCrewRole(currentAircraft, isSecondSeat);
+                                        }
+                                    }
+
+                                    // Дополнительная проверка при непосредственной посадке игрока в кабину (МП)
+                                    Match mSeat = Regex.Match(chunk, @"(?:Seat|SetOccupant|EnterVehicle)[^\r\n]*" + myNickEsc + @"[^\r\n]*?(?:seat(?:Idx)?\s*[=:]\s*(?<idx>\d+)|(?<role>Gunner|Copilot|EWO|WSO|BackSeat|Pilot))", RegexOptions.IgnoreCase);
+                                    if (mSeat.Success)
+                                    {
+                                        bool isBack = false;
+                                        if (mSeat.Groups["idx"].Success && mSeat.Groups["idx"].Value != "0") isBack = true;
+                                        if (mSeat.Groups["role"].Success && !mSeat.Groups["role"].Value.Equals("Pilot", StringComparison.OrdinalIgnoreCase)) isBack = true;
+                                        SettingsManager.Set("LastSlotSecondSeat", isBack ? "true" : "false");
+                                        if (inSortie)
+                                            currentCrewRole = ResolveCrewRole(currentAircraft, isBack);
                                     }
                                 }
+
 
                                 // 4. Старт реального вылета:
                                 // В мультиплеере: "shutze has spawned" или "FlightLogger: shutze has spawned"
@@ -1129,56 +1171,105 @@ public class GameTracker
                                         ? SettingsManager.Get("LastSlotCallsign", "В полёте")
                                         : "Одиночный вылет";
 
-                                    if (!inSortie || currentAircraft != veh || currentCallsign != cs)
+                                    bool isSecondSeat = mpSpawned && SettingsManager.GetBool("LastSlotSecondSeat", false);
+                                    string role = ResolveCrewRole(veh, isSecondSeat);
+
+                                    if (!inSortie || currentAircraft != veh || currentCallsign != cs || currentCrewRole != role)
                                     {
                                         currentAircraft = veh;
                                         currentCallsign = cs;
+                                        currentCrewRole = role;
                                         inSortie = true;
                                         sortieStart = DateTime.Now;
-                                        AppLogger.Log("TRACKER", string.Format("Старт вылета ({0}): Борт={1}, Позывной={2}", mpSpawned ? "MP" : "SP", currentAircraft, currentCallsign));
-                                        WriteFlightLog("SORTIE", currentAircraft, currentCallsign, "00:00", 0, mpSpawned ? "Вылет (мультиплеер)" : "Вылет (одиночная миссия)");
+                                        string acDisplay = FormatAircraftWithRole(currentAircraft, currentCrewRole);
+                                        AppLogger.Log("TRACKER", string.Format("Старт вылета ({0}): Борт={1}, Позывной={2}", mpSpawned ? "MP" : "SP", acDisplay, currentCallsign));
+                                        WriteFlightLog("SORTIE", acDisplay, currentCallsign, "00:00", 0, mpSpawned ? "Вылет (мультиплеер)" : "Вылет (одиночная миссия)");
                                     }
                                 }
 
 
-                                // 5. Сбитые цели (актуальный формат VTOL VR: "FlightLogger: <Target> was killed by F-45A (shutze).")
+                                // 5. Боевая телеметрия: пуски ракет, захваты целей и подтверждённые сбития
                                 if (!string.IsNullOrEmpty(myNickEsc))
                                 {
+                                    // 5а. Фиксируем пуск ракеты игроком ("Starting missile info for AIM-120C(101) by Player [0] (shutze)")
+                                    MatchCollection mcLaunch = Regex.Matches(
+                                        chunk,
+                                        @"Starting missile info for\s+(?<msl>[^\r\n\(\[]+)(?:\(\d+\))?\s+by\s+[^\r\n]*?\(" + myNickEsc + @"\)",
+                                        RegexOptions.IgnoreCase
+                                    );
+                                    foreach (Match ml in mcLaunch)
+                                    {
+                                        string mslName = ml.Groups["msl"].Value.Trim();
+                                        if (!string.IsNullOrEmpty(mslName))
+                                        {
+                                            lastFiredPlayerMissile = mslName;
+                                            RecordWeaponStat(mslName, 1, 0);
+                                        }
+                                    }
+
+                                    // 5б. Связываем ракету с ID захваченной цели ("AIM-120 (shutze) acquired radar target: ASF-30 [11] (ASF-30)")
+                                    MatchCollection mcLock = Regex.Matches(
+                                        chunk,
+                                        @"(?<msl>[A-Za-z0-9\-]+)\s*\(" + myNickEsc + @"\)\s+acquired\s+(?:radar\s+|optical\s+|heat\s+)?target:\s*[^\r\n\[]+\[(?<tid>\d+)\]",
+                                        RegexOptions.IgnoreCase
+                                    );
+                                    foreach (Match mLock in mcLock)
+                                    {
+                                        string tid = mLock.Groups["tid"].Value;
+                                        string lockMsl = mLock.Groups["msl"].Value.Trim();
+                                        // Если точное имя с модификацией (например AIM-120C) совпадает по базе с AIM-120 — берём полное имя
+                                        if (!string.IsNullOrEmpty(lastFiredPlayerMissile) &&
+                                            lastFiredPlayerMissile.StartsWith(lockMsl, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            lockMsl = lastFiredPlayerMissile;
+                                        }
+                                        targetIdToMissile[tid] = lockMsl;
+                                    }
+
+                                    // 5в. Подтверждённые сбития ("FlightLogger: ASF-30 [13] (ASF-30) was killed by Player [0] (shutze). explosion")
                                     int newKills = 0;
                                     string lastTarget = "Цель";
+                                    string acDisplay = FormatAircraftWithRole(currentAircraft, currentCrewRole);
 
-                                    // Основной формат VTOL VR (исключаем самоубийство, когда цель = сам игрок)
                                     MatchCollection mcKill = Regex.Matches(
                                         chunk,
-                                        @"FlightLogger:\s*(?<target>[^\r\n]+?)\s+was killed by\s+[^\r\n]*?\(" + myNickEsc + @"\)",
+                                        @"FlightLogger:\s*(?<target>[^\r\n]+?)\s+was killed by\s+[^\r\n]*?\(" + myNickEsc + @"\)(?:\s+with\s+(?<weapon>[^\r\n\.]+))?",
                                         RegexOptions.IgnoreCase
                                     );
                                     foreach (Match mk in mcKill)
                                     {
-                                        string targetName = mk.Groups["target"].Value.Trim();
-                                        if (targetName.IndexOf("(" + myNick + ")", StringComparison.OrdinalIgnoreCase) >= 0)
-                                            continue; // пропускаем самоуничтожение
+                                        string rawTarget = mk.Groups["target"].Value.Trim();
+                                        if (rawTarget.IndexOf("(" + myNick + ")", StringComparison.OrdinalIgnoreCase) >= 0)
+                                            continue;
+
+                                        string targetName = CleanUnitDisplayName(rawTarget);
+                                        string weapon = mk.Groups["weapon"].Success ? CleanUnitDisplayName(mk.Groups["weapon"].Value) : "";
+
+                                        // Ищем ракету по ID цели [13] из словаря захватов
+                                        Match mTid = Regex.Match(rawTarget, @"\[(?<tid>\d+)\]");
+                                        if (string.IsNullOrEmpty(weapon) && mTid.Success)
+                                        {
+                                            string mappedMsl;
+                                            if (targetIdToMissile.TryGetValue(mTid.Groups["tid"].Value, out mappedMsl))
+                                            {
+                                                weapon = mappedMsl;
+                                                targetIdToMissile.Remove(mTid.Groups["tid"].Value);
+                                            }
+                                        }
+
+                                        if (!string.IsNullOrEmpty(weapon))
+                                            RecordWeaponStat(weapon, 0, 1);
+                                        else
+                                            RecordWeaponStat("Пушка / Неупр. АСП", 0, 1);
+
+                                        string killNote = string.IsNullOrEmpty(weapon)
+                                            ? ("Уничтожен: " + targetName)
+                                            : ("Уничтожен: " + targetName + "  |  Оружие: " + weapon);
 
                                         newKills++;
                                         lastTarget = targetName;
                                         kills++;
-                                        WriteFlightLog("KILL", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Сбит: " + lastTarget);
-                                    }
-
-                                    // Резервная проверка по пользовательским шаблонам из log_patterns.ini
-                                    if (newKills == 0)
-                                    {
-                                        foreach (string killTpl in patterns.KillTemplates)
-                                        {
-                                            string pat = killTpl.Replace("{NICK}", myNickEsc);
-                                            Match mLegacy = Regex.Match(chunk, pat, RegexOptions.IgnoreCase);
-                                            if (mLegacy.Success)
-                                            {
-                                                kills++;
-                                                WriteFlightLog("KILL", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Цель уничтожена");
-                                                break;
-                                            }
-                                        }
+                                        WriteFlightLog("KILL", acDisplay, currentCallsign, GetDurStr(sortieStart), kills, killNote);
                                     }
 
                                     if (newKills > 0)
@@ -1190,32 +1281,68 @@ public class GameTracker
                                 }
 
 
-                                // 6. Катапультирование / потеря борта (строго по нику текущего пилота)
+                                // 6. Катапультирование / гибель борта с точным указанием убийцы, оружия или причины крушения
                                 bool hit = false;
+                                string deathEventType = "KIA";
+                                string deathDetails = "Борт потерян";
+
                                 if (!string.IsNullOrEmpty(myNickEsc))
                                 {
-                                    foreach (string ejTpl in patterns.EjectTemplates)
+                                    // Вариант А: Сбит противником или ботом ("FlightLogger: F/A-26B (shutze) was killed by <Killer> with <Weapon>.")
+                                    Match mKilledBy = Regex.Match(
+                                        chunk,
+                                        @"FlightLogger:\s*[^\r\n]*?\(" + myNickEsc + @"\)[^\r\n]*?\bwas killed by\s+(?<killer>[^\r\n\.]+?)(?:\s+with\s+(?<weapon>[^\r\n\.]+))?(?:\.|$)",
+                                        RegexOptions.IgnoreCase
+                                    );
+                                    if (mKilledBy.Success)
                                     {
-                                        string pat = ejTpl.Replace("{NICK}", myNickEsc);
-                                        if (Regex.IsMatch(chunk, pat, RegexOptions.IgnoreCase)) { hit = true; break; }
+                                        hit = true;
+                                        deathEventType = "KIA";
+                                        string killer = CleanUnitDisplayName(mKilledBy.Groups["killer"].Value);
+                                        string weap = mKilledBy.Groups["weapon"].Success ? CleanUnitDisplayName(mKilledBy.Groups["weapon"].Value) : "";
+                                        deathDetails = string.IsNullOrEmpty(weap)
+                                            ? ("Сбит: " + killer)
+                                            : ("Сбит: " + killer + "  |  Оружие: " + weap);
                                     }
-                                    // Формат VTOL VR: "FlightLogger: F-45A (shutze) ejected." или "FlightLogger: F-45A (shutze) was killed."
-                                    if (!hit && Regex.IsMatch(chunk, @"FlightLogger:\s*[^\r\n]*?\(" + myNickEsc + @"\)[^\r\n]*?\b(?:ejected|was killed|died|crashed)\b", RegexOptions.IgnoreCase))
+
+                                    // Вариант Б: Катапультирование ("FlightLogger: F/A-26B (shutze) ejected.")
+                                    if (!hit && Regex.IsMatch(chunk, @"(?:FlightLogger:\s*[^\r\n]*?\(" + myNickEsc + @"\)|(?:\$|\b)" + myNickEsc + @"\$?)[^\r\n]*?\bejected\b", RegexOptions.IgnoreCase))
+                                    {
                                         hit = true;
-                                    // Резервный формат без FlightLogger: "$shutze$ ejected" или "shutze was killed"
-                                    if (!hit && Regex.IsMatch(chunk, @"(?:\$|\b)" + myNickEsc + @"\$?\s+(?:ejected|was killed|died|crashed)\b", RegexOptions.IgnoreCase))
+                                        deathEventType = "EJECT";
+                                        deathDetails = "Катапультирование пилота";
+                                    }
+
+                                    // Вариант В: Столкновение / крушение / самоуничтожение
+                                    if (!hit && Regex.IsMatch(chunk, @"(?:FlightLogger:\s*[^\r\n]*?\(" + myNickEsc + @"\)|(?:\$|\b)" + myNickEsc + @"\$?)[^\r\n]*?\b(?:was killed|died|crashed)\b", RegexOptions.IgnoreCase))
+                                    {
                                         hit = true;
+                                        deathEventType = "KIA";
+                                        if (chunk.IndexOf("crashed", StringComparison.OrdinalIgnoreCase) >= 0 || chunk.IndexOf("terrain", StringComparison.OrdinalIgnoreCase) >= 0)
+                                            deathDetails = "Столкновение с землёй / крушение";
+                                        else
+                                            deathDetails = "Борт уничтожен (авария / столкновение)";
+                                    }
+
+                                    if (!hit)
+                                    {
+                                        foreach (string ejTpl in patterns.EjectTemplates)
+                                        {
+                                            string pat = ejTpl.Replace("{NICK}", myNickEsc);
+                                            if (Regex.IsMatch(chunk, pat, RegexOptions.IgnoreCase)) { hit = true; break; }
+                                        }
+                                    }
                                 }
 
                                 if (hit)
                                 {
                                     KillSoundPlayer.ResetCombo();
-                                    string evType = chunk.IndexOf("ejected", StringComparison.OrdinalIgnoreCase) >= 0 ? "EJECT" : "KIA";
-                                    WriteFlightLog(evType, currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, evType == "EJECT" ? "Катапультирование" : "Борт сбит / потерян");
+                                    string acDisplay = FormatAircraftWithRole(currentAircraft, currentCrewRole);
+                                    WriteFlightLog(deathEventType, acDisplay, currentCallsign, GetDurStr(sortieStart), kills, deathDetails);
                                     currentAircraft = "В ангаре / Меню";
                                     currentCallsign = "В ангаре / Меню";
                                     inSortie = false;
-                                    AppLogger.Log("TRACKER", "Пилот " + myNick + " погиб/катапультировался (" + evType + ").");
+                                    AppLogger.Log("TRACKER", "Пилот " + myNick + " погиб/катапультировался (" + deathEventType + ").");
 
                                     if (SettingsManager.GetBool("Shuffle", true))
                                     {
@@ -1332,15 +1459,29 @@ public class GameTracker
                     if (pipe != null)
                     {
                         IsGameActive = true;
-                        ActiveFlightSummary = inSortie ? (currentAircraft + " (" + currentCallsign + ")") : "В ангаре / Меню";
+                        string acFullDisplay = FormatAircraftWithRole(currentAircraft, currentCrewRole);
+                        ActiveFlightSummary = inSortie ? (acFullDisplay + " (" + currentCallsign + ")") : "В ангаре / Меню";
                         if (!string.IsNullOrEmpty(myNick)) ActivePilotName = myNick;
-                        string det = "Борт: " + currentAircraft + (kills > 0 ? " | Сбито: " + kills : "");
-                        string st = "Позывной: " + currentCallsign;
+
+                        string det = inSortie
+                            ? ("Борт: " + acFullDisplay + (kills > 0 ? " | Сбито: " + kills : ""))
+                            : "В ангаре / Меню";
+
+                        string st = inSortie
+                            ? ("Позывной: " + currentCallsign + (!string.IsNullOrEmpty(currentMission) ? " | " + currentMission : ""))
+                            : (!string.IsNullOrEmpty(currentMission) ? "Брифинг: " + currentMission : "Ожидание вылета");
+
+                        string acAssetKey = GetAircraftAssetKey(currentAircraft);
+                        string assetsJson = string.IsNullOrEmpty(acAssetKey)
+                            ? "\"large_image\":\"vtol_logo\",\"large_text\":\"VTOL QoL by L.Shutze\""
+                            : "\"large_image\":\"vtol_logo\",\"large_text\":\"VTOL QoL by L.Shutze\",\"small_image\":\"" + acAssetKey + "\",\"small_text\":\"" + JsonEscape(currentAircraft) + "\"";
+
                         string json = "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + Process.GetCurrentProcess().Id +
                                       ",\"activity\":{\"details\":\"" + JsonEscape(det) +
                                       "\",\"state\":\"" + JsonEscape(st) +
                                       "\",\"timestamps\":{\"start\":" + startEpoch +
-                                      "},\"assets\":{\"large_image\":\"vtol_logo\",\"large_text\":\"VTOL QoL by L.Shutze\"}}},\"nonce\":\"" + Guid.NewGuid() + "\"}";
+                                      "},\"assets\":{" + assetsJson + "}}},\"nonce\":\"" + Guid.NewGuid() + "\"}";
+
                         try
                         {
                             SendPacket(pipe, 1, json);
@@ -1383,11 +1524,89 @@ public class GameTracker
             Thread.Sleep(2000);
         }
     }
+    private string ResolveCrewRole(string aircraft, bool isSecondSeat)
+    {
+        if (string.IsNullOrEmpty(aircraft)) return "";
+        string ac = aircraft.ToUpperInvariant();
+        if (ac == "AH-94") return isSecondSeat ? "Стрелок" : "Пилот";
+        if (ac == "EF-24G") return isSecondSeat ? "Оператор РЭБ" : "Пилот";
+        if (ac == "T-55") return isSecondSeat ? "Оператор Вооружения" : "Пилот";
+        return "";
+    }
 
+    private string FormatAircraftWithRole(string aircraft, string role)
+    {
+        if (string.IsNullOrEmpty(aircraft) || string.IsNullOrEmpty(role)) return aircraft;
+        return aircraft + " — " + role;
+    }
+
+    private string GetAircraftAssetKey(string aircraft)
+    {
+        if (string.IsNullOrEmpty(aircraft)) return "";
+        switch (aircraft.ToUpperInvariant())
+        {
+            case "FA-26B": return "fa26b";
+            case "F-45A": return "f45a";
+            case "AV-42C": return "av42c";
+            case "AH-94": return "ah94";
+            case "T-55": return "t55";
+            case "EF-24G": return "ef24g";
+            default: return "";
+        }
+    }
     private string GetDurStr(DateTime start)
     {
         TimeSpan span = DateTime.Now - start;
         return string.Format("{0:D2}:{1:D2}", (int)span.TotalMinutes, span.Seconds);
+    }
+
+    private string CleanUnitDisplayName(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        string s = Regex.Replace(raw, @"\s*\[\d+\]\s*\([^)]+\)", "");
+        s = Regex.Replace(s, @"\s*\[\d+\]", "");
+        return s.Trim().Trim('.', ' ');
+    }
+
+    private void RecordWeaponStat(string weaponName, int addFired, int addHits)
+    {
+        if (string.IsNullOrEmpty(weaponName)) return;
+        try
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL");
+            Directory.CreateDirectory(dir);
+            string path = Path.Combine(dir, "weapon_stats.ini");
+
+            Dictionary<string, int[]> stats = new Dictionary<string, int[]>(StringComparer.OrdinalIgnoreCase);
+            if (File.Exists(path))
+            {
+                foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
+                {
+                    string[] p = line.Split('|');
+                    if (p.Length >= 3)
+                    {
+                        int f, h;
+                        int.TryParse(p[1], out f);
+                        int.TryParse(p[2], out h);
+                        stats[p[0]] = new int[] { f, h };
+                    }
+                }
+            }
+
+            int[] cur;
+            if (!stats.TryGetValue(weaponName, out cur))
+                cur = new int[] { 0, 0 };
+
+            cur[0] += addFired;
+            cur[1] += addHits;
+            stats[weaponName] = cur;
+
+            List<string> outLines = new List<string>();
+            foreach (KeyValuePair<string, int[]> kv in stats)
+                outLines.Add(kv.Key + "|" + kv.Value[0] + "|" + kv.Value[1]);
+            File.WriteAllLines(path, outLines.ToArray(), Encoding.UTF8);
+        }
+        catch { }
     }
 }
 
@@ -1759,7 +1978,7 @@ public class LogDiagnosticsForm : Form
         btnClear.Click += (s, e) => { try { File.Delete(GetDiagPath()); } catch { } LoadDiag(); };
         this.Controls.Add(btnClear);
 
-        Button btnSave = new Button() { Text = "Сохранить и закрыть", Left = 585, Top = 478, Width = 140, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 140, 60), ForeColor = Color.White, DialogResult = DialogResult.OK };
+        Button btnSave = new Button() { Text = "Сохранить", Left = 585, Top = 478, Width = 140, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 140, 60), ForeColor = Color.White, DialogResult = DialogResult.OK };
         btnSave.Click += (s, e) => { SettingsManager.SetBool("DiagnosticsEnabled", chkEnabled.Checked); SettingsManager.Save(); };
         this.Controls.Add(btnSave);
 
@@ -2638,12 +2857,6 @@ public class FbxLightMarker
     public System.Windows.Media.Media3D.Point3D Position;
 }
 
-public class FbxLightMarker
-{
-    public string Kind; // "NavRed", "NavGreen", "NavWhite", "Strobe", "Landing"
-    public System.Windows.Media.Media3D.Point3D Position;
-}
-
 public class FbxMeshData
 {
     public FbxSubMesh Body = new FbxSubMesh();
@@ -2856,19 +3069,20 @@ public static class FbxLoader
                 if (!isEngineNozzle)
                 {
                     if (ContainsAny(selfName,
-                        "_damaged", "_dmg", "_destroyed", ".destroyed", "_broken",
+                        "_damaged", "_dmg", "_destroyed", ".destroyed", "_broken", "tailBroken", "brokenWing",
                         "LOD 1", "LOD 2", "LOD 3", "LOD 4", "LOD1", "LOD2", "LOD3", "LOD4",
-                        "LowPoly", "_lod", "GlassBreak", ".scratch", "_glare",
+                        "LowPoly", "_lod", "GlassBreak", ".scratch", "_glare", "hudGlare", "hudScratch",
                         "steamImg", "TailArt", "Collider", "Hitbox", "Trigger", "Shadow",
                         "Flame", "Afterburner", "ExhaustCone", "JetFlame", "NavLight", "Strobe", "LandingLight", "TaxiLight"))
                         continue;
 
                     if (ContainsAny(fullTag,
-                        "_damaged", "_dmg", "_destroyed", ".destroyed", "_broken",
+                        "_damaged", "_dmg", "_destroyed", ".destroyed", "_broken", "tailBroken", "brokenWing",
                         "dmg1", "dmg2", "dmg3", "dmg4", "Blurred",
-                        "sevtfLowPoly", "body_LOD2", "LOD 2", "LOD2", "LOD3",
+                        "sevtfLowPoly", "body_LOD2", "LOD 1", "LOD1", "LOD 2", "LOD2", "LOD3", "LowPoly",
                         "steamUserImage", "FlybyCam", "SpectatorCam", "Camcorder", "Remote", "BobblePilot",
-                        "[CameraRig]", "Camera (eye)", "Helmet", "hqh", "flesh", "headSphere", "hmdVisor", "tintVisor"))
+                        "[CameraRig]", "Camera (eye)", "Helmet", "hqh", "flesh", "headSphere", "hmdVisor", "tintVisor",
+                        "DashCanvasFront", "DashCanvasRear", "PassengerOnlyObjs", "LowerCenterDash"))
                         continue;
                 }
 
@@ -2903,9 +3117,11 @@ public static class FbxLoader
             }
             seenGeometrySignatures.Add(sig);
 
-            if (ContainsAny(fullTag, "T-55") && ContainsAny(fullTag, "flap", "wing", "body", "airbrake"))
-                AppLogger.Log("T55_OK", string.Format("Self='{0}', Verts={1}, UVs={2}, BBox=({3:F1},{4:F1},{5:F1})..({6:F1},{7:F1},{8:F1})",
-                    selfName.Trim(), part.RawVerts.Count, part.RawUVs.Count, minX, minY, minZ, maxX, maxY, maxZ));
+            if (ContainsAny(fullTag, "EF-24", "ef24", "ew"))
+                AppLogger.Log("EF24_PART", string.Format("Self='{0}' | Verts={1} | BBox=({2:F1},{3:F1},{4:F1})..({5:F1},{6:F1},{7:F1}) | Tag='{8}'",
+                    selfName.Trim(), part.RawVerts.Count, minX, minY, minZ, maxX, maxY, maxZ, fullTag.Trim()));
+
+
 
             FbxSubMesh targetSub = result.Body;
 
@@ -2918,13 +3134,13 @@ public static class FbxLoader
             {
                 targetSub = result.Glass;
             }
-            // 3. Сопла двигателей (vgEngineLowPoly, _engine), шасси (_ext2), интерьер кабины (_int, cockpitProps, acesSeat)
-            else if (part.RawUVs.Count == 0 || ContainsAny(fullTag,
-                "vgEngine", "mat_vgLowpoly", "_ext2", "_engine", "_int", "Interior", "cockpitProps", "NonUIDash", "DashCanvas", "Instruments",
+            // 3. Сопла двигателей (vgEngineLowPoly, _engine), стойки/колёса шасси (_ext2, landingGear), интерьер кабины (_int, cockpitProps, acesSeat)
+            else if (part.RawUVs.Count == 0 || (!ContainsAny(selfName, "gearDoor", "GearDoor", "centerRails", "sidePylons", "sideRails", "UnderRailNoseCone") && ContainsAny(fullTag,
+    "vgEngine", "mat_vgLowpoly", "_ext2", "_engine", "_int", "Interior", "cockpitProps", "NonUIDash", "DashCanvas", "Instruments",
                 "acesSeat", "EjectorSeat", "Seat", "Stick", "Throttle", "Pedal", "MFD", "Switch", "Button", "Knob", "Gauge",
                 "LandingGear", "landingGear", "FrontGear", "LeftGear", "RightGear", "Wheel", "Tire", "Tyre", "Strut", "Piston", "catHook",
                 "Nozzle", "gimbalFin", "Turbine", "Compressor", "liftFanCylinder", "liftFanPiston", "IntakeGuides",
-                "mat_tgp", "eyeHolder", "Pylon", "Rail", "Launcher", "Rack", "Hardpoint", "Missile", "Bomb", "tempMirror"))
+                "mat_tgp", "eyeHolder", "Pylon", "Rail", "Launcher", "Rack", "Hardpoint", "Missile", "Bomb", "tempMirror")))
             {
                 targetSub = result.Details;
             }
@@ -2977,15 +3193,23 @@ public static class FbxLoader
             // Исключаем повреждённые дубли, тумблеры в кабине (Switch, Interactable, DashCanvas)
             // и пустые корневые контейнеры-контроллеры (Controller, ExtLights, LightSwitches)
             if (ContainsAny(hName,
-                "_damaged", "_dmg", "_destroyed", ".destroyed", "_broken",
-                "LOD 2", "LOD2", "Folded", "BrokenWing", "Camcorder", "Spectator",
-                "Switch", "Interactable", "Controller", "DashCanvas", "Overhead",
-                "LightSwitches", "ExtLights", "LeftLightObjs", "RightLightObjs", "LightObjs"))
+    "_damaged", "_dmg", "_destroyed", ".destroyed", "_broken",
+    "LOD 2", "LOD2", "Folded", "BrokenWing", "Camcorder", "Spectator",
+    "Switch", "Interactable", "Controller", "DashCanvas", "Overhead",
+    "LightSwitches"))
+                continue;
+
+            // Пропускаем только пустые родительские группы, но не их дочерние лампы!
+            if (ContainsAny(mName, "NavLights", "StrobeLights", "ExtLights", "LightObjs"))
                 continue;
 
             string kind = null;
             if (ContainsAny(mName, "RedStrobe", "redStrobe", "Beacon", "AntiCol"))
+            {
+                if (!ContainsAny(hName, "ah94", "AH-94")) continue;
                 kind = "RedStrobe";
+            }
+
             else if (ContainsAny(mName, "Strobe"))
                 kind = "Strobe";
             else if (ContainsAny(mName, "LandingLight", "TaxiLight", "NoseLight", "Spotlight"))
@@ -2996,19 +3220,23 @@ public static class FbxLoader
                 else kind = "NavAuto";
             }
 
+
             if (kind != null)
             {
                 System.Windows.Media.Media3D.Matrix3D wm = BuildWorldMatrix(m.Id, models);
                 System.Windows.Media.Media3D.Point3D pos = wm.Transform(new System.Windows.Media.Media3D.Point3D(0, 0, 0));
-
-                // Игнорируем нулевую точку (0,0,0), если узел не смещён
+                if (kind == "RedStrobe" && Math.Abs(pos.X) > 450.0) continue;
                 if (pos.X * pos.X + pos.Y * pos.Y + pos.Z * pos.Z < 1.0) continue;
 
-                // Склеиваем родительский узел и дочерний блик (радиус 120 ед. до нормализации)
+                // Проверяем дубли только среди огней ТОГО ЖЕ типа (чтобы строб не склеивался с БАНО!)
                 bool dup = false;
                 for (int i = 0; i < result.Lights.Count; i++)
                 {
-                    if ((result.Lights[i].Position - pos).LengthSquared < 14000.0) { dup = true; break; }
+                    if (result.Lights[i].Kind == kind && (result.Lights[i].Position - pos).LengthSquared < 16000.0)
+                    {
+                        dup = true;
+                        break;
+                    }
                 }
                 if (!dup)
                     result.Lights.Add(new FbxLightMarker { Kind = kind, Position = pos });
@@ -3023,7 +3251,6 @@ public static class FbxLoader
         }
 
         return result.TotalVertices > 0 ? result : null;
-
     }
 
     private static System.Windows.Point ResolveUV(FbxGeomPart part, int vertIdx, int cornerIdx)
@@ -3282,6 +3509,14 @@ public class Livery3DViewerForm : Form
     private System.Windows.Media.Media3D.ModelVisual3D modelVisual;
     private System.Windows.Media.Media3D.ModelVisual3D cloudsVisual;
     private System.Windows.Media.Media3D.ModelVisual3D rainVisual;
+    private System.Windows.Media.Media3D.ModelVisual3D aircraftLightsVisual;
+    private List<System.Windows.Media.SolidColorBrush> strobeBrushes = new List<System.Windows.Media.SolidColorBrush>();
+    private List<System.Windows.Media.Media3D.PointLight> strobePointLights = new List<System.Windows.Media.Media3D.PointLight>();
+    private System.Windows.Forms.Timer navLightTimer;
+    private int strobePhaseTick = 0;
+    private bool navLightsEnabled = true;
+    private bool strobeLightsEnabled = true;
+    private bool landingLightEnabled = true;
     private System.Windows.Media.Media3D.TranslateTransform3D rainDropTransform;
     private System.Windows.Media.SolidColorBrush rainMatBrush;
     private System.Windows.Media.Media3D.Model3DGroup lightGroup;
@@ -3393,12 +3628,35 @@ public class Livery3DViewerForm : Form
         btnFlipY.Click += (s, e) => { FbxLoader.FlipUVY = !FbxLoader.FlipUVY; LoadModelAndTexture(); };
         pnlBottom.Controls.Add(btnFlipY);
 
-        Button btnLight = new Button() { Text = "☀ Свет", Left = 648, Top = 7, Width = 78, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(95, 75, 25), ForeColor = Color.White };
+        Button btnLight = new Button() { Text = "☀ Свет", Left = 648, Top = 7, Width = 72, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(95, 75, 25), ForeColor = Color.White };
         btnLight.Click += (s, e) => { lightPreset = (lightPreset + 1) % 4; ApplyLightingPreset(); };
         pnlBottom.Controls.Add(btnLight);
 
+        Button btnNavToggle = new Button() { Text = "NAV", Left = 726, Top = 7, Width = 46, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 120, 75), ForeColor = Color.White };
+        btnNavToggle.Click += (s, e) => {
+            navLightsEnabled = !navLightsEnabled;
+            btnNavToggle.BackColor = navLightsEnabled ? Color.FromArgb(0, 120, 75) : Color.FromArgb(40, 46, 44);
+            if (lastLoadedMeshData != null) BuildAircraftLights(lastLoadedMeshData);
+        };
+        pnlBottom.Controls.Add(btnNavToggle);
 
-        Label lblHint = new Label() { Text = "ЛКМ — вращение", Left = 732, Top = 13, AutoSize = true, ForeColor = Color.Silver };
+        Button btnStrobeToggle = new Button() { Text = "STRB", Left = 776, Top = 7, Width = 50, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 120, 75), ForeColor = Color.White };
+        btnStrobeToggle.Click += (s, e) => {
+            strobeLightsEnabled = !strobeLightsEnabled;
+            btnStrobeToggle.BackColor = strobeLightsEnabled ? Color.FromArgb(0, 120, 75) : Color.FromArgb(40, 46, 44);
+            if (lastLoadedMeshData != null) BuildAircraftLights(lastLoadedMeshData);
+        };
+        pnlBottom.Controls.Add(btnStrobeToggle);
+
+        Button btnLandToggle = new Button() { Text = "LAND", Left = 830, Top = 7, Width = 52, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 120, 75), ForeColor = Color.White };
+        btnLandToggle.Click += (s, e) => {
+            landingLightEnabled = !landingLightEnabled;
+            btnLandToggle.BackColor = landingLightEnabled ? Color.FromArgb(0, 120, 75) : Color.FromArgb(40, 46, 44);
+            if (lastLoadedMeshData != null) BuildAircraftLights(lastLoadedMeshData);
+        };
+        pnlBottom.Controls.Add(btnLandToggle);
+
+        Label lblHint = new Label() { Text = "ЛКМ", Left = 888, Top = 13, AutoSize = true, ForeColor = Color.Silver };
         pnlBottom.Controls.Add(lblHint);
 
 
@@ -3424,6 +3682,7 @@ public class Livery3DViewerForm : Form
 
         this.FormClosing += (s, e) => {
             if (cloudAnimTimer != null) { cloudAnimTimer.Stop(); cloudAnimTimer.Dispose(); cloudAnimTimer = null; }
+            if (navLightTimer != null) { navLightTimer.Stop(); navLightTimer.Dispose(); navLightTimer = null; }
         };
 
         InitScene();
@@ -3536,7 +3795,8 @@ public class Livery3DViewerForm : Form
                 new System.Windows.Media.Media3D.Vector3D(0.5, -1.5, -1.0));
             lightGroup.Children.Add(stormFlashLight);
         }
-
+        if (lastLoadedMeshData != null)
+            BuildAircraftLights(lastLoadedMeshData);
         UpdateVolumetricClouds();
         RenderBackgroundDecor();
 
@@ -4466,6 +4726,288 @@ private void LoadModelAndTexture()
         modelVisual = new System.Windows.Media.Media3D.ModelVisual3D();
         modelVisual.Content = group;
         viewport.Children.Add(modelVisual);
+
+        BuildAircraftLights(meshData);
+    }
+
+    private FbxMeshData lastLoadedMeshData;
+
+
+    private void BuildAircraftLights(FbxMeshData meshData)
+    {
+        lastLoadedMeshData = meshData;
+        if (navLightTimer != null)
+        {
+            navLightTimer.Stop();
+            navLightTimer.Dispose();
+            navLightTimer = null;
+        }
+        strobeBrushes.Clear();
+        strobePointLights.Clear();
+
+        if (viewport == null) return;
+        if (aircraftLightsVisual != null)
+        {
+            viewport.Children.Remove(aircraftLightsVisual);
+            aircraftLightsVisual = null;
+        }
+
+        if (meshData == null || meshData.Lights.Count == 0) return;
+
+        bool isNightOrStorm = (lightPreset == 2 || lightPreset == 3);
+        bool isDay = (lightPreset == 1);
+
+        System.Windows.Media.Media3D.Model3DGroup lightsGroup = new System.Windows.Media.Media3D.Model3DGroup();
+        System.Windows.Media.Media3D.MeshGeometry3D bulbMesh = BuildLightSphereMesh(10, 8);
+
+        for (int i = 0; i < meshData.Lights.Count; i++)
+        {
+            FbxLightMarker lm = meshData.Lights[i];
+            System.Windows.Media.Media3D.Point3D rawPos = lm.Position;
+            System.Windows.Media.Media3D.Point3D pos = SnapToWingSurface(meshData.Body.Vertices, rawPos, lm.Kind);
+            AppLogger.Log("LIGHT_SNAP", string.Format("[{0}] {1}: Raw=({2:F3},{3:F3},{4:F3}) -> Snapped=({5:F3},{6:F3},{7:F3})",
+                entry != null ? entry.Aircraft : "?", lm.Kind,
+                rawPos.X, rawPos.Y, rawPos.Z, pos.X, pos.Y, pos.Z));
+
+
+
+            if ((lm.Kind == "NavRed" || lm.Kind == "NavGreen" || lm.Kind == "NavWhite") && navLightsEnabled)
+            {
+                System.Windows.Media.Color coreCol = lm.Kind == "NavRed"
+                    ? System.Windows.Media.Color.FromRgb(255, 35, 35)
+                    : (lm.Kind == "NavGreen"
+                        ? System.Windows.Media.Color.FromRgb(30, 255, 95)
+                        : System.Windows.Media.Color.FromRgb(255, 248, 230));
+
+                byte haloAlpha = isNightOrStorm ? (byte)115 : (isDay ? (byte)35 : (byte)75);
+                System.Windows.Media.Color haloCol = System.Windows.Media.Color.FromArgb(haloAlpha, coreCol.R, coreCol.G, coreCol.B);
+
+                AddLightBulb(lightsGroup, bulbMesh, pos, 0.013, coreCol);
+                AddLightBulb(lightsGroup, bulbMesh, pos, isNightOrStorm ? 0.042 : 0.026, haloCol);
+
+                if (isNightOrStorm)
+                {
+                    System.Windows.Media.Color ptCol = lm.Kind == "NavRed"
+                        ? System.Windows.Media.Color.FromRgb(160, 20, 20)
+                        : (lm.Kind == "NavGreen"
+                            ? System.Windows.Media.Color.FromRgb(20, 160, 55)
+                            : System.Windows.Media.Color.FromRgb(140, 135, 120));
+                    System.Windows.Media.Media3D.PointLight pt = new System.Windows.Media.Media3D.PointLight(ptCol, pos);
+                    pt.Range = 0.65;
+                    pt.ConstantAttenuation = 0.6;
+                    pt.LinearAttenuation = 2.2;
+                    lightsGroup.Children.Add(pt);
+                }
+            }
+            else if ((lm.Kind == "Strobe" || lm.Kind == "RedStrobe") && strobeLightsEnabled)
+            {
+                bool isRed = (lm.Kind == "RedStrobe");
+                System.Windows.Media.Media3D.Point3D stPos = pos;
+
+                // Если строб на крыле — ставим его строго по середине торца законцовки относительно БАНО этого крыла
+                if (!isRed && Math.Abs(pos.X) > 0.35)
+                {
+                    for (int n = 0; n < meshData.Lights.Count; n++)
+                    {
+                        FbxLightMarker nav = meshData.Lights[n];
+                        if ((nav.Kind == "NavRed" || nav.Kind == "NavGreen") && Math.Sign(nav.Position.X) == Math.Sign(pos.X))
+                        {
+                            System.Windows.Media.Media3D.Point3D navSnapped = SnapToWingSurface(meshData.Body.Vertices, nav.Position, nav.Kind);
+                            stPos = new System.Windows.Media.Media3D.Point3D(navSnapped.X, navSnapped.Y, navSnapped.Z - 0.028);
+                            break;
+                        }
+                    }
+                }
+
+
+
+                System.Windows.Media.SolidColorBrush coreBr = new System.Windows.Media.SolidColorBrush(
+                    isRed ? System.Windows.Media.Color.FromArgb(0, 255, 45, 45) : System.Windows.Media.Color.FromArgb(0, 255, 255, 255));
+                System.Windows.Media.SolidColorBrush haloBr = new System.Windows.Media.SolidColorBrush(
+                    isRed ? System.Windows.Media.Color.FromArgb(0, 255, 30, 30) : System.Windows.Media.Color.FromArgb(0, 200, 230, 255));
+
+                strobeBrushes.Add(coreBr);
+                strobeBrushes.Add(haloBr);
+
+                AddLightBulbBrush(lightsGroup, bulbMesh, stPos, 0.011, coreBr);
+                AddLightBulbBrush(lightsGroup, bulbMesh, stPos, 0.036, haloBr);
+
+                System.Windows.Media.Media3D.Point3D lightOrigin = new System.Windows.Media.Media3D.Point3D(
+                    stPos.X * 0.92, stPos.Y + 0.04, stPos.Z);
+                System.Windows.Media.Media3D.PointLight stPt = new System.Windows.Media.Media3D.PointLight(
+                    System.Windows.Media.Color.FromRgb(0, 0, 0), lightOrigin);
+                stPt.Range = 0.85;
+                stPt.ConstantAttenuation = 0.6;
+                stPt.LinearAttenuation = 2.0;
+                lightsGroup.Children.Add(stPt);
+                strobePointLights.Add(stPt);
+            }
+            else if (lm.Kind == "Landing" && landingLightEnabled)
+            {
+                if (!isDay)
+                {
+                    System.Windows.Media.Color lampCol = System.Windows.Media.Color.FromRgb(255, 250, 232);
+                    AddLightBulb(lightsGroup, bulbMesh, pos, 0.014, lampCol);
+                    AddLightBulb(lightsGroup, bulbMesh, pos, 0.034,
+                        System.Windows.Media.Color.FromArgb(isNightOrStorm ? (byte)95 : (byte)45, 255, 244, 205));
+
+                    if (isNightOrStorm)
+                    {
+                        System.Windows.Media.Media3D.PointLight nosePt = new System.Windows.Media.Media3D.PointLight(
+                            System.Windows.Media.Color.FromRgb(210, 198, 165),
+                            new System.Windows.Media.Media3D.Point3D(pos.X, pos.Y - 0.04, pos.Z + 0.12));
+                        nosePt.Range = 0.85;
+                        nosePt.ConstantAttenuation = 0.5;
+                        nosePt.LinearAttenuation = 1.8;
+                        lightsGroup.Children.Add(nosePt);
+                    }
+                }
+            }
+        }
+
+
+        aircraftLightsVisual = new System.Windows.Media.Media3D.ModelVisual3D();
+        aircraftLightsVisual.Content = lightsGroup;
+        viewport.Children.Add(aircraftLightsVisual);
+
+        if (strobeBrushes.Count > 0)
+        {
+            navLightTimer = new System.Windows.Forms.Timer();
+            navLightTimer.Interval = 40;
+            navLightTimer.Tick += (s, e) => StepAircraftLights();
+            navLightTimer.Start();
+        }
+    }
+
+    private System.Windows.Media.Media3D.Point3D SnapToWingSurface(
+        List<System.Windows.Media.Media3D.Point3D> verts,
+        System.Windows.Media.Media3D.Point3D pt,
+        string kind)
+    {
+        if (verts == null || verts.Count == 0 || kind == "Landing") return pt;
+        if (Math.Abs(pt.X) < 0.25) return pt;
+
+        double bestDistSq = double.MaxValue;
+        System.Windows.Media.Media3D.Point3D bestVert = pt;
+
+        for (int i = 0; i < verts.Count; i++)
+        {
+            System.Windows.Media.Media3D.Point3D v = verts[i];
+            double dx = v.X - pt.X;
+            double dy = v.Y - pt.Y;
+            double dz = v.Z - pt.Z;
+            double dSq = dx * dx + dy * dy + dz * dz;
+            if (dSq < bestDistSq)
+            {
+                bestDistSq = dSq;
+                bestVert = v;
+            }
+        }
+
+        if (bestDistSq < 0.032)
+        {
+            double outOffset = pt.X > 0 ? 0.006 : -0.006;
+            return new System.Windows.Media.Media3D.Point3D(bestVert.X + outOffset, bestVert.Y, bestVert.Z);
+        }
+        return pt;
+    }
+
+    private void StepAircraftLights()
+    {
+        if (strobeBrushes.Count == 0) return;
+        strobePhaseTick = (strobePhaseTick + 1) % 38;
+
+        bool isFlashOn = (strobePhaseTick == 0 || strobePhaseTick == 1 || strobePhaseTick == 4 || strobePhaseTick == 5);
+        byte coreA = isFlashOn ? (byte)255 : (byte)0;
+        byte haloA = isFlashOn ? (byte)(lightPreset == 1 ? 75 : 155) : (byte)0;
+
+    for (int i = 0; i < strobeBrushes.Count; i += 2)
+    {
+        System.Windows.Media.Color baseC = strobeBrushes[i].Color;
+        bool isRed = (baseC.G < 100);
+        strobeBrushes[i].Color = isRed
+            ? System.Windows.Media.Color.FromArgb(coreA, 255, 45, 45)
+            : System.Windows.Media.Color.FromArgb(coreA, 255, 255, 255);
+        if (i + 1 < strobeBrushes.Count)
+        {
+            strobeBrushes[i + 1].Color = isRed
+                ? System.Windows.Media.Color.FromArgb(haloA, 255, 30, 30)
+                : System.Windows.Media.Color.FromArgb(haloA, 200, 230, 255);
+        }
+
+        int ptIdx = i / 2;
+        if (ptIdx < strobePointLights.Count)
+        {
+            byte ptVal = (isFlashOn && (lightPreset == 2 || lightPreset == 3)) ? (byte)210 : (byte)0;
+            strobePointLights[ptIdx].Color = isRed
+                ? System.Windows.Media.Color.FromRgb(ptVal, (byte)(ptVal * 0.12), (byte)(ptVal * 0.12))
+                : System.Windows.Media.Color.FromRgb(ptVal, ptVal, (byte)Math.Min(255, ptVal + 25));
+        }
+    }
+}
+
+private void AddLightBulb(System.Windows.Media.Media3D.Model3DGroup group, System.Windows.Media.Media3D.MeshGeometry3D sphere, System.Windows.Media.Media3D.Point3D pos, double radius, System.Windows.Media.Color color)
+    {
+        AddLightBulbBrush(group, sphere, pos, radius, new System.Windows.Media.SolidColorBrush(color));
+    }
+
+    private void AddLightBulbBrush(System.Windows.Media.Media3D.Model3DGroup group, System.Windows.Media.Media3D.MeshGeometry3D sphere, System.Windows.Media.Media3D.Point3D pos, double radius, System.Windows.Media.SolidColorBrush brush)
+    {
+        System.Windows.Media.Media3D.EmissiveMaterial mat = new System.Windows.Media.Media3D.EmissiveMaterial(brush);
+        System.Windows.Media.Media3D.GeometryModel3D gm = new System.Windows.Media.Media3D.GeometryModel3D(sphere, mat);
+        System.Windows.Media.Media3D.Transform3DGroup tg = new System.Windows.Media.Media3D.Transform3DGroup();
+        tg.Children.Add(new System.Windows.Media.Media3D.ScaleTransform3D(radius, radius, radius));
+        tg.Children.Add(new System.Windows.Media.Media3D.TranslateTransform3D(pos.X, pos.Y, pos.Z));
+        gm.Transform = tg;
+        group.Children.Add(gm);
+    }
+
+    private System.Windows.Media.Media3D.MeshGeometry3D BuildLightSphereMesh(int slices, int stacks)
+    {
+        System.Windows.Media.Media3D.MeshGeometry3D m = new System.Windows.Media.Media3D.MeshGeometry3D();
+        for (int st = 0; st <= stacks; st++)
+        {
+            double phi = Math.PI * st / stacks;
+            double y = Math.Cos(phi);
+            double r = Math.Sin(phi);
+            for (int sl = 0; sl <= slices; sl++)
+            {
+                double th = 2.0 * Math.PI * sl / slices;
+                m.Positions.Add(new System.Windows.Media.Media3D.Point3D(r * Math.Cos(th), y, r * Math.Sin(th)));
+            }
+        }
+        int stride = slices + 1;
+        for (int st = 0; st < stacks; st++)
+        {
+            for (int sl = 0; sl < slices; sl++)
+            {
+                int a = st * stride + sl, b = a + stride, c = a + 1, d = b + 1;
+                m.TriangleIndices.Add(a); m.TriangleIndices.Add(b); m.TriangleIndices.Add(c);
+                m.TriangleIndices.Add(c); m.TriangleIndices.Add(b); m.TriangleIndices.Add(d);
+            }
+        }
+        m.Freeze();
+        return m;
+    }
+
+    private System.Windows.Media.Media3D.MeshGeometry3D BuildSpotlightConeMesh(System.Windows.Media.Media3D.Point3D origin, double r0, double r1, double length, int sides)
+    {
+        System.Windows.Media.Media3D.MeshGeometry3D m = new System.Windows.Media.Media3D.MeshGeometry3D();
+        for (int i = 0; i <= sides; i++)
+        {
+            double a = 2.0 * Math.PI * i / sides;
+            double ca = Math.Cos(a), sa = Math.Sin(a);
+            m.Positions.Add(new System.Windows.Media.Media3D.Point3D(origin.X + r0 * ca, origin.Y + r0 * sa, origin.Z));
+            m.Positions.Add(new System.Windows.Media.Media3D.Point3D(origin.X + r1 * ca, origin.Y + r1 * sa - 0.14, origin.Z + length));
+        }
+        for (int i = 0; i < sides; i++)
+        {
+            int b = i * 2;
+            m.TriangleIndices.Add(b); m.TriangleIndices.Add(b + 1); m.TriangleIndices.Add(b + 2);
+            m.TriangleIndices.Add(b + 2); m.TriangleIndices.Add(b + 1); m.TriangleIndices.Add(b + 3);
+        }
+        m.Freeze();
+        return m;
     }
 
     private System.Windows.Media.Media3D.MeshGeometry3D BuildWpfMesh(FbxSubMesh sub)
@@ -4477,6 +5019,7 @@ private void LoadModelAndTexture()
             foreach (System.Windows.Point uv in sub.UVs) geom.TextureCoordinates.Add(uv);
         return geom;
     }
+
 
     private void NormalizeToUnitCube(FbxMeshData mesh)
     {
@@ -4519,9 +5062,11 @@ private void LoadModelAndTexture()
                 if (Math.Abs(mesh.Lights[i].Position.X) < 0.08) mesh.Lights[i].Kind = "NavWhite";
                 else mesh.Lights[i].Kind = mesh.Lights[i].Position.X > 0 ? "NavRed" : "NavGreen";
             }
+            AppLogger.Log("LIGHTS_NORM", string.Format("[{0}] Kind={1} -> Pos=({2:F3}, {3:F3}, {4:F3})",
+                entry != null ? entry.Aircraft : "?", mesh.Lights[i].Kind,
+                mesh.Lights[i].Position.X, mesh.Lights[i].Position.Y, mesh.Lights[i].Position.Z));
         }
     }
-
 
     private string FindReferenceModel(string aircraft)
     {
@@ -5269,10 +5814,11 @@ public class FlightLogbookForm : Form
     public FlightLogbookForm()
     {
         this.Text = "VTOL QoL — Журнал боевых вылетов";
-        this.Size = new Size(840, 560);
+        this.Size = new Size(1060, 620);
+        this.MinimumSize = new Size(880, 460);
         this.StartPosition = FormStartPosition.CenterParent;
-        this.FormBorderStyle = FormBorderStyle.FixedDialog;
-        this.MaximizeBox = false;
+        this.FormBorderStyle = FormBorderStyle.Sizable;
+        this.MaximizeBox = true;
         this.BackColor = Color.FromArgb(18, 22, 20);
         this.ForeColor = Color.FromArgb(0, 255, 102);
         this.Font = new Font("Consolas", 9.5f);
@@ -5280,50 +5826,105 @@ public class FlightLogbookForm : Form
         Label lblTitle = new Label() { Text = "/// ТАКТИЧЕСКИЙ ЖУРНАЛ БОЕВЫХ ВЫЛЕТОВ ///", Left = 20, Top = 14, AutoSize = true, Font = new Font("Consolas", 11f, FontStyle.Bold) };
         this.Controls.Add(lblTitle);
 
-        Panel pnlStats = new Panel() { Left = 20, Top = 42, Width = 785, Height = 52, BackColor = Color.FromArgb(25, 32, 28), BorderStyle = BorderStyle.FixedSingle };
+        Panel pnlStats = new Panel() { Left = 20, Top = 42, Width = 1004, Height = 52, BackColor = Color.FromArgb(25, 32, 28), BorderStyle = BorderStyle.FixedSingle };
+        pnlStats.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         this.Controls.Add(pnlStats);
 
-        lblSummary = new Label() { Left = 12, Top = 6, Width = 760, Height = 20, ForeColor = Color.Cyan, Font = new Font("Consolas", 9.5f, FontStyle.Bold) };
+        lblSummary = new Label() { Left = 12, Top = 6, Width = 975, Height = 20, ForeColor = Color.Cyan, Font = new Font("Consolas", 9.5f, FontStyle.Bold) };
+        lblSummary.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         pnlStats.Controls.Add(lblSummary);
 
-        lblSubStats = new Label() { Left = 12, Top = 27, Width = 760, Height = 20, ForeColor = Color.FromArgb(170, 230, 190) };
+        lblSubStats = new Label() { Left = 12, Top = 27, Width = 975, Height = 20, ForeColor = Color.FromArgb(170, 230, 190) };
+        lblSubStats.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         pnlStats.Controls.Add(lblSubStats);
 
         lvLog = new ListView();
         lvLog.Location = new Point(20, 104);
-        lvLog.Size = new Size(785, 365);
+        lvLog.Size = new Size(1004, 420);
+        lvLog.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         lvLog.View = View.Details;
         lvLog.FullRowSelect = true;
-        lvLog.BackColor = Color.FromArgb(22, 26, 24);
+        lvLog.OwnerDraw = true;
+        lvLog.BackColor = Color.FromArgb(20, 24, 22);
         lvLog.ForeColor = Color.White;
         lvLog.BorderStyle = BorderStyle.FixedSingle;
+
+        lvLog.ColumnWidthChanging += (s, e) => {
+            e.Cancel = true;
+            e.NewWidth = lvLog.Columns[e.ColumnIndex].Width;
+        };
+
+        lvLog.DrawColumnHeader += (s, e) => {
+            Rectangle fillRect = e.Bounds;
+            if (e.ColumnIndex == lvLog.Columns.Count - 1)
+                fillRect.Width += 200; // перекрываем пустой белый хвост заголовка справа
+            using (SolidBrush bg = new SolidBrush(Color.FromArgb(28, 36, 32)))
+                e.Graphics.FillRectangle(bg, fillRect);
+            using (Pen borderPen = new Pen(Color.FromArgb(45, 65, 55)))
+                e.Graphics.DrawRectangle(borderPen, e.Bounds.X, e.Bounds.Y, e.Bounds.Width - 1, e.Bounds.Height - 1);
+            TextRenderer.DrawText(e.Graphics, e.Header.Text, new Font("Consolas", 9.5f, FontStyle.Bold),
+                new Rectangle(e.Bounds.X + 6, e.Bounds.Y, e.Bounds.Width - 8, e.Bounds.Height),
+                Color.FromArgb(0, 255, 102), TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+        };
+
+        lvLog.DrawSubItem += (s, e) => {
+            bool isSelected = e.Item.Selected;
+            Color rowBg = isSelected
+                ? Color.FromArgb(35, 65, 52)
+                : (e.ItemIndex % 2 == 0 ? Color.FromArgb(20, 24, 22) : Color.FromArgb(24, 29, 26));
+            using (SolidBrush bg = new SolidBrush(rowBg))
+                e.Graphics.FillRectangle(bg, e.Bounds);
+            using (Pen linePen = new Pen(Color.FromArgb(32, 40, 36)))
+                e.Graphics.DrawLine(linePen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+            TextRenderer.DrawText(e.Graphics, e.SubItem.Text, lvLog.Font,
+                new Rectangle(e.Bounds.X + 6, e.Bounds.Y, e.Bounds.Width - 8, e.Bounds.Height),
+                e.Item.ForeColor, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+        };
         lvLog.Columns.Add("Дата и время", 145);
-        lvLog.Columns.Add("Статус", 85);
-        lvLog.Columns.Add("Борт", 115);
-        lvLog.Columns.Add("Позывной", 115);
-        lvLog.Columns.Add("Налет", 65);
-        lvLog.Columns.Add("Сбито", 60);
-        lvLog.Columns.Add("Детали события", 195);
+        lvLog.Columns.Add("Статус", 72);
+        lvLog.Columns.Add("Борт", 195);
+        lvLog.Columns.Add("Позывной", 145);
+        lvLog.Columns.Add("Налет", 58);
+        lvLog.Columns.Add("Сбито", 55);
+        lvLog.Columns.Add("Детали события (цель, противник, оружие)", 310);
         this.Controls.Add(lvLog);
 
-        Button btnRefresh = new Button() { Text = "Обновить", Left = 20, Top = 480, Width = 120, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(35, 45, 40), ForeColor = Color.FromArgb(0, 255, 102) };
+        Button btnRefresh = new Button() { Text = "Обновить", Left = 20, Top = 536, Width = 120, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(35, 45, 40), ForeColor = Color.FromArgb(0, 255, 102) };
+        btnRefresh.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         btnRefresh.Click += (s, e) => LoadLog();
         this.Controls.Add(btnRefresh);
 
-        Button btnExport = new Button() { Text = "Экспорт отчета", Left = 150, Top = 480, Width = 145, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 110, 140), ForeColor = Color.White };
+        Button btnExport = new Button() { Text = "Экспорт отчета", Left = 150, Top = 536, Width = 145, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 110, 140), ForeColor = Color.White };
+        btnExport.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         btnExport.Click += BtnExport_Click;
         this.Controls.Add(btnExport);
 
-        Button btnClear = new Button() { Text = "Очистить журнал", Left = 305, Top = 480, Width = 145, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(120, 30, 30), ForeColor = Color.White };
+        Button btnClear = new Button() { Text = "Очистить журнал", Left = 305, Top = 536, Width = 145, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(120, 30, 30), ForeColor = Color.White };
+        btnClear.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         btnClear.Click += BtnClear_Click;
         this.Controls.Add(btnClear);
 
-        Button btnClose = new Button() { Text = "Закрыть", Left = 675, Top = 480, Width = 130, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 50, 45), ForeColor = Color.White };
+        Button btnClose = new Button() { Text = "Закрыть", Left = 894, Top = 536, Width = 130, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 50, 45), ForeColor = Color.White };
+        btnClose.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         btnClose.Click += (s, e) => this.Close();
         this.Controls.Add(btnClose);
 
+        Action fitLastColumn = () => {
+            if (lvLog.Columns.Count >= 7)
+            {
+                int fixedW = 0;
+                for (int i = 0; i < 6; i++) fixedW += lvLog.Columns[i].Width;
+                int rem = lvLog.ClientSize.Width - fixedW;
+                if (rem > 220) lvLog.Columns[6].Width = rem;
+            }
+        };
+
+        this.Shown += (s, e) => fitLastColumn();
+        this.SizeChanged += (s, e) => fitLastColumn();
+
         LoadLog();
     }
+
 
     private string GetLogFilePath()
     {
@@ -5378,17 +5979,60 @@ public class FlightLogbookForm : Form
         foreach (KeyValuePair<string, int> kv in planeUsage) if (kv.Value > maxCount) { maxCount = kv.Value; favPlane = kv.Key; }
         double kd = totalLosses > 0 ? Math.Round((double)totalKills / totalLosses, 2) : totalKills;
         lblSummary.Text = string.Format("ВЫЛЕТОВ: {0}  |  СБИТО: {1}  |  ПОТЕРЬ: {2}  |  K/D: {3}", totalSorties, totalKills, totalLosses, kd);
-        lblSubStats.Text = string.Format("Основной борт: {0} ({1} вылетов)  |  Записей: {2}", favPlane, maxCount, lvLog.Items.Count);
+
+        string weapSummary = LoadWeaponStatsSummary();
+        lblSubStats.Text = string.Format("Борт: {0} ({1})  |  {2}", favPlane, maxCount, weapSummary);
+    }
+
+    private string LoadWeaponStatsSummary()
+    {
+        try
+        {
+            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL", "weapon_stats.ini");
+            if (!File.Exists(path)) return "Статистика оружия: ожидание пусков";
+            List<string> parts = new List<string>();
+            foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
+            {
+                string[] p = line.Split('|');
+                if (p.Length >= 3)
+                {
+                    int fired, hits;
+                    int.TryParse(p[1], out fired);
+                    int.TryParse(p[2], out hits);
+                    if (fired > 0)
+                    {
+                        int acc = Math.Min(100, (int)Math.Round((hits * 100.0) / fired));
+                        parts.Add(string.Format("{0}: {1}/{2} ({3}%)", p[0], hits, fired, acc));
+                    }
+                    else if (hits > 0)
+                    {
+                        parts.Add(string.Format("{0}: {1} сбито", p[0], hits));
+                    }
+                }
+            }
+            return parts.Count > 0 ? ("Оружие: " + string.Join(" | ", parts.ToArray())) : "Статистика оружия: пусто";
+        }
+        catch { return ""; }
     }
 
     private void BtnClear_Click(object sender, EventArgs e)
     {
-        if (MessageBox.Show("Очистить историю вылетов?", "Подтверждение", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+        if (MessageBox.Show("Очистить историю вылетов и статистику оружия?", "Подтверждение", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
         {
-            try { string path = GetLogFilePath(); if (File.Exists(path)) File.Delete(path); LoadLog(); }
+            try
+            {
+                string path = GetLogFilePath();
+                if (File.Exists(path)) File.Delete(path);
+
+                string weapPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL", "weapon_stats.ini");
+                if (File.Exists(weapPath)) File.Delete(weapPath);
+
+                LoadLog();
+            }
             catch (Exception ex) { MessageBox.Show("Ошибка: " + ex.Message); }
         }
     }
+
 
     private void BtnExport_Click(object sender, EventArgs e)
     {
@@ -5561,11 +6205,7 @@ public class MainForm : Form
     private Button btnLiveryManager;
     private Button btnLogbook;
     private Button btnSaveVault;
-    private Button btnAudioSettings;
     private Button btnDiagnostics;
-    private NotifyIcon trayIcon;
-    private ContextMenuStrip trayMenu;
-    private bool isExplicitExit = false;
     private volatile Process currentWorkerProcess = null;
     private volatile bool isCancelRequested = false;
     private GameTracker tracker = new GameTracker();
@@ -5578,11 +6218,25 @@ public class MainForm : Form
     public MainForm()
     {
         this.Text = "VTOL QoL — Smart Radio & Media Hub | by L.Shutze";
-        this.Size = new Size(580, 772);
+        this.Size = new Size(580, 722);
         this.StartPosition = FormStartPosition.CenterScreen;
         this.FormBorderStyle = FormBorderStyle.FixedSingle;
         this.MaximizeBox = false;
-        try { this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        try
+        {
+            string localIco = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "icon.ico");
+            if (File.Exists(localIco))
+                this.Icon = new Icon(localIco);
+            else
+            {
+                Stream icoStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("icon.ico");
+                if (icoStream != null)
+                    this.Icon = new Icon(icoStream);
+                else
+                    this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+        }
+        catch { }
         this.BackColor = Color.FromArgb(18, 22, 20);
         this.ForeColor = Color.FromArgb(0, 255, 102);
         this.Font = new Font("Consolas", 9.5f, FontStyle.Regular);
@@ -5590,7 +6244,7 @@ public class MainForm : Form
         Label lblTitle = new Label();
         lblTitle.Text = "/// VTOL QoL — FLIGHT AUDIO && DISCORD SUITE ///";
         lblTitle.Font = new Font("Consolas", 12f, FontStyle.Bold);
-        lblTitle.Location = new Point(20, 15);
+        lblTitle.Location = new Point(20, 14);
         lblTitle.AutoSize = true;
         this.Controls.Add(lblTitle);
 
@@ -5598,38 +6252,18 @@ public class MainForm : Form
         lblAuthor.Text = "Created by L.Shutze";
         lblAuthor.Font = new Font("Consolas", 8.5f, FontStyle.Italic);
         lblAuthor.ForeColor = Color.FromArgb(130, 180, 150);
-        lblAuthor.Location = new Point(405, 38);
+        lblAuthor.Location = new Point(405, 36);
         lblAuthor.AutoSize = true;
         this.Controls.Add(lblAuthor);
 
-        Label lblDir = new Label();
-        lblDir.Text = "Директория RadioMusic:";
-        lblDir.Location = new Point(22, 48);
-        lblDir.AutoSize = true;
-        lblDir.ForeColor = Color.LightGray;
-        this.Controls.Add(lblDir);
-
         txtPath = new TextBox();
-        txtPath.Location = new Point(24, 68);
-        txtPath.Size = new Size(415, 24);
-        txtPath.BackColor = Color.FromArgb(30, 36, 33);
-        txtPath.ForeColor = Color.White;
-        txtPath.BorderStyle = BorderStyle.FixedSingle;
+        txtPath.Visible = false;
         txtPath.Text = SettingsManager.Get("RadioMusicDir", FindVtolMusicDir());
         this.Controls.Add(txtPath);
 
-        Button btnBrowse = new Button();
-        btnBrowse.Text = "Обзор...";
-        btnBrowse.Location = new Point(445, 67);
-        btnBrowse.Size = new Size(80, 26);
-        btnBrowse.FlatStyle = FlatStyle.Flat;
-        btnBrowse.BackColor = Color.FromArgb(35, 45, 40);
-        btnBrowse.Click += new EventHandler(BtnBrowse_Click);
-        this.Controls.Add(btnBrowse);
-
         pnlDropZone = new Panel();
-        pnlDropZone.Location = new Point(24, 105);
-        pnlDropZone.Size = new Size(501, 90);
+        pnlDropZone.Location = new Point(24, 58);
+        pnlDropZone.Size = new Size(520, 90);
         pnlDropZone.BackColor = Color.FromArgb(26, 34, 30);
         pnlDropZone.BorderStyle = BorderStyle.FixedSingle;
         pnlDropZone.AllowDrop = true;
@@ -5650,14 +6284,14 @@ public class MainForm : Form
 
         Label lblUrl = new Label();
         lblUrl.Text = "Загрузить по ссылке (YouTube / SoundCloud / Радио):";
-        lblUrl.Location = new Point(22, 205);
+        lblUrl.Location = new Point(22, 158);
         lblUrl.AutoSize = true;
         lblUrl.ForeColor = Color.LightGray;
         this.Controls.Add(lblUrl);
 
         txtUrl = new TextBox();
-        txtUrl.Location = new Point(24, 225);
-        txtUrl.Size = new Size(310, 24);
+        txtUrl.Location = new Point(24, 178);
+        txtUrl.Size = new Size(328, 24);
         txtUrl.BackColor = Color.FromArgb(30, 36, 33);
         txtUrl.ForeColor = Color.Cyan;
         txtUrl.BorderStyle = BorderStyle.FixedSingle;
@@ -5665,7 +6299,7 @@ public class MainForm : Form
 
         btnDownloadUrl = new Button();
         btnDownloadUrl.Text = "СКАЧАТЬ";
-        btnDownloadUrl.Location = new Point(340, 224);
+        btnDownloadUrl.Location = new Point(358, 177);
         btnDownloadUrl.Size = new Size(95, 26);
         btnDownloadUrl.FlatStyle = FlatStyle.Flat;
         btnDownloadUrl.BackColor = Color.FromArgb(0, 110, 140);
@@ -5675,7 +6309,7 @@ public class MainForm : Form
 
         btnStopDownload = new Button();
         btnStopDownload.Text = "СТОП";
-        btnStopDownload.Location = new Point(440, 224);
+        btnStopDownload.Location = new Point(459, 177);
         btnStopDownload.Size = new Size(85, 26);
         btnStopDownload.FlatStyle = FlatStyle.Flat;
         btnStopDownload.BackColor = Color.FromArgb(140, 35, 35);
@@ -5684,23 +6318,24 @@ public class MainForm : Form
         btnStopDownload.Click += new EventHandler(BtnStopDownload_Click);
         this.Controls.Add(btnStopDownload);
 
-        chkShuffle = CreateCheckBox("Умный шаффл музыки (между игровыми сессиями)", 262, SettingsManager.GetBool("Shuffle", true));
-        chkLoudNorm = CreateCheckBox("Выравнивание громкости треков (LoudNorm -14 LUFS)", 288, SettingsManager.GetBool("LoudNorm", true));
-        chkDiscord = CreateCheckBox("Discord Rich Presence (борт, позывной, фраги, таймер)", 314, SettingsManager.GetBool("Discord", true));
-        chkDucking = CreateCheckBox("Авто-затихание радио при голосовой связи", 340, SettingsManager.GetBool("Ducking", true));
-        chkAudioSwitch = CreateCheckBox("Авто-переключение звука/микрофона на VR-шлем", 366, SettingsManager.GetBool("AudioSwitch", true));
-        chkDiagnostics = CreateCheckBox("Диагностика лога (для подбора паттернов распознавания)", 392, SettingsManager.GetBool("DiagnosticsEnabled", false));
-        chkKillSound = CreateCheckBox("Озвучка фрагов (War Thunder + серии Unreal Tournament 3)", 416, SettingsManager.GetBool("KillSoundEnabled", true));
+        chkShuffle = CreateCheckBox("Умный шаффл музыки (между игровыми сессиями)", 214, SettingsManager.GetBool("Shuffle", true));
+        chkLoudNorm = CreateCheckBox("Выравнивание громкости треков (LoudNorm -14 LUFS)", 240, SettingsManager.GetBool("LoudNorm", true));
+        chkDiscord = CreateCheckBox("Discord Rich Presence (борт, позывной, фраги, таймер)", 266, SettingsManager.GetBool("Discord", true));
+        chkDucking = CreateCheckBox("Авто-затихание радио при голосовой связи", 292, SettingsManager.GetBool("Ducking", true));
+        chkAudioSwitch = CreateCheckBox("Авто-переключение звука/микрофона на VR-шлем", 318, SettingsManager.GetBool("AudioSwitch", true));
+        chkDiagnostics = CreateCheckBox("Диагностика лога (для подбора паттернов распознавания)", 344, SettingsManager.GetBool("DiagnosticsEnabled", false));
+        chkKillSound = CreateCheckBox("Озвучка фрагов (War Thunder + серии Unreal Tournament 3)", 370, SettingsManager.GetBool("KillSoundEnabled", true));
+
 
         progressBar = new ProgressBar();
-        progressBar.Location = new Point(24, 452);
+        progressBar.Location = new Point(24, 404);
         progressBar.Size = new Size(520, 14);
         progressBar.Visible = false;
         this.Controls.Add(progressBar);
 
         lblStatus = new Label();
         lblStatus.Text = "Запуск...";
-        lblStatus.Location = new Point(22, 470);
+        lblStatus.Location = new Point(22, 422);
         lblStatus.Size = new Size(520, 22);
         lblStatus.ForeColor = Color.Silver;
         this.Controls.Add(lblStatus);
@@ -5708,7 +6343,7 @@ public class MainForm : Form
         btnInstall = new Button();
         btnInstall.Text = "▶ СТАРТ VTOL VR";
         btnInstall.Font = new Font("Consolas", 10f, FontStyle.Bold);
-        btnInstall.Location = new Point(24, 500);
+        btnInstall.Location = new Point(24, 452);
         btnInstall.Size = new Size(255, 42);
         btnInstall.FlatStyle = FlatStyle.Flat;
         btnInstall.BackColor = Color.FromArgb(0, 140, 60);
@@ -5719,7 +6354,7 @@ public class MainForm : Form
         btnLiveryManager = new Button();
         btnLiveryManager.Text = "✈ МЕНЕДЖЕР ЛИВРЕЙ";
         btnLiveryManager.Font = new Font("Consolas", 9.5f, FontStyle.Bold);
-        btnLiveryManager.Location = new Point(290, 500);
+        btnLiveryManager.Location = new Point(290, 452);
         btnLiveryManager.Size = new Size(254, 42);
         btnLiveryManager.FlatStyle = FlatStyle.Flat;
         btnLiveryManager.BackColor = Color.FromArgb(70, 50, 110);
@@ -5729,8 +6364,8 @@ public class MainForm : Form
 
         btnManageMusic = new Button();
         btnManageMusic.Text = "♫ ТРЕКИ";
-        btnManageMusic.Location = new Point(24, 550);
-        btnManageMusic.Size = new Size(125, 38);
+        btnManageMusic.Location = new Point(24, 502);
+        btnManageMusic.Size = new Size(168, 38);
         btnManageMusic.FlatStyle = FlatStyle.Flat;
         btnManageMusic.BackColor = Color.FromArgb(0, 95, 125);
         btnManageMusic.ForeColor = Color.White;
@@ -5739,38 +6374,27 @@ public class MainForm : Form
 
         btnSaveVault = new Button();
         btnSaveVault.Text = "🛡 БЭКАП";
-        btnSaveVault.Location = new Point(157, 550);
-        btnSaveVault.Size = new Size(125, 38);
+        btnSaveVault.Location = new Point(200, 502);
+        btnSaveVault.Size = new Size(168, 38);
         btnSaveVault.FlatStyle = FlatStyle.Flat;
         btnSaveVault.BackColor = Color.FromArgb(130, 80, 0);
         btnSaveVault.ForeColor = Color.White;
         btnSaveVault.Click += new EventHandler(BtnSaveVault_Click);
         this.Controls.Add(btnSaveVault);
 
-
         btnLogbook = new Button();
         btnLogbook.Text = "📋 ЛОГБУК";
-        btnLogbook.Location = new Point(290, 550);
-        btnLogbook.Size = new Size(125, 38);
+        btnLogbook.Location = new Point(376, 502);
+        btnLogbook.Size = new Size(168, 38);
         btnLogbook.FlatStyle = FlatStyle.Flat;
         btnLogbook.BackColor = Color.FromArgb(40, 85, 70);
         btnLogbook.ForeColor = Color.White;
         btnLogbook.Click += new EventHandler(BtnLogbook_Click);
         this.Controls.Add(btnLogbook);
 
-        btnAudioSettings = new Button();
-        btnAudioSettings.Text = "🎧 АУДИО VR";
-        btnAudioSettings.Location = new Point(423, 550);
-        btnAudioSettings.Size = new Size(122, 38);
-        btnAudioSettings.FlatStyle = FlatStyle.Flat;
-        btnAudioSettings.BackColor = Color.FromArgb(80, 60, 20);
-        btnAudioSettings.ForeColor = Color.White;
-        btnAudioSettings.Click += new EventHandler(BtnAudioSettings_Click);
-        this.Controls.Add(btnAudioSettings);
-
         btnDiagnostics = new Button();
         btnDiagnostics.Text = "🔧 ЛОГ ИГРЫ";
-        btnDiagnostics.Location = new Point(24, 596);
+        btnDiagnostics.Location = new Point(24, 548);
         btnDiagnostics.Size = new Size(125, 32);
         btnDiagnostics.FlatStyle = FlatStyle.Flat;
         btnDiagnostics.BackColor = Color.FromArgb(30, 38, 34);
@@ -5780,16 +6404,17 @@ public class MainForm : Form
 
         Button btnAppLog = new Button();
         btnAppLog.Text = "🐞 ЛОГ ПРОГИ";
-        btnAppLog.Location = new Point(155, 596);
+        btnAppLog.Location = new Point(155, 548);
         btnAppLog.Size = new Size(124, 32);
         btnAppLog.FlatStyle = FlatStyle.Flat;
         btnAppLog.BackColor = Color.FromArgb(55, 35, 45);
         btnAppLog.ForeColor = Color.Gold;
         btnAppLog.Click += (s, e) => { try { Process.Start("notepad.exe", AppLogger.GetLogPath()); } catch { } };
         this.Controls.Add(btnAppLog);
+
         btnOpenFolder = new Button();
         btnOpenFolder.Text = "📁 ПАПКА RADIOMUSIC";
-        btnOpenFolder.Location = new Point(290, 596);
+        btnOpenFolder.Location = new Point(290, 548);
         btnOpenFolder.Size = new Size(254, 32);
         btnOpenFolder.FlatStyle = FlatStyle.Flat;
         btnOpenFolder.BackColor = Color.FromArgb(30, 38, 34);
@@ -5797,18 +6422,47 @@ public class MainForm : Form
         btnOpenFolder.Click += new EventHandler(BtnOpenFolder_Click);
         this.Controls.Add(btnOpenFolder);
 
-
         Panel pnlIndicators = new Panel();
-        pnlIndicators.Location = new Point(24, 638);
+        pnlIndicators.Location = new Point(24, 590);
         pnlIndicators.Size = new Size(520, 44);
         pnlIndicators.BackColor = Color.FromArgb(24, 30, 27);
         pnlIndicators.BorderStyle = BorderStyle.FixedSingle;
         this.Controls.Add(pnlIndicators);
 
+        ToolTip indTip = new ToolTip();
+
         lblIndDiscord = new Label() { Left = 8, Top = 5, Width = 245, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Silver, Text = "● Discord: ожидание" };
-        lblIndMusic = new Label() { Left = 260, Top = 5, Width = 250, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Silver, Text = "● Треки: проверка..." };
-        lblIndAudio = new Label() { Left = 8, Top = 23, Width = 245, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Silver, Text = "● VR Аудио: проверка..." };
+        lblIndDiscord.Click += (s, e) => {
+            if (tracker.IsDiscordAccessDenied)
+            {
+                if (MessageBox.Show("Discord запущен от имени администратора.\nПерезапустить VTOL QoL с правами администратора для подключения?",
+                    "Требуются права администратора", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                {
+                    try
+                    {
+                        ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath);
+                        psi.Verb = "runas";
+                        psi.UseShellExecute = true;
+                    }
+                    catch { }
+                }
+            }
+        };
+
+        lblIndMusic = new Label() { Left = 260, Top = 5, Width = 250, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Silver, Text = "● Треки: проверка... ⚙", Cursor = Cursors.Hand };
+        lblIndMusic.Click += new EventHandler(BtnBrowse_Click);
+        lblIndMusic.MouseEnter += (s, e) => { lblIndMusic.Font = new Font("Consolas", 8.5f, FontStyle.Bold | FontStyle.Underline); };
+        lblIndMusic.MouseLeave += (s, e) => { lblIndMusic.Font = new Font("Consolas", 8.5f, FontStyle.Bold); };
+        indTip.SetToolTip(lblIndMusic, "Нажмите, чтобы изменить путь к папке RadioMusic");
+
+        lblIndAudio = new Label() { Left = 8, Top = 23, Width = 245, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Silver, Text = "● VR Аудио: проверка... ⚙", Cursor = Cursors.Hand };
+        lblIndAudio.Click += new EventHandler(BtnAudioSettings_Click);
+        lblIndAudio.MouseEnter += (s, e) => { lblIndAudio.Font = new Font("Consolas", 8.5f, FontStyle.Bold | FontStyle.Underline); };
+        lblIndAudio.MouseLeave += (s, e) => { lblIndAudio.Font = new Font("Consolas", 8.5f, FontStyle.Bold); };
+        indTip.SetToolTip(lblIndAudio, "Нажмите, чтобы выбрать наушники и микрофон VR-шлема");
+
         lblIndPilot = new Label() { Left = 260, Top = 23, Width = 250, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Cyan, Text = "● Пилот: —" };
+
 
         pnlIndicators.Controls.Add(lblIndDiscord);
         pnlIndicators.Controls.Add(lblIndMusic);
@@ -5820,7 +6474,6 @@ public class MainForm : Form
         uiStatusTimer.Tick += (s, e) => RefreshStatusIndicators();
         uiStatusTimer.Start();
 
-        InitSystemTray();
         this.FormClosing += new FormClosingEventHandler(MainForm_FormClosing);
         this.Shown += new EventHandler(MainForm_Shown);
     }
@@ -5856,8 +6509,9 @@ public class MainForm : Form
         }
         else if (tracker.IsDiscordAccessDenied)
         {
-            lblIndDiscord.Text = "● Discord: нужны права админа";
+            lblIndDiscord.Text = "● Discord: права админа ⚙";
             lblIndDiscord.ForeColor = Color.OrangeRed;
+            lblIndDiscord.Cursor = Cursors.Hand;
         }
         else if (tracker.IsDiscordConnected)
         {
@@ -5881,12 +6535,12 @@ public class MainForm : Form
         {
             int count = 0;
             try { count = Directory.GetFiles(mDir, "*.mp3", SearchOption.TopDirectoryOnly).Length; } catch { }
-            lblIndMusic.Text = "● RadioMusic: " + count + " тр.";
+            lblIndMusic.Text = "● RadioMusic: " + count + " тр. ⚙";
             lblIndMusic.ForeColor = count > 0 ? Color.FromArgb(0, 255, 102) : Color.Gold;
         }
         else
         {
-            lblIndMusic.Text = "● RadioMusic: папка не задана";
+            lblIndMusic.Text = "● RadioMusic: задать путь ⚙";
             lblIndMusic.ForeColor = Color.OrangeRed;
         }
 
@@ -5895,19 +6549,20 @@ public class MainForm : Form
         string vrCp = SettingsManager.Get("VrCaptureId", "");
         if (!chkAudioSwitch.Checked)
         {
-            lblIndAudio.Text = "● VR Аудио: авто-перекл. выкл.";
+            lblIndAudio.Text = "● VR Аудио: выключено ⚙";
             lblIndAudio.ForeColor = Color.Gray;
         }
         else if (!string.IsNullOrEmpty(vrPb) || !string.IsNullOrEmpty(vrCp))
         {
-            lblIndAudio.Text = "● VR Аудио: настроено";
+            lblIndAudio.Text = "● VR Аудио: настроено ⚙";
             lblIndAudio.ForeColor = Color.FromArgb(0, 255, 102);
         }
         else
         {
-            lblIndAudio.Text = "● VR Аудио: не выбрано";
+            lblIndAudio.Text = "● VR Аудио: не выбрано ⚙";
             lblIndAudio.ForeColor = Color.Gold;
         }
+
 
         // 4. Пилот и статус
         string pilot = tracker.ActivePilotName;
@@ -5939,7 +6594,17 @@ public class MainForm : Form
     private void BtnBrowse_Click(object sender, EventArgs e)
     {
         using (FolderBrowserDialog fbd = new FolderBrowserDialog())
-            if (fbd.ShowDialog() == DialogResult.OK) { txtPath.Text = fbd.SelectedPath; SaveCheckboxSettings(); }
+        {
+            fbd.Description = "Выберите папку RadioMusic в директории VTOL VR (текущая: " + txtPath.Text + ")";
+            if (!string.IsNullOrEmpty(txtPath.Text) && Directory.Exists(txtPath.Text))
+                fbd.SelectedPath = txtPath.Text;
+            if (fbd.ShowDialog() == DialogResult.OK)
+            {
+                txtPath.Text = fbd.SelectedPath;
+                SaveCheckboxSettings();
+                RefreshStatusIndicators();
+            }
+        }
     }
 
     private void BtnInstall_Click(object sender, EventArgs e)
@@ -5997,72 +6662,17 @@ public class MainForm : Form
         if (Directory.Exists(txtPath.Text)) Process.Start("explorer.exe", txtPath.Text);
     }
 
-    private void InitSystemTray()
-    {
-        trayMenu = new ContextMenuStrip();
-        ToolStripMenuItem itemRestore = new ToolStripMenuItem("Показать главное окно");
-        itemRestore.Click += delegate { RestoreFromTray(); };
-        trayMenu.Items.Add(itemRestore);
-
-        ToolStripMenuItem itemShuffle = new ToolStripMenuItem("Перемешать треки сейчас");
-        itemShuffle.Click += delegate {
-            string dir = txtPath.Text.Trim('"');
-            if (Directory.Exists(dir))
-            {
-                bool ok = MusicShuffler.ShuffleNow(dir, chkShuffle.Checked);
-                if (trayIcon != null)
-                    trayIcon.ShowBalloonTip(2000, "VTOL QoL", ok ? "Плейлист перемешан!" : "Шафл невозможен (игра запущена или папка пуста).", ToolTipIcon.Info);
-            }
-        };
-        trayMenu.Items.Add(itemShuffle);
-
-        ToolStripMenuItem itemOpenFolder = new ToolStripMenuItem("Открыть папку RadioMusic");
-        itemOpenFolder.Click += delegate {
-            string dir = txtPath.Text.Trim('"');
-            if (Directory.Exists(dir)) Process.Start("explorer.exe", dir);
-        };
-        trayMenu.Items.Add(itemOpenFolder);
-
-        trayMenu.Items.Add(new ToolStripSeparator());
-
-        ToolStripMenuItem itemExit = new ToolStripMenuItem("Выход из VTOL QoL");
-        itemExit.Click += delegate {
-            isExplicitExit = true;
-            if (trayIcon != null) trayIcon.Visible = false;
-            Application.Exit();
-        };
-        trayMenu.Items.Add(itemExit);
-
-        trayIcon = new NotifyIcon();
-        trayIcon.Text = "VTOL QoL — Flight Audio Hub";
-        trayIcon.Icon = this.Icon;
-        trayIcon.ContextMenuStrip = trayMenu;
-        trayIcon.Visible = true;
-        trayIcon.DoubleClick += delegate { RestoreFromTray(); };
-    }
-
-    private void RestoreFromTray()
-    {
-        this.Show();
-        this.WindowState = FormWindowState.Normal;
-        this.BringToFront();
-        this.Activate();
-    }
-
     private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
     {
-        if (!isExplicitExit && e.CloseReason == CloseReason.UserClosing)
+        SaveCheckboxSettings();
+        if (uiStatusTimer != null)
         {
-            e.Cancel = true;
-            this.Hide();
-            if (trayIcon != null)
-                trayIcon.ShowBalloonTip(2500, "VTOL QoL", "Утилита свернута в трей и продолжает работу в фоне.", ToolTipIcon.Info);
+            uiStatusTimer.Stop();
+            uiStatusTimer.Dispose();
         }
-        else
-        {
-            SaveCheckboxSettings();
-        }
+        Environment.Exit(0);
     }
+
 
     private CheckBox CreateCheckBox(string text, int top, bool isChecked)
     {
@@ -6072,6 +6682,43 @@ public class MainForm : Form
         cb.Size = new Size(505, 24);
         cb.Checked = isChecked;
         cb.ForeColor = Color.FromArgb(210, 240, 220);
+        cb.Cursor = Cursors.Hand;
+
+        cb.Paint += (s, e) => {
+            e.Graphics.Clear(this.BackColor);
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            int boxSize = 15;
+            int boxY = (cb.Height - boxSize) / 2;
+            Rectangle boxRect = new Rectangle(1, boxY, boxSize, boxSize);
+
+            Color fill = cb.Checked ? Color.FromArgb(0, 75, 42) : Color.FromArgb(24, 30, 27);
+            Color border = cb.Checked ? Color.FromArgb(0, 255, 102) : Color.FromArgb(65, 95, 80);
+
+            using (SolidBrush br = new SolidBrush(fill))
+                e.Graphics.FillRectangle(br, boxRect);
+            using (Pen pen = new Pen(border, 1.4f))
+                e.Graphics.DrawRectangle(pen, boxRect);
+
+            if (cb.Checked)
+            {
+                using (Pen checkPen = new Pen(Color.FromArgb(0, 255, 102), 2.1f))
+                {
+                    checkPen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                    checkPen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                    e.Graphics.DrawLines(checkPen, new Point[] {
+                        new Point(4, boxY + 8),
+                        new Point(7, boxY + 11),
+                        new Point(13, boxY + 4)
+                    });
+                }
+            }
+
+            TextRenderer.DrawText(e.Graphics, cb.Text, cb.Font,
+                new Rectangle(23, 0, cb.Width - 23, cb.Height),
+                cb.ForeColor, TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+        };
+
         this.Controls.Add(cb);
         return cb;
     }
@@ -6318,7 +6965,7 @@ public class MainForm : Form
                 "@echo off\r\n\"" + installedExe + "\" --shuffle \"" + gameDir + "\"\r\n",
                 Encoding.ASCII);
 
-            if (firstRun) ConfigureSteam(batPath);
+            ConfigureSteam(batPath);
 
             UpdateStatus("VTOL QoL готов к работе.", 100);
         }
