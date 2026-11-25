@@ -599,6 +599,164 @@ public static class AudioSessionDucking
         return false;
     }
 }
+// =========================================================================
+// === СИСТЕМА ОЗВУЧКИ СЕРИЙ УБИЙСТВ (WT + UNREAL TOURNAMENT 3) =============
+// =========================================================================
+public static class KillSoundPlayer
+{
+    private static readonly object stateLock = new object();
+    private static int comboStreak = 0;
+    private static DateTime lastKillUtc = DateTime.MinValue;
+    private const int ComboTimeoutSeconds = 25;
+
+    private static int requestedGeneration = 0;
+    private static int requestedTier = 0;
+    private static Thread playerThread = null;
+    private static AutoResetEvent playSignal = new AutoResetEvent(false);
+
+    private static readonly string[] tierFileBases = new string[]
+    {
+        "1_kill",          // 1: War Thunder
+        "2_doublekill",    // 2: Double Kill
+        "3_triplekill",    // 3: Triple Kill
+        "4_megakill",      // 4: Mega Kill
+        "5_ultrakill",     // 5: Ultra Kill
+        "6_monsterkill",   // 6: Monster Kill
+        "7_ludicrouskill", // 7: Ludicrous Kill
+        "8_holyshit"       // 8+: Holy Shit
+    };
+
+    public static string GetSoundsDir()
+    {
+        string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL", "KillSounds");
+        try { Directory.CreateDirectory(dir); } catch { }
+        return dir;
+    }
+
+    public static void ResetCombo()
+    {
+        lock (stateLock)
+        {
+            comboStreak = 0;
+            lastKillUtc = DateTime.MinValue;
+        }
+    }
+
+    public static void RegisterKills(int count)
+    {
+        if (count <= 0) return;
+        lock (stateLock)
+        {
+            DateTime now = DateTime.UtcNow;
+            if ((now - lastKillUtc).TotalSeconds > ComboTimeoutSeconds)
+                comboStreak = 0;
+
+            comboStreak += count;
+            requestedTier = Math.Min(comboStreak, 8);
+            requestedGeneration++;
+            lastKillUtc = now;
+
+            if (playerThread == null || !playerThread.IsAlive)
+            {
+                playerThread = new Thread(AudioLoop);
+                playerThread.IsBackground = true;
+                playerThread.SetApartmentState(ApartmentState.STA);
+                playerThread.Start();
+            }
+            playSignal.Set();
+        }
+    }
+
+    private static string ResolveSoundFile(int tier)
+    {
+        string dir = GetSoundsDir();
+        string baseName = tierFileBases[Math.Max(0, Math.Min(tier - 1, tierFileBases.Length - 1))];
+        string[] exts = new string[] { ".mp3", ".wav" };
+
+        // 1. Проверяем извлечённый или пользовательский файл
+        foreach (string ext in exts)
+        {
+            string p = Path.Combine(dir, baseName + ext);
+            if (File.Exists(p)) return p;
+        }
+
+        // 2. Извлекаем из вшитых ресурсов .exe
+        foreach (string ext in exts)
+        {
+            string resName = baseName + ext;
+            string targetPath = Path.Combine(dir, resName);
+            try
+            {
+                using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(resName))
+                {
+                    if (s != null)
+                    {
+                        using (FileStream fs = new FileStream(targetPath, FileMode.Create, FileAccess.Write))
+                            s.CopyTo(fs);
+                        return targetPath;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        if (tier > 1) return ResolveSoundFile(1);
+        return null;
+    }
+
+    private static void AudioLoop()
+    {
+        System.Windows.Media.MediaPlayer player = new System.Windows.Media.MediaPlayer();
+        player.Volume = 1.0;
+        int currentGen = 0;
+
+        while (true)
+        {
+            int genToPlay = 0;
+            int tierToPlay = 0;
+
+            lock (stateLock)
+            {
+                if (requestedGeneration != currentGen)
+                {
+                    genToPlay = requestedGeneration;
+                    tierToPlay = requestedTier;
+                }
+            }
+
+            if (genToPlay != 0)
+            {
+                currentGen = genToPlay;
+                try
+                {
+                    // Мгновенно обрываем предыдущий звук, если он ещё играет
+                    player.Stop();
+                    player.Close();
+
+                    string filePath = ResolveSoundFile(tierToPlay);
+                    AppLogger.Log("SOUND", string.Format("Тир {0} (прерывание предыдущего): {1}", tierToPlay, filePath ?? "не найден"));
+
+                    if (!string.IsNullOrEmpty(filePath) && File.Exists(filePath))
+                    {
+                        player.Open(new Uri(filePath, UriKind.Absolute));
+                        player.Play();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Error("SOUND", "AudioLoop", ex);
+                }
+            }
+
+            // Прокачиваем сообщения WPF Dispatcher в STA-потоке и ждём следующего сигнала
+            System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(
+                System.Windows.Threading.DispatcherPriority.Background,
+                new Action(delegate { })
+            );
+            playSignal.WaitOne(25);
+        }
+    }
+}
 
 // =========================================================================
 // === ТРЕКЕР ИГРЫ: DISCORD RPC + АУДИО VR + DUCKING + ЛОГБУК (ЕДИНСТВЕННЫЙ) =
@@ -629,6 +787,13 @@ public class GameTracker
     public volatile bool DuckingEnabled = true;
     public volatile bool AudioSwitchEnabled = true;
     public volatile bool DiagnosticsEnabled = false;
+
+    public volatile bool IsDiscordConnected = false;
+    public volatile bool IsDiscordAccessDenied = false;
+    public volatile bool IsGameActive = false;
+    public volatile string ActivePilotName = "—";
+    public volatile string ActiveFlightSummary = "В меню";
+
 
     private bool running = false;
     private static bool elevationAttempted = false;
@@ -808,6 +973,9 @@ public class GameTracker
                     }
 
                     if (pipe != null) { try { pipe.Dispose(); } catch { } pipe = null; }
+                    IsDiscordConnected = false;
+                    IsGameActive = false;
+                    ActiveFlightSummary = "В меню";
                     currentAircraft = "В ангаре / Меню";
                     currentCallsign = "В ангаре / Меню";
                     kills = 0;
@@ -885,8 +1053,10 @@ public class GameTracker
                                     {
                                         myNick = nick;
                                         myNickEsc = Regex.Escape(myNick);
+                                        ActivePilotName = myNick;
                                         AppLogger.Log("TRACKER", "Активный пилот: " + myNick);
                                     }
+
                                 }
 
                                 // 1. Запоминаем выбранный самолёт ("Set current vehicle to F-45A"), но в статус пока не ставим
@@ -971,35 +1141,91 @@ public class GameTracker
                                 }
 
 
-                                // 5. Сбитые цели
+                                // 5. Сбитые цели (актуальный формат VTOL VR: "FlightLogger: <Target> was killed by F-45A (shutze).")
                                 if (!string.IsNullOrEmpty(myNickEsc))
                                 {
-                                    foreach (string killTpl in patterns.KillTemplates)
+                                    int newKills = 0;
+                                    string lastTarget = "Цель";
+
+                                    // Основной формат VTOL VR (исключаем самоубийство, когда цель = сам игрок)
+                                    MatchCollection mcKill = Regex.Matches(
+                                        chunk,
+                                        @"FlightLogger:\s*(?<target>[^\r\n]+?)\s+was killed by\s+[^\r\n]*?\(" + myNickEsc + @"\)",
+                                        RegexOptions.IgnoreCase
+                                    );
+                                    foreach (Match mk in mcKill)
                                     {
-                                        string pat = killTpl.Replace("{NICK}", myNickEsc);
-                                        if (Regex.IsMatch(chunk, "(?i)" + pat))
+                                        string targetName = mk.Groups["target"].Value.Trim();
+                                        if (targetName.IndexOf("(" + myNick + ")", StringComparison.OrdinalIgnoreCase) >= 0)
+                                            continue; // пропускаем самоуничтожение
+
+                                        newKills++;
+                                        lastTarget = targetName;
+                                        kills++;
+                                        WriteFlightLog("KILL", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Сбит: " + lastTarget);
+                                    }
+
+                                    // Резервная проверка по пользовательским шаблонам из log_patterns.ini
+                                    if (newKills == 0)
+                                    {
+                                        foreach (string killTpl in patterns.KillTemplates)
                                         {
-                                            kills++;
-                                            WriteFlightLog("KILL", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Цель уничтожена");
-                                            break;
+                                            string pat = killTpl.Replace("{NICK}", myNickEsc);
+                                            Match mLegacy = Regex.Match(chunk, pat, RegexOptions.IgnoreCase);
+                                            if (mLegacy.Success)
+                                            {
+                                                kills++;
+                                                WriteFlightLog("KILL", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Цель уничтожена");
+                                                break;
+                                            }
                                         }
+                                    }
+
+                                    if (newKills > 0)
+                                    {
+                                        AppLogger.Log("TRACKER", string.Format("Подтверждено сбитие ({0}): всего за сессию = {1}", lastTarget, kills));
+                                        if (SettingsManager.GetBool("KillSoundEnabled", true))
+                                            KillSoundPlayer.RegisterKills(newKills);
                                     }
                                 }
 
-                                // 6. Катапультирование / потеря борта
+
+                                // 6. Катапультирование / потеря борта (строго по нику текущего пилота)
                                 bool hit = false;
-                                foreach (string ejTpl in patterns.EjectTemplates)
+                                if (!string.IsNullOrEmpty(myNickEsc))
                                 {
-                                    string pat = !string.IsNullOrEmpty(myNickEsc) ? ejTpl.Replace("{NICK}", myNickEsc) : ejTpl.Replace("{NICK}", ".+?");
-                                    if (Regex.IsMatch(chunk, pat)) { hit = true; break; }
+                                    foreach (string ejTpl in patterns.EjectTemplates)
+                                    {
+                                        string pat = ejTpl.Replace("{NICK}", myNickEsc);
+                                        if (Regex.IsMatch(chunk, pat, RegexOptions.IgnoreCase)) { hit = true; break; }
+                                    }
+                                    // Формат VTOL VR: "FlightLogger: F-45A (shutze) ejected." или "FlightLogger: F-45A (shutze) was killed."
+                                    if (!hit && Regex.IsMatch(chunk, @"FlightLogger:\s*[^\r\n]*?\(" + myNickEsc + @"\)[^\r\n]*?\b(?:ejected|was killed|died|crashed)\b", RegexOptions.IgnoreCase))
+                                        hit = true;
+                                    // Резервный формат без FlightLogger: "$shutze$ ejected" или "shutze was killed"
+                                    if (!hit && Regex.IsMatch(chunk, @"(?:\$|\b)" + myNickEsc + @"\$?\s+(?:ejected|was killed|died|crashed)\b", RegexOptions.IgnoreCase))
+                                        hit = true;
                                 }
+
                                 if (hit)
                                 {
+                                    KillSoundPlayer.ResetCombo();
                                     string evType = chunk.IndexOf("ejected", StringComparison.OrdinalIgnoreCase) >= 0 ? "EJECT" : "KIA";
                                     WriteFlightLog(evType, currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, evType == "EJECT" ? "Катапультирование" : "Борт сбит / потерян");
                                     currentAircraft = "В ангаре / Меню";
                                     currentCallsign = "В ангаре / Меню";
                                     inSortie = false;
+                                    AppLogger.Log("TRACKER", "Пилот " + myNick + " погиб/катапультировался (" + evType + ").");
+
+                                    if (SettingsManager.GetBool("Shuffle", true))
+                                    {
+                                        string mDir = SettingsManager.Get("RadioMusicDir", "");
+                                        if (!string.IsNullOrEmpty(mDir) && Directory.Exists(mDir))
+                                        {
+                                            bool shuffled = MusicShuffler.ShuffleNow(mDir, true, true);
+                                            AppLogger.Log("MUSIC", "Перемешивание треков после гибели/катапультирования: " + shuffled);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1007,6 +1233,7 @@ public class GameTracker
                 }
 
                 // Ducking
+
 
                 if (DuckingEnabled)
                 {
@@ -1047,11 +1274,15 @@ public class GameTracker
                                     {
                                         pipe.Dispose();
                                         pipe = null;
+                                        IsDiscordConnected = false;
                                     }
                                     else
                                     {
+                                        IsDiscordConnected = true;
+                                        IsDiscordAccessDenied = false;
                                         break;
                                     }
+
                                 }
                                 catch (Exception exPipe)
                                 {
@@ -1065,8 +1296,10 @@ public class GameTracker
                                 hPipe.Dispose();
                                 if (err != 2)
                                 {
+                                    if (err == 5) IsDiscordAccessDenied = true;
                                     AppLogger.Log("DISCORD", string.Format("CreateFile discord-ipc-{0} Win32Error={1}", i, err));
                                     if (err == 5 && !elevationAttempted)
+
                                     {
                                         elevationAttempted = true;
                                         bool isAdmin = new System.Security.Principal.WindowsPrincipal(
@@ -1098,6 +1331,9 @@ public class GameTracker
 
                     if (pipe != null)
                     {
+                        IsGameActive = true;
+                        ActiveFlightSummary = inSortie ? (currentAircraft + " (" + currentCallsign + ")") : "В ангаре / Меню";
+                        if (!string.IsNullOrEmpty(myNick)) ActivePilotName = myNick;
                         string det = "Борт: " + currentAircraft + (kills > 0 ? " | Сбито: " + kills : "");
                         string st = "Позывной: " + currentCallsign;
                         string json = "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + Process.GetCurrentProcess().Id +
@@ -1172,10 +1408,10 @@ public static class MusicShuffler
         return Path.Combine(dir, "shuffle_history.txt");
     }
 
-    public static bool ShuffleNow(string musicDir, bool smart)
+    public static bool ShuffleNow(string musicDir, bool smart, bool forceInGame = false)
     {
         if (!Directory.Exists(musicDir)) return false;
-        if (IsGameRunning()) return false; // никогда не трогаем файлы во время игры
+        if (!forceInGame && IsGameRunning()) return false;
 
         string[] files;
         try { files = Directory.GetFiles(musicDir, "*.mp3", SearchOption.TopDirectoryOnly); }
@@ -2387,14 +2623,40 @@ public static class WorkshopBrowser
 
 
 // =========================================================================
-// === ЗАГРУЗЧИК FBX (БИНАРНЫЙ + УПРОЩЕННЫЙ ASCII) =========================
+// === ЗАГРУЗЧИК FBX (РАЗДЕЛЕНИЕ КОРПУСА/ДЕТАЛЕЙ + АНТИ-Z-FIGHTING) =========
 // =========================================================================
-public class FbxMeshData
+public class FbxSubMesh
 {
     public List<System.Windows.Media.Media3D.Point3D> Vertices = new List<System.Windows.Media.Media3D.Point3D>();
     public List<int> Indices = new List<int>();
     public List<System.Windows.Point> UVs = new List<System.Windows.Point>();
 }
+
+public class FbxLightMarker
+{
+    public string Kind; // "NavRed", "NavGreen", "NavWhite", "Strobe", "Landing"
+    public System.Windows.Media.Media3D.Point3D Position;
+}
+
+public class FbxLightMarker
+{
+    public string Kind; // "NavRed", "NavGreen", "NavWhite", "Strobe", "Landing"
+    public System.Windows.Media.Media3D.Point3D Position;
+}
+
+public class FbxMeshData
+{
+    public FbxSubMesh Body = new FbxSubMesh();
+    public FbxSubMesh Details = new FbxSubMesh();
+    public FbxSubMesh Glass = new FbxSubMesh();
+    public List<FbxLightMarker> Lights = new List<FbxLightMarker>();
+
+    public int TotalVertices
+    {
+        get { return Body.Vertices.Count + Details.Vertices.Count + Glass.Vertices.Count; }
+    }
+}
+
 
 public static class FbxLoader
 {
@@ -2428,13 +2690,25 @@ public static class FbxLoader
         public string UVRef = "Direct";
     }
 
+    private static object GetProp(FbxNode n, int index)
+    {
+        if (n == null || n.Properties == null || index < 0 || index >= n.Properties.Count) return null;
+        int cur = 0;
+        foreach (object obj in n.Properties)
+        {
+            if (cur == index) return obj;
+            cur++;
+        }
+        return null;
+    }
 
     public static FbxMeshData Load(string path)
     {
         byte[] data = File.ReadAllBytes(path);
         if (data.Length > 23 && Encoding.ASCII.GetString(data, 0, 18) == "Kaydara FBX Binary")
         {
-            try { return LoadBinary(data); } catch { return null; }
+            try { return LoadBinary(data); }
+            catch (Exception ex) { AppLogger.Error("FBX", Path.GetFileName(path), ex); return null; }
         }
         return null;
     }
@@ -2458,20 +2732,27 @@ public static class FbxLoader
 
         Dictionary<long, FbxGeomPart> geoms = new Dictionary<long, FbxGeomPart>();
         Dictionary<long, FbxModelTransform> models = new Dictionary<long, FbxModelTransform>();
+        Dictionary<long, string> materials = new Dictionary<long, string>();
         Dictionary<long, long> geomToModel = new Dictionary<long, long>();
+        Dictionary<long, List<string>> modelToMaterials = new Dictionary<long, List<string>>();
 
         foreach (FbxNode child in objects.Children)
         {
             if (child.Name == "Geometry" && child.Properties.Count > 0)
             {
-                long id = Convert.ToInt64(child.Properties[0]);
+                long id = Convert.ToInt64(GetProp(child, 0));
                 FbxGeomPart part = ParseGeometryNode(child, id);
                 if (part != null && part.RawVerts.Count > 0) geoms[id] = part;
             }
             else if (child.Name == "Model" && child.Properties.Count > 0)
             {
-                long id = Convert.ToInt64(child.Properties[0]);
+                long id = Convert.ToInt64(GetProp(child, 0));
                 models[id] = ParseModelNode(child, id);
+            }
+            else if (child.Name == "Material" && child.Properties.Count > 1)
+            {
+                long id = Convert.ToInt64(GetProp(child, 0));
+                materials[id] = GetProp(child, 1) as string ?? "";
             }
         }
 
@@ -2480,106 +2761,269 @@ public static class FbxLoader
         {
             foreach (FbxNode c in conns.Children)
             {
-                if (c.Name == "C" && c.Properties.Count >= 3 && (c.Properties[0] as string) == "OO")
+                if (c.Name == "C" && c.Properties.Count >= 3 && (GetProp(c, 0) as string) == "OO")
                 {
-                    long childId = Convert.ToInt64(c.Properties[1]);
-                    long parentId = Convert.ToInt64(c.Properties[2]);
+                    long childId = Convert.ToInt64(GetProp(c, 1));
+                    long parentId = Convert.ToInt64(GetProp(c, 2));
                     if (geoms.ContainsKey(childId) && models.ContainsKey(parentId))
                         geomToModel[childId] = parentId;
                     else if (models.ContainsKey(childId) && models.ContainsKey(parentId))
                         models[childId].ParentId = parentId;
+                    else if (materials.ContainsKey(childId) && models.ContainsKey(parentId))
+                    {
+                        List<string> list;
+                        if (!modelToMaterials.TryGetValue(parentId, out list))
+                        {
+                            list = new List<string>();
+                            modelToMaterials[parentId] = list;
+                        }
+                        list.Add(materials[childId]);
+                    }
                 }
             }
         }
 
-        return AssembleFullMesh(geoms, models, geomToModel);
+        return AssembleFullMesh(geoms, models, geomToModel, modelToMaterials);
     }
+
+    private static string GetFullHierarchyName(long modelId, Dictionary<long, FbxModelTransform> models, Dictionary<long, List<string>> modelToMaterials)
+    {
+        StringBuilder sb = new StringBuilder();
+        HashSet<long> visited = new HashSet<long>();
+        long cur = modelId;
+        while (cur != 0 && models.ContainsKey(cur) && !visited.Contains(cur))
+        {
+            visited.Add(cur);
+            FbxModelTransform m = models[cur];
+            if (!string.IsNullOrEmpty(m.Name)) sb.Append(" ").Append(m.Name);
+            List<string> mats;
+            if (modelToMaterials.TryGetValue(cur, out mats))
+                foreach (string mat in mats) sb.Append(" ").Append(mat);
+            cur = m.ParentId;
+        }
+        return sb.ToString();
+    }
+
+    private static bool ContainsAny(string text, params string[] keywords)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        foreach (string kw in keywords)
+            if (text.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        return false;
+    }
+
     private static FbxMeshData AssembleFullMesh(
-    Dictionary<long, FbxGeomPart> geoms,
-    Dictionary<long, FbxModelTransform> models,
-    Dictionary<long, long> geomToModel)
+        Dictionary<long, FbxGeomPart> geoms,
+        Dictionary<long, FbxModelTransform> models,
+        Dictionary<long, long> geomToModel,
+        Dictionary<long, List<string>> modelToMaterials)
     {
         bool hasDetailedParts = false;
         foreach (var kv in geoms) if (kv.Value.RawVerts.Count > 30) { hasDetailedParts = true; break; }
 
         FbxMeshData result = new FbxMeshData();
+        HashSet<string> seenGeometrySignatures = new HashSet<string>();
 
         foreach (var kv in geoms)
         {
             FbxGeomPart part = kv.Value;
-            if (hasDetailedParts && !(part.RawVerts.Count > 24)) continue;
+            if (hasDetailedParts && !(part.RawVerts.Count > 24))
+            {
+                string quickName = "";
+                long tmpId;
+                if (geomToModel.TryGetValue(part.Id, out tmpId))
+                    quickName = GetFullHierarchyName(tmpId, models, modelToMaterials);
+                if (!ContainsAny(quickName, "Rotor", "Blade", "Prop"))
+                    continue;
+            }
 
             System.Windows.Media.Media3D.Matrix3D worldMat = System.Windows.Media.Media3D.Matrix3D.Identity;
+            string fullTag = "";
             long modelId;
+            string selfName = "";
             if (geomToModel.TryGetValue(part.Id, out modelId))
             {
-                FbxModelTransform m;
-                if (models.TryGetValue(modelId, out m) && m.Name != null &&
-     (m.Name.IndexOf("Collider", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Hitbox", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("LOD1", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("LOD2", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("LOD3", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Shadow", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Glass", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Cockpit", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Interior", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Seat", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Damage", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Dmg", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Break", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Broken", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Debris", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Stub", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Stump", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Cap", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Decal", StringComparison.OrdinalIgnoreCase) >= 0 ||
-      m.Name.IndexOf("Emblem", StringComparison.OrdinalIgnoreCase) >= 0))
-                    continue;
+                if (models.ContainsKey(modelId) && !string.IsNullOrEmpty(models[modelId].Name))
+                    selfName = models[modelId].Name;
+
+                fullTag = GetFullHierarchyName(modelId, models, modelToMaterials);
+
+                // 1. Отсекаем все повреждённые дубликаты (_damaged, _dmg, _destroyed, _broken, dmg1..4),
+                // негнущиеся дубли (_unbent), дальние LOD (кроме двигателей vgEngineLowPoly!),
+                // осколки стекла, царапины, аватарки, камеры и шлем/руки пилота
+                bool isEngineNozzle = ContainsAny(fullTag, "vgEngine", "mat_vgLowpoly", "leftEngine", "rightEngine", "t55-engine");
+
+                if (!isEngineNozzle)
+                {
+                    if (ContainsAny(selfName,
+                        "_damaged", "_dmg", "_destroyed", ".destroyed", "_broken",
+                        "LOD 1", "LOD 2", "LOD 3", "LOD 4", "LOD1", "LOD2", "LOD3", "LOD4",
+                        "LowPoly", "_lod", "GlassBreak", ".scratch", "_glare",
+                        "steamImg", "TailArt", "Collider", "Hitbox", "Trigger", "Shadow",
+                        "Flame", "Afterburner", "ExhaustCone", "JetFlame", "NavLight", "Strobe", "LandingLight", "TaxiLight"))
+                        continue;
+
+                    if (ContainsAny(fullTag,
+                        "_damaged", "_dmg", "_destroyed", ".destroyed", "_broken",
+                        "dmg1", "dmg2", "dmg3", "dmg4", "Blurred",
+                        "sevtfLowPoly", "body_LOD2", "LOD 2", "LOD2", "LOD3",
+                        "steamUserImage", "FlybyCam", "SpectatorCam", "Camcorder", "Remote", "BobblePilot",
+                        "[CameraRig]", "Camera (eye)", "Helmet", "hqh", "flesh", "headSphere", "hmdVisor", "tintVisor"))
+                        continue;
+                }
 
 
                 worldMat = BuildWorldMatrix(modelId, models);
             }
 
-            List<int> polyVerts = new List<int>();
-        List<int> polyCorners = new List<int>();
-        int cornerIdx = 0;
+            List<System.Windows.Media.Media3D.Point3D> worldVerts = new List<System.Windows.Media.Media3D.Point3D>(part.RawVerts.Count);
+            double minX = double.MaxValue, minY = double.MaxValue, minZ = double.MaxValue;
+            double maxX = double.MinValue, maxY = double.MinValue, maxZ = double.MinValue;
 
-        foreach (int raw in part.RawPolyIndices)
-        {
-            bool last = raw < 0;
-            int vIdx = last ? (-raw - 1) : raw;
-            polyVerts.Add(vIdx);
-            polyCorners.Add(cornerIdx);
-            cornerIdx++;
-
-            if (last)
+            for (int i = 0; i < part.RawVerts.Count; i++)
             {
-                for (int k = 1; k + 1 < polyVerts.Count; k++)
+                System.Windows.Media.Media3D.Point3D wp = worldMat.Transform(part.RawVerts[i]);
+                worldVerts.Add(wp);
+                if (wp.X < minX) minX = wp.X; if (wp.X > maxX) maxX = wp.X;
+                if (wp.Y < minY) minY = wp.Y; if (wp.Y > maxY) maxY = wp.Y;
+                if (wp.Z < minZ) minZ = wp.Z; if (wp.Z > maxZ) maxZ = wp.Z;
+            }
+
+            if (part.RawVerts.Count <= 6 && part.RawPolyIndices.Count <= 6)
+                continue;
+
+            string sig = string.Format("{0}_{1}_{2:F3}_{3:F3}_{4:F3}_{5:F3}_{6:F3}_{7:F3}",
+                part.RawVerts.Count, part.RawPolyIndices.Count,
+                minX, minY, minZ, maxX, maxY, maxZ);
+            if (seenGeometrySignatures.Contains(sig))
+            {
+                if (ContainsAny(fullTag, "T-55") && ContainsAny(fullTag, "flap", "wing", "body", "airbrake"))
+                    AppLogger.Log("T55_DUP", string.Format("Self='{0}', Verts={1}, Tag='{2}'", selfName.Trim(), part.RawVerts.Count, fullTag.Trim()));
+                continue;
+            }
+            seenGeometrySignatures.Add(sig);
+
+            if (ContainsAny(fullTag, "T-55") && ContainsAny(fullTag, "flap", "wing", "body", "airbrake"))
+                AppLogger.Log("T55_OK", string.Format("Self='{0}', Verts={1}, UVs={2}, BBox=({3:F1},{4:F1},{5:F1})..({6:F1},{7:F1},{8:F1})",
+                    selfName.Trim(), part.RawVerts.Count, part.RawUVs.Count, minX, minY, minZ, maxX, maxY, maxZ));
+
+            FbxSubMesh targetSub = result.Body;
+
+            // 2. Стекло фонаря кабины (полупрозрачный плексиглас)
+            bool isGlassMesh = ContainsAny(selfName, "Canopy", "Glass", "Windshield", "Transparent") &&
+                               !ContainsAny(selfName, "Frame", "Cylinder", "Piston", "Switch", "Button", "Sensor", "Tads", "Optic", "Camera", "Turret");
+            bool isGlassMat = ContainsAny(fullTag, "mat_f45CanopyExt", "mat_ewCanopy", "CanopyGlass", "CockpitGlass", "HudGlass");
+
+            if ((isGlassMesh || isGlassMat) && !ContainsAny(selfName, "Frame", "detCord", "Cylinder", "Piston"))
+            {
+                targetSub = result.Glass;
+            }
+            // 3. Сопла двигателей (vgEngineLowPoly, _engine), шасси (_ext2), интерьер кабины (_int, cockpitProps, acesSeat)
+            else if (part.RawUVs.Count == 0 || ContainsAny(fullTag,
+                "vgEngine", "mat_vgLowpoly", "_ext2", "_engine", "_int", "Interior", "cockpitProps", "NonUIDash", "DashCanvas", "Instruments",
+                "acesSeat", "EjectorSeat", "Seat", "Stick", "Throttle", "Pedal", "MFD", "Switch", "Button", "Knob", "Gauge",
+                "LandingGear", "landingGear", "FrontGear", "LeftGear", "RightGear", "Wheel", "Tire", "Tyre", "Strut", "Piston", "catHook",
+                "Nozzle", "gimbalFin", "Turbine", "Compressor", "liftFanCylinder", "liftFanPiston", "IntakeGuides",
+                "mat_tgp", "eyeHolder", "Pylon", "Rail", "Launcher", "Rack", "Hardpoint", "Missile", "Bomb", "tempMirror"))
+            {
+                targetSub = result.Details;
+            }
+
+            List<int> polyVerts = new List<int>();
+            List<int> polyCorners = new List<int>();
+            int cornerIdx = 0;
+
+            foreach (int raw in part.RawPolyIndices)
+            {
+                bool last = raw < 0;
+                int vIdx = last ? (-raw - 1) : raw;
+                polyVerts.Add(vIdx);
+                polyCorners.Add(cornerIdx);
+                cornerIdx++;
+
+                if (last)
                 {
-                    int[] triV = new int[] { polyVerts[0], polyVerts[k], polyVerts[k + 1] };
-                    int[] triC = new int[] { polyCorners[0], polyCorners[k], polyCorners[k + 1] };
-
-                    for (int t = 0; t < 3; t++)
+                    for (int k = 1; k + 1 < polyVerts.Count; k++)
                     {
-                        int vi = triV[t];
-                        if (vi < 0 || vi >= part.RawVerts.Count) continue;
+                        int v0 = 0; foreach (int x in polyVerts) { v0 = x; break; }
+                        int c0 = 0; foreach (int x in polyCorners) { c0 = x; break; }
+                        int[] triV = new int[] { v0, polyVerts[k], polyVerts[k + 1] };
+                        int[] triC = new int[] { c0, polyCorners[k], polyCorners[k + 1] };
 
-                        System.Windows.Media.Media3D.Point3D pt = worldMat.Transform(part.RawVerts[vi]);
-                        result.Indices.Add(result.Vertices.Count);
-                        result.Vertices.Add(pt);
+                        for (int t = 0; t < 3; t++)
+                        {
+                            int vi = triV[t];
+                            if (vi < 0 || vi >= worldVerts.Count) continue;
 
-                        System.Windows.Point uv = ResolveUV(part, vi, triC[t]);
-                            result.UVs.Add(new System.Windows.Point(uv.X, FlipUVY ? (1.0 - uv.Y) : uv.Y));
+                            targetSub.Indices.Add(targetSub.Vertices.Count);
+                            targetSub.Vertices.Add(worldVerts[vi]);
+
+                            System.Windows.Point uv = ResolveUV(part, vi, triC[t]);
+                            targetSub.UVs.Add(new System.Windows.Point(uv.X, FlipUVY ? (1.0 - uv.Y) : uv.Y));
                         }
                     }
-                polyVerts.Clear();
-                polyCorners.Clear();
+                    polyVerts.Clear();
+                    polyCorners.Clear();
+                }
             }
         }
-    }
 
-        return result.Vertices.Count > 0 ? result : null;
+        foreach (var mkv in models)
+        {
+            FbxModelTransform m = mkv.Value;
+            string mName = m.Name ?? "";
+            string hName = GetFullHierarchyName(m.Id, models, modelToMaterials);
+
+            // Исключаем повреждённые дубли, тумблеры в кабине (Switch, Interactable, DashCanvas)
+            // и пустые корневые контейнеры-контроллеры (Controller, ExtLights, LightSwitches)
+            if (ContainsAny(hName,
+                "_damaged", "_dmg", "_destroyed", ".destroyed", "_broken",
+                "LOD 2", "LOD2", "Folded", "BrokenWing", "Camcorder", "Spectator",
+                "Switch", "Interactable", "Controller", "DashCanvas", "Overhead",
+                "LightSwitches", "ExtLights", "LeftLightObjs", "RightLightObjs", "LightObjs"))
+                continue;
+
+            string kind = null;
+            if (ContainsAny(mName, "RedStrobe", "redStrobe", "Beacon", "AntiCol"))
+                kind = "RedStrobe";
+            else if (ContainsAny(mName, "Strobe"))
+                kind = "Strobe";
+            else if (ContainsAny(mName, "LandingLight", "TaxiLight", "NoseLight", "Spotlight"))
+                kind = "Landing";
+            else if (ContainsAny(mName, "NavLight", "Nav_L", "Nav_R", "WingLight", "TailLight"))
+            {
+                if (ContainsAny(mName, "Tail", "White", "Rear")) kind = "NavWhite";
+                else kind = "NavAuto";
+            }
+
+            if (kind != null)
+            {
+                System.Windows.Media.Media3D.Matrix3D wm = BuildWorldMatrix(m.Id, models);
+                System.Windows.Media.Media3D.Point3D pos = wm.Transform(new System.Windows.Media.Media3D.Point3D(0, 0, 0));
+
+                // Игнорируем нулевую точку (0,0,0), если узел не смещён
+                if (pos.X * pos.X + pos.Y * pos.Y + pos.Z * pos.Z < 1.0) continue;
+
+                // Склеиваем родительский узел и дочерний блик (радиус 120 ед. до нормализации)
+                bool dup = false;
+                for (int i = 0; i < result.Lights.Count; i++)
+                {
+                    if ((result.Lights[i].Position - pos).LengthSquared < 14000.0) { dup = true; break; }
+                }
+                if (!dup)
+                    result.Lights.Add(new FbxLightMarker { Kind = kind, Position = pos });
+            }
+        }
+
+
+        if (result.Body.Vertices.Count == 0 && result.Details.Vertices.Count > 0)
+        {
+            result.Body = result.Details;
+            result.Details = new FbxSubMesh();
+        }
+
+        return result.TotalVertices > 0 ? result : null;
+
     }
 
     private static System.Windows.Point ResolveUV(FbxGeomPart part, int vertIdx, int cornerIdx)
@@ -2600,29 +3044,31 @@ public static class FbxLoader
     }
 
     private static System.Windows.Media.Media3D.Matrix3D BuildWorldMatrix(long modelId, Dictionary<long, FbxModelTransform> models)
-{
-    System.Windows.Media.Media3D.Matrix3D mat = System.Windows.Media.Media3D.Matrix3D.Identity;
-    HashSet<long> visited = new HashSet<long>();
-    long cur = modelId;
-    while (cur != 0 && models.ContainsKey(cur) && !visited.Contains(cur))
     {
-        visited.Add(cur);
-        FbxModelTransform m = models[cur];
-        System.Windows.Media.Media3D.Transform3DGroup tg = new System.Windows.Media.Media3D.Transform3DGroup();
-        tg.Children.Add(new System.Windows.Media.Media3D.ScaleTransform3D(m.Sx, m.Sy, m.Sz));
-        tg.Children.Add(new System.Windows.Media.Media3D.RotateTransform3D(new System.Windows.Media.Media3D.AxisAngleRotation3D(new System.Windows.Media.Media3D.Vector3D(1, 0, 0), m.Rx)));
-        tg.Children.Add(new System.Windows.Media.Media3D.RotateTransform3D(new System.Windows.Media.Media3D.AxisAngleRotation3D(new System.Windows.Media.Media3D.Vector3D(0, 1, 0), m.Ry)));
-        tg.Children.Add(new System.Windows.Media.Media3D.RotateTransform3D(new System.Windows.Media.Media3D.AxisAngleRotation3D(new System.Windows.Media.Media3D.Vector3D(0, 0, 1), m.Rz)));
-        tg.Children.Add(new System.Windows.Media.Media3D.TranslateTransform3D(m.Tx, m.Ty, m.Tz));
-        mat = System.Windows.Media.Media3D.Matrix3D.Multiply(mat, tg.Value);
-        cur = m.ParentId;
+        System.Windows.Media.Media3D.Matrix3D mat = System.Windows.Media.Media3D.Matrix3D.Identity;
+        HashSet<long> visited = new HashSet<long>();
+        long cur = modelId;
+        while (cur != 0 && models.ContainsKey(cur) && !visited.Contains(cur))
+        {
+            visited.Add(cur);
+            FbxModelTransform m = models[cur];
+            System.Windows.Media.Media3D.Transform3DGroup tg = new System.Windows.Media.Media3D.Transform3DGroup();
+            tg.Children.Add(new System.Windows.Media.Media3D.ScaleTransform3D(m.Sx, m.Sy, m.Sz));
+            tg.Children.Add(new System.Windows.Media.Media3D.RotateTransform3D(new System.Windows.Media.Media3D.AxisAngleRotation3D(new System.Windows.Media.Media3D.Vector3D(1, 0, 0), m.Rx)));
+            tg.Children.Add(new System.Windows.Media.Media3D.RotateTransform3D(new System.Windows.Media.Media3D.AxisAngleRotation3D(new System.Windows.Media.Media3D.Vector3D(0, 1, 0), m.Ry)));
+            tg.Children.Add(new System.Windows.Media.Media3D.RotateTransform3D(new System.Windows.Media.Media3D.AxisAngleRotation3D(new System.Windows.Media.Media3D.Vector3D(0, 0, 1), m.Rz)));
+            tg.Children.Add(new System.Windows.Media.Media3D.TranslateTransform3D(m.Tx, m.Ty, m.Tz));
+            mat = System.Windows.Media.Media3D.Matrix3D.Multiply(mat, tg.Value);
+            cur = m.ParentId;
+        }
+        return mat;
     }
-    return mat;
-}
-private static FbxModelTransform ParseModelNode(FbxNode node, long id)
-{
-    FbxModelTransform tr = new FbxModelTransform { Id = id };
-    if (node.Properties.Count > 1) tr.Name = node.Properties[1] as string;
+
+    private static FbxModelTransform ParseModelNode(FbxNode node, long id)
+    {
+        FbxModelTransform tr = new FbxModelTransform { Id = id };
+
+        if (node.Properties.Count > 1) tr.Name = node.Properties[1] as string;
     FbxNode p70 = FindChild(node.Children, "Properties70");
     if (p70 != null)
     {
@@ -2642,8 +3088,19 @@ private static FbxModelTransform ParseModelNode(FbxNode node, long id)
     }
     return tr;
 }
+    private static bool HasValidUVData(FbxNode uvNode)
+    {
+        if (uvNode == null) return false;
+        FbxNode uvData = FindChild(uvNode.Children, "UV");
+        if (uvData == null || uvData.Properties.Count == 0) return false;
+        double[] arr = GetProp(uvData, 0) as double[];
+        if (arr == null || arr.Length < 4) return false;
+        for (int i = 0; i < arr.Length; i++)
+            if (Math.Abs(arr[i]) > 0.0001) return true;
+        return false;
+    }
 
-private static FbxGeomPart ParseGeometryNode(FbxNode geometry, long id)
+    private static FbxGeomPart ParseGeometryNode(FbxNode geometry, long id)
 {
         FbxGeomPart part = new FbxGeomPart { Id = id };
         FbxNode verticesNode = FindChild(geometry.Children, "Vertices");
@@ -2657,6 +3114,9 @@ private static FbxGeomPart ParseGeometryNode(FbxNode geometry, long id)
         {
             int idx = (UseSecondUV && uvLayers.Count > 1) ? 1 : 0;
             uvNode = uvLayers[idx];
+            // Если выбранный UV-слой пустой или все координаты в (0,0) — переключаемся на другой слой
+            if (uvLayers.Count > 1 && !HasValidUVData(uvNode))
+                uvNode = uvLayers[1 - idx];
         }
 
 
@@ -2817,11 +3277,49 @@ public class Livery3DViewerForm : Form
     private bool dragging = false;
     private double orbitYaw = 45, orbitPitch = 20, zoomDist = 4;
 
-        private ComboBox cmbModelSelect;
-        private System.Windows.Controls.TextBlock lblMissingModel;
-        private System.Windows.Media.Media3D.ModelVisual3D modelVisual;
+    private ComboBox cmbModelSelect;
+    private System.Windows.Controls.TextBlock lblMissingModel;
+    private System.Windows.Media.Media3D.ModelVisual3D modelVisual;
+    private System.Windows.Media.Media3D.ModelVisual3D cloudsVisual;
+    private System.Windows.Media.Media3D.ModelVisual3D rainVisual;
+    private System.Windows.Media.Media3D.TranslateTransform3D rainDropTransform;
+    private System.Windows.Media.SolidColorBrush rainMatBrush;
+    private System.Windows.Media.Media3D.Model3DGroup lightGroup;
+    private System.Windows.Controls.Canvas bgCanvas;
+    private System.Windows.Controls.Canvas fgCanvas;
+    private int lightPreset = 0; // 0 = Студия, 1 = Солнце, 2 = Ночь
 
-        public Livery3DViewerForm(LiveryEntry liveryEntry)
+    private class CloudBank3D
+    {
+        public double Yaw, Pitch, Dist, SpeedYaw, Scale;
+        public System.Windows.Controls.Canvas Visual;
+    }
+
+    private class PassThroughCloud
+    {
+        public double Progress; // 0.0 -> 1.0 (пролёт мимо/сквозь самолёт)
+        public double OffsetX, OffsetY, Speed, Scale;
+        public System.Windows.Controls.Canvas Visual;
+    }
+
+    private List<CloudBank3D> activeCloudBanks = new List<CloudBank3D>();
+    private List<PassThroughCloud> passClouds = new List<PassThroughCloud>();
+    private System.Windows.Forms.Timer cloudAnimTimer;
+
+    // Поля для ночной грозы (lightPreset == 3)
+    private System.Windows.Media.Media3D.DirectionalLight stormFlashLight;
+    private double lightningFlashAlpha = 0.0; // 0.0 -> 1.0 (яркость текущей вспышки)
+    private int lightningPulsesLeft = 0;
+    private double lightningYaw = 215.0;
+    private double lightningPitch = 8.0;
+    private int lightningTicksUntilNext = 90;
+    private int lightningSeed = 1337;
+    private double rainPhase = 0.0;
+
+
+
+
+    public Livery3DViewerForm(LiveryEntry liveryEntry)
         {
             this.entry = liveryEntry;
             this.Text = "VTOL QoL — 3D просмотр ливреи: " + liveryEntry.Name;
@@ -2833,14 +3331,26 @@ public class Livery3DViewerForm : Form
             host.Dock = DockStyle.Fill;
             this.Controls.Add(host);
 
-            System.Windows.Controls.Grid grid = new System.Windows.Controls.Grid();
-            grid.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(28, 32, 34));
-            viewport = new System.Windows.Controls.Viewport3D();
-            viewport.IsHitTestVisible = false;
-            grid.Children.Add(viewport);
-            host.Child = grid;
+        System.Windows.Controls.Grid grid = new System.Windows.Controls.Grid();
+        grid.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(26, 31, 35));
+        bgCanvas = new System.Windows.Controls.Canvas();
+        bgCanvas.IsHitTestVisible = false;
+        grid.Children.Add(bgCanvas);
 
-            Panel pnlBottom = new Panel();
+        viewport = new System.Windows.Controls.Viewport3D();
+        viewport.IsHitTestVisible = false;
+        grid.Children.Add(viewport);
+
+        fgCanvas = new System.Windows.Controls.Canvas();
+        fgCanvas.IsHitTestVisible = false;
+        grid.Children.Add(fgCanvas);
+
+        grid.SizeChanged += (s, e) => RenderBackgroundDecor();
+        host.Child = grid;
+
+
+
+        Panel pnlBottom = new Panel();
             pnlBottom.Dock = DockStyle.Bottom;
             pnlBottom.Height = 42;
             pnlBottom.BackColor = Color.FromArgb(24, 28, 26);
@@ -2883,8 +3393,14 @@ public class Livery3DViewerForm : Form
         btnFlipY.Click += (s, e) => { FbxLoader.FlipUVY = !FbxLoader.FlipUVY; LoadModelAndTexture(); };
         pnlBottom.Controls.Add(btnFlipY);
 
-        Label lblHint = new Label() { Text = "ЛКМ — вращение", Left = 650, Top = 13, AutoSize = true, ForeColor = Color.Silver };
+        Button btnLight = new Button() { Text = "☀ Свет", Left = 648, Top = 7, Width = 78, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(95, 75, 25), ForeColor = Color.White };
+        btnLight.Click += (s, e) => { lightPreset = (lightPreset + 1) % 4; ApplyLightingPreset(); };
+        pnlBottom.Controls.Add(btnLight);
+
+
+        Label lblHint = new Label() { Text = "ЛКМ — вращение", Left = 732, Top = 13, AutoSize = true, ForeColor = Color.Silver };
         pnlBottom.Controls.Add(lblHint);
+
 
 
         grid.MouseLeftButtonDown += (s, e) => { dragging = true; lastMouse = e.GetPosition(grid); grid.CaptureMouse(); };
@@ -2906,43 +3422,961 @@ public class Livery3DViewerForm : Form
                 UpdateCamera();
             };
 
-            InitScene();
-            entry.Aircraft = cmbModelSelect.SelectedItem.ToString();
-            LoadModelAndTexture();
-        }
+        this.FormClosing += (s, e) => {
+            if (cloudAnimTimer != null) { cloudAnimTimer.Stop(); cloudAnimTimer.Dispose(); cloudAnimTimer = null; }
+        };
 
-        private void InitScene()
+        InitScene();
+        entry.Aircraft = cmbModelSelect.SelectedItem.ToString();
+        LoadModelAndTexture();
+    }
+
+    private void InitScene()
+    {
+        camera = new System.Windows.Media.Media3D.PerspectiveCamera();
+        camera.FieldOfView = 45;
+        viewport.Camera = camera;
+
+        System.Windows.Media.Media3D.ModelVisual3D lightVisual = new System.Windows.Media.Media3D.ModelVisual3D();
+        lightGroup = new System.Windows.Media.Media3D.Model3DGroup();
+        lightVisual.Content = lightGroup;
+        viewport.Children.Add(lightVisual);
+
+        ApplyLightingPreset();
+        UpdateCamera();
+    }
+
+    private void ApplyLightingPreset()
+    {
+        if (lightGroup == null) return;
+        lightGroup.Children.Clear();
+        if (fgCanvas != null) fgCanvas.Children.Clear();
+        System.Windows.Controls.Grid grid = (System.Windows.Controls.Grid)host.Child;
+
+        if (lightPreset == 0)
         {
-            camera = new System.Windows.Media.Media3D.PerspectiveCamera();
-            camera.FieldOfView = 45;
-            viewport.Camera = camera;
+            System.Windows.Media.RadialGradientBrush rad = new System.Windows.Media.RadialGradientBrush(
+                System.Windows.Media.Color.FromRgb(34, 42, 46),
+                System.Windows.Media.Color.FromRgb(18, 22, 24));
+            grid.Background = rad;
 
-            System.Windows.Media.Media3D.ModelVisual3D lightVisual = new System.Windows.Media.Media3D.ModelVisual3D();
-            System.Windows.Media.Media3D.Model3DGroup lightGroup = new System.Windows.Media.Media3D.Model3DGroup();
-            lightGroup.Children.Add(new System.Windows.Media.Media3D.AmbientLight(System.Windows.Media.Color.FromRgb(145, 145, 145)));
-            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(System.Windows.Media.Colors.White, new System.Windows.Media.Media3D.Vector3D(-1, -2, -2)));
-            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(System.Windows.Media.Color.FromRgb(190, 190, 190), new System.Windows.Media.Media3D.Vector3D(2, 1, 2)));
-            lightVisual.Content = lightGroup;
-            viewport.Children.Add(lightVisual);
-
-            UpdateCamera();
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.AmbientLight(System.Windows.Media.Color.FromRgb(95, 102, 110)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(255, 248, 235),
+                new System.Windows.Media.Media3D.Vector3D(-1.2, -2.0, -1.5)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(150, 180, 220),
+                new System.Windows.Media.Media3D.Vector3D(1.8, -0.5, 1.0)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(130, 145, 165),
+                new System.Windows.Media.Media3D.Vector3D(0.3, 1.4, 1.8)));
         }
-
-        private void UpdateCamera()
+        else if (lightPreset == 1)
         {
-            double yawRad = orbitYaw * Math.PI / 180.0;
-            double pitchRad = orbitPitch * Math.PI / 180.0;
-            double x = zoomDist * Math.Cos(pitchRad) * Math.Sin(yawRad);
-            double y = zoomDist * Math.Sin(pitchRad);
-            double z = zoomDist * Math.Cos(pitchRad) * Math.Cos(yawRad);
-            camera.Position = new System.Windows.Media.Media3D.Point3D(x, y, z);
-            System.Windows.Media.Media3D.Vector3D look = new System.Windows.Media.Media3D.Vector3D(-x, -y, -z);
-            look.Normalize();
-            camera.LookDirection = look;
-            camera.UpDirection = new System.Windows.Media.Media3D.Vector3D(0, 1, 0);
+            System.Windows.Media.LinearGradientBrush sky = new System.Windows.Media.LinearGradientBrush();
+            sky.StartPoint = new System.Windows.Point(0.5, 0);
+            sky.EndPoint = new System.Windows.Point(0.5, 1);
+            sky.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromRgb(16, 44, 84), 0.0));
+            sky.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromRgb(42, 92, 148), 0.52));
+            sky.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromRgb(118, 162, 202), 0.85));
+            sky.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromRgb(176, 198, 214), 1.0));
+            grid.Background = sky;
+
+
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.AmbientLight(System.Windows.Media.Color.FromRgb(90, 105, 125)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(255, 244, 214),
+                new System.Windows.Media.Media3D.Vector3D(1.5, -2.2, -1.2)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(125, 165, 215),
+                new System.Windows.Media.Media3D.Vector3D(-1.2, -0.8, 1.4)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(105, 100, 90),
+                new System.Windows.Media.Media3D.Vector3D(0.0, 2.0, 0.0)));
+        }
+        else if (lightPreset == 2)
+        {
+            System.Windows.Media.LinearGradientBrush night = new System.Windows.Media.LinearGradientBrush();
+            night.StartPoint = new System.Windows.Point(0.5, 0);
+            night.EndPoint = new System.Windows.Point(0.5, 1);
+            night.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromRgb(7, 10, 18), 0.0));
+            night.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromRgb(14, 22, 38), 1.0));
+            grid.Background = night;
+
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.AmbientLight(System.Windows.Media.Color.FromRgb(42, 52, 68)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(195, 220, 255),
+                new System.Windows.Media.Media3D.Vector3D(-1.2, -2.2, -1.0)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(70, 110, 160),
+                new System.Windows.Media.Media3D.Vector3D(1.5, 0.5, 1.5)));
+        }
+        else
+        {
+            // 3: Ночная гроза (свинцовое небо + вспышки 3D-молний на самолёте)
+            System.Windows.Media.LinearGradientBrush stormSky = new System.Windows.Media.LinearGradientBrush();
+            stormSky.StartPoint = new System.Windows.Point(0.5, 0);
+            stormSky.EndPoint = new System.Windows.Point(0.5, 1);
+            stormSky.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromRgb(9, 12, 19), 0.0));
+            stormSky.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromRgb(18, 25, 36), 0.65));
+            stormSky.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromRgb(26, 35, 48), 1.0));
+            grid.Background = stormSky;
+
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.AmbientLight(System.Windows.Media.Color.FromRgb(32, 40, 52)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(95, 125, 165),
+                new System.Windows.Media.Media3D.Vector3D(-1.0, -2.0, -1.0)));
+            lightGroup.Children.Add(new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(45, 65, 95),
+                new System.Windows.Media.Media3D.Vector3D(1.5, 0.8, 1.2)));
+
+            // Динамический источник света от вспышки молнии (в обычное время выключен = 0,0,0)
+            stormFlashLight = new System.Windows.Media.Media3D.DirectionalLight(
+                System.Windows.Media.Color.FromRgb(0, 0, 0),
+                new System.Windows.Media.Media3D.Vector3D(0.5, -1.5, -1.0));
+            lightGroup.Children.Add(stormFlashLight);
         }
 
-        private void LoadModelAndTexture()
+        UpdateVolumetricClouds();
+        RenderBackgroundDecor();
+
+    }
+    private System.Windows.Controls.Canvas BuildCumulusCloudElement(double scale, bool isPassThrough, bool isStorm = false)
+    {
+        System.Windows.Controls.Canvas cloud = new System.Windows.Controls.Canvas();
+        cloud.Width = 960 * scale;
+        cloud.Height = 380 * scale;
+        cloud.IsHitTestVisible = false;
+
+        // Широкий многослойный облачный фронт (28 пересекающихся клубов без резких границ "отдельных плюшек")
+        double[,] puffs = new double[,]
+        {
+            // Нижняя плотная теневая основа (широкое основание гряды)
+            { 160, 255, 190, 72, 1, 135 },
+            { 310, 262, 220, 78, 1, 150 },
+            { 480, 265, 240, 82, 1, 155 },
+            { 650, 260, 215, 76, 1, 145 },
+            { 800, 252, 185, 68, 1, 130 },
+            { 240, 240, 210, 75, 1, 130 },
+            { 400, 242, 230, 80, 1, 140 },
+            { 570, 242, 225, 78, 1, 140 },
+            { 730, 240, 195, 72, 1, 130 },
+
+            // Широкая средняя облачная пелена (соединяет всё в единый массив)
+            { 130, 215, 180, 95,  0, 175 },
+            { 250, 195, 210, 115, 0, 205 },
+            { 390, 180, 235, 130, 0, 225 },
+            { 540, 182, 240, 132, 0, 225 },
+            { 685, 195, 210, 115, 0, 205 },
+            { 820, 215, 175, 92,  0, 170 },
+            { 320, 205, 220, 118, 0, 210 },
+            { 470, 202, 245, 125, 0, 220 },
+            { 615, 205, 220, 118, 0, 210 },
+
+            // Верхние пушистые кучевые гребни
+            { 220, 155, 145, 95,  0, 205 },
+            { 330, 130, 165, 112, 0, 230 },
+            { 450, 112, 185, 125, 0, 242 },
+            { 565, 122, 175, 118, 0, 235 },
+            { 670, 148, 150, 98,  0, 210 },
+            { 400, 145, 170, 108, 0, 225 },
+            { 515, 142, 175, 110, 0, 228 },
+            { 485, 88,  130, 92,  0, 225 },
+            { 375, 102, 120, 86,  0, 210 },
+            { 595, 100, 125, 88,  0, 212 }
+        };
+
+        double alphaMul = isPassThrough ? 0.58 : 1.0;
+
+        for (int i = 0; i < puffs.GetLength(0); i++)
+        {
+            double cx = puffs[i, 0] * scale;
+            double cy = puffs[i, 1] * scale;
+            double rx = puffs[i, 2] * scale;
+            double ry = puffs[i, 3] * scale;
+            bool isShadow = (puffs[i, 4] > 0.5);
+            byte maxAlpha = (byte)(puffs[i, 5] * alphaMul);
+
+            byte r = isStorm ? (isShadow ? (byte)16 : (byte)36) : (isShadow ? (byte)138 : (byte)255);
+            byte g = isStorm ? (isShadow ? (byte)21 : (byte)45) : (isShadow ? (byte)162 : (byte)254);
+            byte b = isStorm ? (isShadow ? (byte)30 : (byte)62) : (isShadow ? (byte)192 : (byte)252);
+
+
+            System.Windows.Media.RadialGradientBrush rg = new System.Windows.Media.RadialGradientBrush();
+            rg.GradientOrigin = new System.Windows.Point(0.45, 0.35);
+            rg.Center = new System.Windows.Point(0.5, 0.5);
+            rg.GradientStops.Add(new System.Windows.Media.GradientStop(
+                System.Windows.Media.Color.FromArgb(maxAlpha, r, g, b), 0.0));
+            rg.GradientStops.Add(new System.Windows.Media.GradientStop(
+                System.Windows.Media.Color.FromArgb((byte)(maxAlpha * 0.58), r, g, b), 0.45));
+            rg.GradientStops.Add(new System.Windows.Media.GradientStop(
+                System.Windows.Media.Color.FromArgb((byte)(maxAlpha * 0.16), r, g, b), 0.76));
+            rg.GradientStops.Add(new System.Windows.Media.GradientStop(
+                System.Windows.Media.Color.FromArgb(0, r, g, b), 1.0));
+            rg.Freeze();
+
+            System.Windows.Shapes.Ellipse el = new System.Windows.Shapes.Ellipse()
+            {
+                Width = rx * 2.0,
+                Height = ry * 2.0,
+                Fill = rg
+            };
+            System.Windows.Controls.Canvas.SetLeft(el, cx - rx);
+            System.Windows.Controls.Canvas.SetTop(el, cy - ry);
+            cloud.Children.Add(el);
+        }
+
+        return cloud;
+    }
+
+    private void UpdateVolumetricClouds()
+    {
+        if (cloudAnimTimer != null)
+        {
+            cloudAnimTimer.Stop();
+            cloudAnimTimer.Dispose();
+            cloudAnimTimer = null;
+        }
+        activeCloudBanks.Clear();
+        passClouds.Clear();
+        if (fgCanvas != null) fgCanvas.Children.Clear();
+
+        if (viewport != null && cloudsVisual != null)
+        {
+            viewport.Children.Remove(cloudsVisual);
+            cloudsVisual = null;
+        }
+        if (viewport != null && rainVisual != null)
+        {
+            viewport.Children.Remove(rainVisual);
+            rainVisual = null;
+            rainDropTransform = null;
+            rainMatBrush = null;
+        }
+
+        if (lightPreset != 1 && lightPreset != 3) return;
+        bool isStorm = (lightPreset == 3);
+
+        if (isStorm && viewport != null)
+            Build3DRainVolume();
+
+
+        // Сплошные перекрывающиеся облачные гряды по всему небу (от горизонта -4° до зенита +62°)
+        double[,] presets = new double[,]
+        {
+            // Нижний сплошной облачный горизонт (перекрываются каждые ~30°)
+            {   0.0, -3.5, 1.35, 0.035, 1.0 },
+            {  32.0, -2.0, 1.45, 0.038, 1.0 },
+            {  65.0, -4.0, 1.40, 0.032, 1.0 },
+            {  98.0, -1.5, 1.50, 0.040, 1.0 },
+            { 130.0, -3.5, 1.35, 0.034, 1.0 },
+            { 162.0, -2.0, 1.45, 0.036, 1.0 },
+            { 195.0, -4.2, 1.55, 0.030, 1.0 },
+            { 228.0, -1.8, 1.40, 0.038, 1.0 },
+            { 260.0, -3.5, 1.45, 0.033, 1.0 },
+            { 292.0, -2.2, 1.50, 0.037, 1.0 },
+            { 325.0, -3.8, 1.40, 0.035, 1.0 },
+
+            // Средний ярус облачных полей (12°..26° высоты)
+            {  18.0, 14.0, 1.25, 0.052, 1.1 },
+            {  75.0, 19.0, 1.30, 0.055, 1.1 },
+            { 135.0, 13.0, 1.25, 0.050, 1.1 },
+            { 195.0, 21.0, 1.35, 0.058, 1.1 },
+            { 255.0, 15.0, 1.25, 0.052, 1.1 },
+            { 312.0, 20.0, 1.30, 0.055, 1.1 },
+
+            // Верхний ярус над головой (36°..62° высоты — плотное небо при взгляде снизу вверх)
+            {  25.0, 38.0, 1.20, 0.068, 1.2 },
+            {  95.0, 46.0, 1.25, 0.072, 1.2 },
+            { 165.0, 36.0, 1.20, 0.066, 1.2 },
+            { 235.0, 52.0, 1.30, 0.075, 1.2 },
+            { 305.0, 42.0, 1.22, 0.070, 1.2 },
+            { 120.0, 62.0, 1.35, 0.080, 1.3 }
+        };
+
+        for (int i = 0; i < presets.GetLength(0); i++)
+        {
+            double sc = presets[i, 2];
+            activeCloudBanks.Add(new CloudBank3D
+            {
+                Yaw = presets[i, 0],
+                Pitch = presets[i, 1],
+                Scale = sc,
+                SpeedYaw = presets[i, 3],
+                Dist = presets[i, 4],
+                Visual = BuildCumulusCloudElement(sc, false, isStorm)
+            });
+        }
+
+        if (!isStorm)
+        {
+            passClouds.Add(new PassThroughCloud
+            {
+                Progress = -1.2,
+                OffsetX = 65,
+                OffsetY = -25,
+                Speed = 0.0022,
+                Scale = 1.05,
+                Visual = BuildCumulusCloudElement(1.05, true, false)
+            });
+        }
+
+
+
+        cloudAnimTimer = new System.Windows.Forms.Timer();
+        cloudAnimTimer.Interval = 33;
+        cloudAnimTimer.Tick += (s, e) => SortAndSyncClouds(true);
+        cloudAnimTimer.Start();
+    }
+
+    private void SortAndSyncClouds(bool advanceMovement)
+    {
+        if (lightPreset != 1 && lightPreset != 3)
+        {
+            if (fgCanvas != null && fgCanvas.Children.Count > 0) fgCanvas.Children.Clear();
+            return;
+        }
+
+        for (int i = 0; i < activeCloudBanks.Count; i++)
+        {
+            if (advanceMovement)
+                activeCloudBanks[i].Yaw = (activeCloudBanks[i].Yaw + activeCloudBanks[i].SpeedYaw * (lightPreset == 3 ? 1.6 : 1.0)) % 360.0;
+        }
+
+        if (lightPreset == 3 && advanceMovement)
+        {
+            rainPhase = (rainPhase + 22.0) % 1000.0;
+            if (lightningFlashAlpha > 0.0)
+            {
+                lightningFlashAlpha -= 0.16;
+                if (lightningFlashAlpha <= 0.25 && lightningPulsesLeft > 0)
+                {
+                    lightningPulsesLeft--;
+                    lightningFlashAlpha = 0.88; // однократный повторный импульс без зацикливания
+                }
+                if (lightningFlashAlpha < 0.0) lightningFlashAlpha = 0.0;
+            }
+            else
+            {
+                lightningTicksUntilNext--;
+                if (lightningTicksUntilNext <= 0)
+                {
+                    Random rnd = new Random(Environment.TickCount);
+                    lightningFlashAlpha = 1.0;
+                    lightningPulsesLeft = rnd.Next(0, 2); // 0 или 1 повторная вспышка
+                    lightningSeed = rnd.Next(1, 99999);
+                    lightningYaw = (orbitYaw + 180.0 + (rnd.NextDouble() * 140.0 - 70.0) + 360.0) % 360.0;
+                    lightningPitch = 6.0 + rnd.NextDouble() * 22.0;
+                    lightningTicksUntilNext = 90 + rnd.Next(130);
+                }
+            }
+
+
+            if (stormFlashLight != null)
+            {
+                byte flashVal = (byte)(lightningFlashAlpha * 235);
+                byte flashBlue = (byte)(lightningFlashAlpha * 255);
+                stormFlashLight.Color = System.Windows.Media.Color.FromRgb(flashVal, (byte)(flashVal * 0.96), flashBlue);
+                double rad = lightningYaw * Math.PI / 180.0;
+                stormFlashLight.Direction = new System.Windows.Media.Media3D.Vector3D(-Math.Sin(rad), -1.2, -Math.Cos(rad));
+            }
+        }
+
+        if (advanceMovement)
+        {
+            RenderBackgroundDecor();
+            if (lightPreset == 1) RenderPassThroughClouds();
+            else if (lightPreset == 3) Step3DRain();
+        }
+
+    }
+
+    private void RenderPassThroughClouds()
+    {
+        if (fgCanvas == null) return;
+        fgCanvas.Children.Clear();
+        if (lightPreset != 1 || passClouds.Count == 0) return;
+
+        double w = fgCanvas.ActualWidth > 0 ? fgCanvas.ActualWidth : 840;
+        double h = fgCanvas.ActualHeight > 0 ? fgCanvas.ActualHeight : 600;
+
+        for (int i = 0; i < passClouds.Count; i++)
+        {
+            PassThroughCloud pc = passClouds[i];
+            pc.Progress += pc.Speed;
+            if (pc.Progress > 1.0)
+            {
+                // Случайная пауза ~20-40 секунд до следующего пролёта
+                pc.Progress = -1.4 - ((DateTime.UtcNow.Ticks % 150) / 100.0);
+                pc.OffsetX = ((DateTime.UtcNow.Millisecond % 180) - 90);
+                pc.OffsetY = ((DateTime.UtcNow.Second % 90) - 45);
+                continue;
+            }
+            if (pc.Progress < 0.0) continue;
+
+            double t = pc.Progress;
+            double perspScale = 0.65 + t * 0.95;
+
+            // Лёгкая, ненавязчивая полупрозрачность (0.38 вместо 0.85), чтобы самолёт всегда хорошо читался
+            double opacity = Math.Sin(t * Math.PI);
+            opacity = Math.Pow(Math.Max(0, opacity), 0.85) * 0.38;
+
+
+            double cx = w * 0.5 + pc.OffsetX + (0.5 - t) * (w * 0.65);
+            double cy = h * 0.5 + pc.OffsetY + (t - 0.5) * (h * 0.35);
+
+            pc.Visual.Opacity = opacity;
+            pc.Visual.RenderTransformOrigin = new System.Windows.Point(0.5, 0.5);
+            pc.Visual.RenderTransform = new System.Windows.Media.ScaleTransform(perspScale, perspScale);
+
+            System.Windows.Controls.Canvas.SetLeft(pc.Visual, cx - pc.Visual.Width * 0.5);
+            System.Windows.Controls.Canvas.SetTop(pc.Visual, cy - pc.Visual.Height * 0.5);
+            fgCanvas.Children.Add(pc.Visual);
+        }
+    }
+
+    private double WrapAngle180(double deg)
+    {
+        deg = (deg + 180.0) % 360.0;
+        if (deg < 0) deg += 360.0;
+        return deg - 180.0;
+    }
+
+    private bool ProjectSkyObject(double objYaw, double objPitch, double w, double h, out double sx, out double sy)
+    {
+        double camLookYaw = orbitYaw + 180.0;
+        double camLookPitch = -orbitPitch;
+
+        double dYaw = WrapAngle180(objYaw - camLookYaw);
+        double dPitch = objPitch - camLookPitch;
+
+        double pxPerDeg = h / 52.0;
+        sx = w * 0.5 - dYaw * pxPerDeg;
+        sy = h * 0.5 - dPitch * pxPerDeg;
+
+        return (sx > -750 && sx < w + 750 && sy > -550 && sy < h + 550);
+    }
+
+
+    private void RenderBackgroundDecor()
+    {
+        if (bgCanvas == null) return;
+        bgCanvas.Children.Clear();
+        double w = bgCanvas.ActualWidth > 0 ? bgCanvas.ActualWidth : 840;
+        double h = bgCanvas.ActualHeight > 0 ? bgCanvas.ActualHeight : 600;
+
+        if (lightPreset == 0)
+        {
+            System.Windows.Media.Brush gridBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(24, 0, 255, 140));
+            double step = 48.0;
+            double offX = ((orbitYaw * 4.5) % step + step) % step;
+            double offY = ((orbitPitch * 4.5) % step + step) % step;
+
+
+            for (double x = offX; x < w; x += step)
+            {
+                System.Windows.Shapes.Line ln = new System.Windows.Shapes.Line() { X1 = x, Y1 = 0, X2 = x, Y2 = h, Stroke = gridBrush, StrokeThickness = 1 };
+                bgCanvas.Children.Add(ln);
+            }
+            for (double y = offY; y < h; y += step)
+            {
+                System.Windows.Shapes.Line ln = new System.Windows.Shapes.Line() { X1 = 0, Y1 = y, X2 = w, Y2 = y, Stroke = gridBrush, StrokeThickness = 1 };
+                bgCanvas.Children.Add(ln);
+            }
+
+            double cx = w / 2.0 + WrapAngle180(-orbitYaw) * 0.35;
+            double cy = h / 2.0 + orbitPitch * 0.35;
+            System.Windows.Media.Brush ringBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(38, 0, 255, 140));
+            double[] radii = new double[] { 145, 245 };
+            foreach (double r in radii)
+            {
+                System.Windows.Shapes.Ellipse el = new System.Windows.Shapes.Ellipse()
+                {
+                    Width = r * 2,
+                    Height = r * 2,
+                    Stroke = ringBrush,
+                    StrokeThickness = 1
+                };
+                System.Windows.Controls.Canvas.SetLeft(el, cx - r);
+                System.Windows.Controls.Canvas.SetTop(el, cy - r);
+                bgCanvas.Children.Add(el);
+            }
+        }
+        else if (lightPreset == 1)
+        {
+            // 1. Атмосферная дымка и нижняя облачная/морская пелена ниже линии горизонта
+            double hx, hy;
+            ProjectSkyObject(orbitYaw + 180.0, -3.0, w, h, out hx, out hy);
+            if (hy < h + 120)
+            {
+                double deckTop = Math.Max(-100, hy);
+                System.Windows.Media.LinearGradientBrush haze = new System.Windows.Media.LinearGradientBrush();
+                haze.StartPoint = new System.Windows.Point(0.5, 0);
+                haze.EndPoint = new System.Windows.Point(0.5, 1);
+                haze.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb(0, 195, 215, 230), 0.0));
+                haze.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb(145, 185, 206, 222), 0.25));
+                haze.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb(215, 130, 158, 184), 1.0));
+
+                System.Windows.Shapes.Rectangle groundDeck = new System.Windows.Shapes.Rectangle()
+                {
+                    Width = w + 4,
+                    Height = Math.Max(0, h - deckTop + 100),
+                    Fill = haze
+                };
+                System.Windows.Controls.Canvas.SetLeft(groundDeck, -2);
+                System.Windows.Controls.Canvas.SetTop(groundDeck, deckTop);
+                bgCanvas.Children.Add(groundDeck);
+            }
+
+            // 2. Всегда считаем экранную проекцию солнца (210°, 14°) без жёсткой обрезки по краям окна
+            double sx, sy;
+            ProjectSkyObject(210.0, 14.0, w, h, out sx, out sy);
+            double sunAngleFromView = Math.Abs(WrapAngle180(210.0 - (orbitYaw + 180.0)));
+            double sunVisibility = Math.Max(0.0, Math.Min(1.0, (140.0 - sunAngleFromView) / 45.0));
+
+            double sunOcclusion = 0.0;
+            for (int i = 0; i < activeCloudBanks.Count; i++)
+            {
+                CloudBank3D cb = activeCloudBanks[i];
+                double dy = WrapAngle180(cb.Yaw - 210.0);
+                double dp = cb.Pitch - 14.0;
+                double d = Math.Sqrt(dy * dy + dp * dp);
+                if (d < 22.0)
+                    sunOcclusion = Math.Max(sunOcclusion, 1.0 - (d / 22.0));
+            }
+
+            if (sunVisibility > 0.01 && sx > -1200 && sx < w + 1200 && sy > -1200 && sy < h + 1200)
+            {
+                byte atmoAlpha = (byte)((140 + sunOcclusion * 55) * sunVisibility);
+                System.Windows.Media.RadialGradientBrush atmoGlow = new System.Windows.Media.RadialGradientBrush();
+                atmoGlow.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb(atmoAlpha, 255, 246, 225), 0.0));
+                atmoGlow.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb((byte)((60 + sunOcclusion * 45) * sunVisibility), 255, 232, 190), 0.35));
+                atmoGlow.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb((byte)(18 * sunVisibility), 220, 235, 255), 0.70));
+                atmoGlow.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb(0, 220, 235, 255), 1.0));
+
+                System.Windows.Shapes.Ellipse bigGlow = new System.Windows.Shapes.Ellipse() { Width = 640, Height = 640, Fill = atmoGlow };
+                System.Windows.Controls.Canvas.SetLeft(bigGlow, sx - 320);
+                System.Windows.Controls.Canvas.SetTop(bigGlow, sy - 320);
+                bgCanvas.Children.Add(bigGlow);
+
+                byte coreAlpha = (byte)((255 - sunOcclusion * 90) * sunVisibility);
+                System.Windows.Media.RadialGradientBrush coreBrush = new System.Windows.Media.RadialGradientBrush();
+                coreBrush.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb(coreAlpha, 255, 255, 255), 0.0));
+                coreBrush.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb((byte)(coreAlpha * 0.85), 255, 252, 238), 0.35));
+                coreBrush.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb(0, 255, 245, 210), 1.0));
+
+                System.Windows.Shapes.Ellipse sunCore = new System.Windows.Shapes.Ellipse() { Width = 58, Height = 58, Fill = coreBrush };
+                System.Windows.Controls.Canvas.SetLeft(sunCore, sx - 29);
+                System.Windows.Controls.Canvas.SetTop(sunCore, sy - 29);
+                bgCanvas.Children.Add(sunCore);
+            }
+
+            // 3. Облака + подповерхностное рассеивание (Silver Lining)
+            List<System.Windows.Rect> cloudScreenBounds = new List<System.Windows.Rect>();
+
+            for (int i = 0; i < activeCloudBanks.Count; i++)
+            {
+                CloudBank3D cb = activeCloudBanks[i];
+                double cx, cy;
+                if (ProjectSkyObject(cb.Yaw, cb.Pitch, w, h, out cx, out cy))
+                {
+                    // Сохраняем экранный контур плотного ядра облака для расчёта щелей
+                    double coreW = cb.Visual.Width * 0.56;
+                    double coreH = cb.Visual.Height * 0.44;
+                    cloudScreenBounds.Add(new System.Windows.Rect(cx - coreW * 0.5, cy - coreH * 0.5, coreW, coreH));
+
+                    double dYawSun = WrapAngle180(cb.Yaw - 210.0);
+                    double dPitchSun = cb.Pitch - 14.0;
+                    double angDist = Math.Sqrt(dYawSun * dYawSun + dPitchSun * dPitchSun);
+
+                    if (angDist < 65.0)
+                    {
+                        double scatter = 1.0 - (angDist / 65.0);
+                        byte glowAlpha = (byte)(scatter * scatter * 155);
+
+                        System.Windows.Media.RadialGradientBrush scatterBrush = new System.Windows.Media.RadialGradientBrush();
+                        scatterBrush.GradientStops.Add(new System.Windows.Media.GradientStop(
+                            System.Windows.Media.Color.FromArgb(glowAlpha, 255, 249, 226), 0.0));
+                        scatterBrush.GradientStops.Add(new System.Windows.Media.GradientStop(
+                            System.Windows.Media.Color.FromArgb((byte)(glowAlpha * 0.55), 255, 236, 185), 0.50));
+                        scatterBrush.GradientStops.Add(new System.Windows.Media.GradientStop(
+                            System.Windows.Media.Color.FromArgb(0, 255, 236, 185), 1.0));
+
+                        double sw = cb.Visual.Width * 1.18;
+                        double sh = cb.Visual.Height * 1.18;
+                        System.Windows.Shapes.Ellipse scatterGlow = new System.Windows.Shapes.Ellipse()
+                        {
+                            Width = sw,
+                            Height = sh,
+                            Fill = scatterBrush
+                        };
+                        System.Windows.Controls.Canvas.SetLeft(scatterGlow, cx - sw * 0.5);
+                        System.Windows.Controls.Canvas.SetTop(scatterGlow, cy - sh * 0.5);
+                        bgCanvas.Children.Add(scatterGlow);
+                    }
+
+                    System.Windows.Controls.Canvas.SetLeft(cb.Visual, cx - cb.Visual.Width * 0.5);
+                    System.Windows.Controls.Canvas.SetTop(cb.Visual, cy - cb.Visual.Height * 0.5);
+                    bgCanvas.Children.Add(cb.Visual);
+                }
+            }
+
+            // 4. Плавные переливающиеся саншафты (мягкие световые конусы с рассеиванием вдоль и поперёк луча)
+            if (sunVisibility > 0.02 && cloudScreenBounds.Count > 0)
+            {
+                System.Windows.Controls.Canvas shaftsLayer = new System.Windows.Controls.Canvas();
+                shaftsLayer.Width = w;
+                shaftsLayer.Height = h;
+                shaftsLayer.IsHitTestVisible = false;
+                shaftsLayer.Effect = new System.Windows.Media.Effects.BlurEffect() { Radius = 28.0 };
+
+                int numRays = 72;
+                double maxRayLen = Math.Sqrt(w * w + h * h) * 1.25;
+
+                for (int r = 0; r < numRays; r++)
+                {
+                    double theta = (2.0 * Math.PI * r) / numRays;
+                    double dirX = Math.Cos(theta);
+                    double dirY = Math.Sin(theta);
+
+                    double blockScore = 0.0;
+                    double edgeProximity = 0.0;
+
+                    for (int step = 1; step <= 7; step++)
+                    {
+                        double dist = step * 55.0;
+                        double px = sx + dirX * dist;
+                        double py = sy + dirY * dist;
+
+                        for (int c = 0; c < cloudScreenBounds.Count; c++)
+                        {
+                            System.Windows.Rect rect = cloudScreenBounds[c];
+                            double rcx = rect.X + rect.Width * 0.5;
+                            double rcy = rect.Y + rect.Height * 0.5;
+                            double nx = (px - rcx) / (rect.Width * 0.5);
+                            double ny = (py - rcy) / (rect.Height * 0.5);
+                            double normDist = Math.Sqrt(nx * nx + ny * ny);
+
+                            if (normDist < 0.72)
+                            {
+                                blockScore += (0.72 - normDist) * 1.6;
+                            }
+                            else if (normDist >= 0.72 && normDist < 1.45)
+                            {
+                                double edgeFactor = 1.0 - Math.Abs(normDist - 1.02) / 0.45;
+                                if (edgeFactor > 0) edgeProximity = Math.Max(edgeProximity, edgeFactor);
+                            }
+                        }
+                    }
+
+                    double intensity = edgeProximity * Math.Max(0.0, 1.0 - blockScore) * sunVisibility;
+                    if (intensity > 0.14)
+                    {
+                        double angleDeg = theta * 180.0 / Math.PI;
+                        double beamLen = maxRayLen * (0.78 + 0.22 * intensity);
+                        double beamHeight = 76.0 + intensity * 115.0;
+
+                        System.Windows.Media.RadialGradientBrush softBeamBrush = new System.Windows.Media.RadialGradientBrush();
+                        softBeamBrush.GradientOrigin = new System.Windows.Point(0.04, 0.5);
+                        softBeamBrush.Center = new System.Windows.Point(0.18, 0.5);
+                        softBeamBrush.RadiusX = 0.85;
+                        softBeamBrush.RadiusY = 0.50;
+
+                        byte aCore = (byte)Math.Min(46, intensity * 44);
+                        byte aMid = (byte)(aCore * 0.48);
+                        byte aEdge = (byte)(aCore * 0.16);
+
+                        softBeamBrush.GradientStops.Add(new System.Windows.Media.GradientStop(
+                            System.Windows.Media.Color.FromArgb(aCore, 255, 250, 226), 0.0));
+                        softBeamBrush.GradientStops.Add(new System.Windows.Media.GradientStop(
+                            System.Windows.Media.Color.FromArgb(aMid, 255, 243, 204), 0.38));
+                        softBeamBrush.GradientStops.Add(new System.Windows.Media.GradientStop(
+                            System.Windows.Media.Color.FromArgb(aEdge, 240, 244, 255), 0.72));
+                        softBeamBrush.GradientStops.Add(new System.Windows.Media.GradientStop(
+                            System.Windows.Media.Color.FromArgb(0, 240, 244, 255), 1.0));
+
+                        System.Windows.Shapes.Ellipse beamEllipse = new System.Windows.Shapes.Ellipse()
+                        {
+                            Width = beamLen,
+                            Height = beamHeight,
+                            Fill = softBeamBrush,
+                            RenderTransformOrigin = new System.Windows.Point(0.0, 0.5),
+                            RenderTransform = new System.Windows.Media.RotateTransform(angleDeg)
+                        };
+
+                        System.Windows.Controls.Canvas.SetLeft(beamEllipse, sx);
+                        System.Windows.Controls.Canvas.SetTop(beamEllipse, sy - beamHeight * 0.5);
+                        shaftsLayer.Children.Add(beamEllipse);
+                    }
+                }
+
+                if (shaftsLayer.Children.Count > 0)
+                    bgCanvas.Children.Add(shaftsLayer);
+            }
+        }
+
+        else if (lightPreset == 2)
+        {
+            Random rnd = new Random(42667);
+
+            for (int i = 0; i < 260; i++)
+            {
+                double starYaw = rnd.NextDouble() * 360.0;
+                double starPitch = (rnd.NextDouble() * 170.0) - 85.0;
+                double sz = (i % 9 == 0) ? 2.7 : ((i % 3 == 0) ? 1.8 : 1.1);
+                byte alpha = (byte)(120 + rnd.Next(135));
+                byte blueTint = (byte)(i % 4 == 0 ? 255 : 225);
+
+                double sx, sy;
+                if (ProjectSkyObject(starYaw, starPitch, w, h, out sx, out sy))
+                {
+                    System.Windows.Shapes.Ellipse star = new System.Windows.Shapes.Ellipse()
+                    {
+                        Width = sz,
+                        Height = sz,
+                        Fill = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(alpha, 225, 235, blueTint))
+                    };
+                    System.Windows.Controls.Canvas.SetLeft(star, sx);
+                    System.Windows.Controls.Canvas.SetTop(star, sy);
+                    bgCanvas.Children.Add(star);
+                }
+            }
+
+            double mx, my;
+            if (ProjectSkyObject(242.0, 15.0, w, h, out mx, out my))
+            {
+                System.Windows.Media.RadialGradientBrush moonGlow = new System.Windows.Media.RadialGradientBrush();
+                moonGlow.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb(95, 170, 205, 255), 0.0));
+                moonGlow.GradientStops.Add(new System.Windows.Media.GradientStop(System.Windows.Media.Color.FromArgb(0, 170, 205, 255), 1.0));
+                System.Windows.Shapes.Ellipse glow = new System.Windows.Shapes.Ellipse() { Width = 170, Height = 170, Fill = moonGlow };
+                System.Windows.Controls.Canvas.SetLeft(glow, mx - 85);
+                System.Windows.Controls.Canvas.SetTop(glow, my - 85);
+                bgCanvas.Children.Add(glow);
+
+                System.Windows.Shapes.Ellipse moon = new System.Windows.Shapes.Ellipse()
+                {
+                    Width = 44,
+                    Height = 44,
+                    Fill = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(220, 232, 250))
+                };
+                System.Windows.Controls.Canvas.SetLeft(moon, mx - 22);
+                System.Windows.Controls.Canvas.SetTop(moon, my - 22);
+                bgCanvas.Children.Add(moon);
+            }
+        }
+        else
+        {
+            double lx = 0, ly = 0;
+            bool flashVisible = (lightningFlashAlpha > 0.02) && ProjectSkyObject(lightningYaw, lightningPitch, w, h, out lx, out ly);
+
+            // 1. Глубокое сине-фиолетовое свечение внутри туч (как на фотореференсе)
+            if (flashVisible)
+            {
+                System.Windows.Media.RadialGradientBrush deepBlueGlow = new System.Windows.Media.RadialGradientBrush();
+                deepBlueGlow.GradientStops.Add(new System.Windows.Media.GradientStop(
+                    System.Windows.Media.Color.FromArgb((byte)(lightningFlashAlpha * 235), 165, 195, 255), 0.0));
+                deepBlueGlow.GradientStops.Add(new System.Windows.Media.GradientStop(
+                    System.Windows.Media.Color.FromArgb((byte)(lightningFlashAlpha * 185), 55, 105, 245), 0.30));
+                deepBlueGlow.GradientStops.Add(new System.Windows.Media.GradientStop(
+                    System.Windows.Media.Color.FromArgb((byte)(lightningFlashAlpha * 95), 25, 55, 175), 0.65));
+                deepBlueGlow.GradientStops.Add(new System.Windows.Media.GradientStop(
+                    System.Windows.Media.Color.FromArgb(0, 15, 30, 110), 1.0));
+
+                System.Windows.Shapes.Ellipse flashHalo = new System.Windows.Shapes.Ellipse() { Width = 1150, Height = 820, Fill = deepBlueGlow };
+                System.Windows.Controls.Canvas.SetLeft(flashHalo, lx - 575);
+                System.Windows.Controls.Canvas.SetTop(flashHalo, ly - 380);
+                bgCanvas.Children.Add(flashHalo);
+            }
+
+            // 2. Грозовые тучи
+            for (int i = 0; i < activeCloudBanks.Count; i++)
+            {
+                CloudBank3D cb = activeCloudBanks[i];
+                double cx, cy;
+                if (ProjectSkyObject(cb.Yaw, cb.Pitch, w, h, out cx, out cy))
+                {
+                    System.Windows.Controls.Canvas.SetLeft(cb.Visual, cx - cb.Visual.Width * 0.5);
+                    System.Windows.Controls.Canvas.SetTop(cb.Visual, cy - cb.Visual.Height * 0.5);
+                    bgCanvas.Children.Add(cb.Visual);
+                }
+            }
+
+            // 3. Тонкий, дёрганый микро-сегментный канал молнии + подсвеченное облачное ядро
+            if (flashVisible)
+            {
+                // Яркое локальное пятно пробоя в облаке
+                System.Windows.Media.RadialGradientBrush breakGlow = new System.Windows.Media.RadialGradientBrush();
+                breakGlow.GradientStops.Add(new System.Windows.Media.GradientStop(
+                    System.Windows.Media.Color.FromArgb((byte)(lightningFlashAlpha * 210), 190, 215, 255), 0.0));
+                breakGlow.GradientStops.Add(new System.Windows.Media.GradientStop(
+                    System.Windows.Media.Color.FromArgb((byte)(lightningFlashAlpha * 110), 65, 115, 250), 0.45));
+                breakGlow.GradientStops.Add(new System.Windows.Media.GradientStop(
+                    System.Windows.Media.Color.FromArgb(0, 30, 60, 180), 1.0));
+
+                System.Windows.Shapes.Ellipse cloudBreak = new System.Windows.Shapes.Ellipse() { Width = 460, Height = 340, Fill = breakGlow };
+                System.Windows.Controls.Canvas.SetLeft(cloudBreak, lx - 230);
+                System.Windows.Controls.Canvas.SetTop(cloudBreak, ly - 150);
+                bgCanvas.Children.Add(cloudBreak);
+
+                Random boltRnd = new Random(lightningSeed);
+                System.Windows.Media.PointCollection mainPts = new System.Windows.Media.PointCollection();
+                double curX = lx, curY = Math.Max(-10, ly - 75);
+                mainPts.Add(new System.Windows.Point(curX, curY));
+
+                double drift = (boltRnd.NextDouble() - 0.5) * 3.5;
+                int segments = 46;
+                for (int s = 0; s < segments; s++)
+                {
+                    curX += drift + (boltRnd.NextDouble() - 0.5) * 18.0;
+                    curY += 8.0 + boltRnd.NextDouble() * 8.5;
+                    mainPts.Add(new System.Windows.Point(curX, curY));
+
+                    // Тонкие капиллярные ответвления
+                    if (s == 9 || s == 19 || s == 31)
+                    {
+                        System.Windows.Media.PointCollection branchPts = new System.Windows.Media.PointCollection();
+                        double bx = curX, by = curY;
+                        branchPts.Add(new System.Windows.Point(bx, by));
+                        double side = (s % 2 == 1) ? -1.0 : 1.0;
+                        for (int b = 0; b < 14; b++)
+                        {
+                            bx += side * (4.0 + boltRnd.NextDouble() * 9.0) + (boltRnd.NextDouble() - 0.5) * 8.0;
+                            by += 5.0 + boltRnd.NextDouble() * 7.0;
+                            branchPts.Add(new System.Windows.Point(bx, by));
+                        }
+
+                        System.Windows.Shapes.Polyline branchGlow = new System.Windows.Shapes.Polyline()
+                        {
+                            Points = branchPts,
+                            Stroke = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb((byte)(lightningFlashAlpha * 110), 80, 130, 255)),
+                            StrokeThickness = 2.4
+                        };
+                        bgCanvas.Children.Add(branchGlow);
+
+                        System.Windows.Shapes.Polyline branchCore = new System.Windows.Shapes.Polyline()
+                        {
+                            Points = branchPts,
+                            Stroke = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb((byte)(lightningFlashAlpha * 215), 225, 238, 255)),
+                            StrokeThickness = 0.85
+                        };
+                        bgCanvas.Children.Add(branchCore);
+                    }
+                }
+
+                // Сине-фиолетовый электрический ореол
+                System.Windows.Shapes.Polyline outerGlow = new System.Windows.Shapes.Polyline()
+                {
+                    Points = mainPts,
+                    Stroke = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb((byte)(lightningFlashAlpha * 125), 65, 115, 255)),
+                    StrokeThickness = 6.5,
+                    StrokeLineJoin = System.Windows.Media.PenLineJoin.Round
+                };
+                bgCanvas.Children.Add(outerGlow);
+
+                // Тонкое ослепительно-белое ядро молнии (1.5 px)
+                System.Windows.Shapes.Polyline coreBolt = new System.Windows.Shapes.Polyline()
+                {
+                    Points = mainPts,
+                    Stroke = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb((byte)(lightningFlashAlpha * 255), 248, 252, 255)),
+                    StrokeThickness = 1.5,
+                    StrokeLineJoin = System.Windows.Media.PenLineJoin.Round
+                };
+                bgCanvas.Children.Add(coreBolt);
+            }
+        }
+    }
+
+    private void Build3DRainVolume()
+    {
+        System.Windows.Media.Media3D.MeshGeometry3D mesh = new System.Windows.Media.Media3D.MeshGeometry3D();
+        double spanY = 7.0;
+
+        for (int copy = 0; copy < 2; copy++)
+        {
+            double baseOffsetY = copy * spanY;
+            Random layerRnd = new Random(8842);
+
+            for (int i = 0; i < 110; i++)
+            {
+                double x = (layerRnd.NextDouble() - 0.5) * 9.0;
+                double y = (layerRnd.NextDouble() - 0.5) * spanY + baseOffsetY;
+                double z = (layerRnd.NextDouble() - 0.5) * 9.0;
+
+                if (x * x + y * y + z * z < 1.2) continue;
+
+                double len = 0.28 + layerRnd.NextDouble() * 0.24;
+                double tiltX = -0.055;
+                double r = 0.0032;
+
+                int idx = mesh.Positions.Count;
+                mesh.Positions.Add(new System.Windows.Media.Media3D.Point3D(x - r, y, z));
+                mesh.Positions.Add(new System.Windows.Media.Media3D.Point3D(x + r, y, z));
+                mesh.Positions.Add(new System.Windows.Media.Media3D.Point3D(x - tiltX, y + len, z));
+
+                mesh.Positions.Add(new System.Windows.Media.Media3D.Point3D(x, y, z - r));
+                mesh.Positions.Add(new System.Windows.Media.Media3D.Point3D(x, y, z + r));
+                mesh.Positions.Add(new System.Windows.Media.Media3D.Point3D(x - tiltX, y + len, z));
+
+                mesh.TriangleIndices.Add(idx);
+                mesh.TriangleIndices.Add(idx + 1);
+                mesh.TriangleIndices.Add(idx + 2);
+
+                mesh.TriangleIndices.Add(idx + 3);
+                mesh.TriangleIndices.Add(idx + 4);
+                mesh.TriangleIndices.Add(idx + 5);
+            }
+        }
+        mesh.Freeze();
+
+        rainMatBrush = new System.Windows.Media.SolidColorBrush(
+            System.Windows.Media.Color.FromArgb(65, 175, 205, 240));
+        System.Windows.Media.Media3D.EmissiveMaterial rainMat = new System.Windows.Media.Media3D.EmissiveMaterial(rainMatBrush);
+
+        System.Windows.Media.Media3D.GeometryModel3D rainModel = new System.Windows.Media.Media3D.GeometryModel3D(mesh, rainMat);
+        rainModel.BackMaterial = rainMat;
+
+        rainDropTransform = new System.Windows.Media.Media3D.TranslateTransform3D(0, 0, 0);
+        rainModel.Transform = rainDropTransform;
+
+        rainVisual = new System.Windows.Media.Media3D.ModelVisual3D();
+        rainVisual.Content = rainModel;
+        viewport.Children.Add(rainVisual);
+    }
+
+    private void Step3DRain()
+    {
+        if (rainDropTransform == null || rainMatBrush == null || lightPreset != 3) return;
+        double spanY = 7.0;
+        double offset = (rainPhase * 0.018) % spanY;
+        rainDropTransform.OffsetY = -offset;
+        rainDropTransform.OffsetX = -offset * 0.14;
+
+
+        byte alpha = (byte)Math.Min(195, 58 + lightningFlashAlpha * 115);
+        rainMatBrush.Color = System.Windows.Media.Color.FromArgb(alpha, 185, 212, 248);
+    }
+
+
+    private void UpdateCamera()
+
+
+    {
+        double yawRad = orbitYaw * Math.PI / 180.0;
+        double pitchRad = orbitPitch * Math.PI / 180.0;
+        double x = zoomDist * Math.Cos(pitchRad) * Math.Sin(yawRad);
+        double y = zoomDist * Math.Sin(pitchRad);
+        double z = zoomDist * Math.Cos(pitchRad) * Math.Cos(yawRad);
+        camera.Position = new System.Windows.Media.Media3D.Point3D(x, y, z);
+        System.Windows.Media.Media3D.Vector3D look = new System.Windows.Media.Media3D.Vector3D(-x, -y, -z);
+        look.Normalize();
+        camera.LookDirection = look;
+    camera.UpDirection = new System.Windows.Media.Media3D.Vector3D(0, 1, 0);
+    SortAndSyncClouds(false);
+    RenderBackgroundDecor();
+}
+
+
+private void LoadModelAndTexture()
         {
             System.Windows.Controls.Grid grid = (System.Windows.Controls.Grid)host.Child;
             if (lblMissingModel != null) { grid.Children.Remove(lblMissingModel); lblMissingModel = null; }
@@ -2963,7 +4397,7 @@ public class Livery3DViewerForm : Form
                 return;
             }
 
-            FbxMeshData meshData = FbxLoader.Load(fbxPath);
+        FbxMeshData meshData = FbxLoader.Load(fbxPath);
         if (meshData == null)
         {
             MessageBox.Show("Не удалось прочитать FBX-файл модели: " + fbxPath, "Ошибка 3D-просмотра", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -2971,12 +4405,6 @@ public class Livery3DViewerForm : Form
         }
 
         NormalizeToUnitCube(meshData);
-
-        System.Windows.Media.Media3D.MeshGeometry3D geom = new System.Windows.Media.Media3D.MeshGeometry3D();
-        foreach (System.Windows.Media.Media3D.Point3D p in meshData.Vertices) geom.Positions.Add(p);
-        foreach (int idx in meshData.Indices) geom.TriangleIndices.Add(idx);
-        if (meshData.UVs.Count == meshData.Vertices.Count)
-            foreach (System.Windows.Point uv in meshData.UVs) geom.TextureCoordinates.Add(uv);
 
         System.Windows.Media.Brush matBrush;
         string texPath = !string.IsNullOrEmpty(entry.TexturePath) && File.Exists(entry.TexturePath) ? entry.TexturePath : null;
@@ -3001,38 +4429,99 @@ public class Livery3DViewerForm : Form
             matBrush = System.Windows.Media.Brushes.LightGray;
         }
 
-        System.Windows.Media.Media3D.DiffuseMaterial mat = new System.Windows.Media.Media3D.DiffuseMaterial(matBrush);
-        model = new System.Windows.Media.Media3D.GeometryModel3D(geom, mat);
+        System.Windows.Media.Media3D.Model3DGroup group = new System.Windows.Media.Media3D.Model3DGroup();
 
-            modelVisual = new System.Windows.Media.Media3D.ModelVisual3D();
-            modelVisual.Content = model;
-            viewport.Children.Add(modelVisual);
+        System.Windows.Media.Media3D.MeshGeometry3D bodyGeom = BuildWpfMesh(meshData.Body);
+        System.Windows.Media.Media3D.MaterialGroup bodyMatGroup = new System.Windows.Media.Media3D.MaterialGroup();
+        bodyMatGroup.Children.Add(new System.Windows.Media.Media3D.DiffuseMaterial(matBrush));
+        bodyMatGroup.Children.Add(new System.Windows.Media.Media3D.SpecularMaterial(
+            new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(65, 70, 75)), 22));
+        model = new System.Windows.Media.Media3D.GeometryModel3D(bodyGeom, bodyMatGroup);
+        model.BackMaterial = bodyMatGroup;
+        group.Children.Add(model);
 
+
+        if (meshData.Details.Vertices.Count > 0)
+        {
+            System.Windows.Media.Media3D.MeshGeometry3D detailsGeom = BuildWpfMesh(meshData.Details);
+            System.Windows.Media.Media3D.MaterialGroup detailsMat = new System.Windows.Media.Media3D.MaterialGroup();
+            detailsMat.Children.Add(new System.Windows.Media.Media3D.DiffuseMaterial(
+                new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(42, 46, 51))));
+            detailsMat.Children.Add(new System.Windows.Media.Media3D.SpecularMaterial(
+                new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(90, 95, 100)), 25));
+            group.Children.Add(new System.Windows.Media.Media3D.GeometryModel3D(detailsGeom, detailsMat));
         }
 
-        private void NormalizeToUnitCube(FbxMeshData mesh)
+        if (meshData.Glass.Vertices.Count > 0)
+        {
+            System.Windows.Media.Media3D.MeshGeometry3D glassGeom = BuildWpfMesh(meshData.Glass);
+            System.Windows.Media.Media3D.MaterialGroup glassMat = new System.Windows.Media.Media3D.MaterialGroup();
+            glassMat.Children.Add(new System.Windows.Media.Media3D.DiffuseMaterial(
+                new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(115, 35, 65, 85))));
+            glassMat.Children.Add(new System.Windows.Media.Media3D.SpecularMaterial(
+                System.Windows.Media.Brushes.White, 60));
+            group.Children.Add(new System.Windows.Media.Media3D.GeometryModel3D(glassGeom, glassMat));
+        }
+
+        modelVisual = new System.Windows.Media.Media3D.ModelVisual3D();
+        modelVisual.Content = group;
+        viewport.Children.Add(modelVisual);
+    }
+
+    private System.Windows.Media.Media3D.MeshGeometry3D BuildWpfMesh(FbxSubMesh sub)
     {
-        if (mesh.Vertices.Count == 0) return;
+        System.Windows.Media.Media3D.MeshGeometry3D geom = new System.Windows.Media.Media3D.MeshGeometry3D();
+        foreach (System.Windows.Media.Media3D.Point3D p in sub.Vertices) geom.Positions.Add(p);
+        foreach (int idx in sub.Indices) geom.TriangleIndices.Add(idx);
+        if (sub.UVs.Count == sub.Vertices.Count)
+            foreach (System.Windows.Point uv in sub.UVs) geom.TextureCoordinates.Add(uv);
+        return geom;
+    }
+
+    private void NormalizeToUnitCube(FbxMeshData mesh)
+    {
+        if (mesh.TotalVertices == 0) return;
         double minX = double.MaxValue, minY = double.MaxValue, minZ = double.MaxValue;
         double maxX = double.MinValue, maxY = double.MinValue, maxZ = double.MinValue;
-        foreach (System.Windows.Media.Media3D.Point3D p in mesh.Vertices)
+
+        FbxSubMesh[] subs = new FbxSubMesh[] { mesh.Body, mesh.Details, mesh.Glass };
+        foreach (FbxSubMesh s in subs)
         {
-            if (p.X < minX) minX = p.X; if (p.X > maxX) maxX = p.X;
-            if (p.Y < minY) minY = p.Y; if (p.Y > maxY) maxY = p.Y;
-            if (p.Z < minZ) minZ = p.Z; if (p.Z > maxZ) maxZ = p.Z;
+            foreach (System.Windows.Media.Media3D.Point3D p in s.Vertices)
+            {
+                if (p.X < minX) minX = p.X; if (p.X > maxX) maxX = p.X;
+                if (p.Y < minY) minY = p.Y; if (p.Y > maxY) maxY = p.Y;
+                if (p.Z < minZ) minZ = p.Z; if (p.Z > maxZ) maxZ = p.Z;
+            }
         }
+
         double cx = (minX + maxX) / 2.0, cy = (minY + maxY) / 2.0, cz = (minZ + maxZ) / 2.0;
         double sizeX = maxX - minX, sizeY = maxY - minY, sizeZ = maxZ - minZ;
         double maxSize = Math.Max(sizeX, Math.Max(sizeY, sizeZ));
         if (maxSize < 0.0001) maxSize = 1;
         double scale = 2.0 / maxSize;
 
-        for (int i = 0; i < mesh.Vertices.Count; i++)
+        foreach (FbxSubMesh s in subs)
         {
-            System.Windows.Media.Media3D.Point3D p = mesh.Vertices[i];
-            mesh.Vertices[i] = new System.Windows.Media.Media3D.Point3D((p.X - cx) * scale, (p.Y - cy) * scale, (p.Z - cz) * scale);
+            for (int i = 0; i < s.Vertices.Count; i++)
+            {
+                System.Windows.Media.Media3D.Point3D p = s.Vertices[i];
+                s.Vertices[i] = new System.Windows.Media.Media3D.Point3D((p.X - cx) * scale, (p.Y - cy) * scale, (p.Z - cz) * scale);
+            }
+        }
+
+        for (int i = 0; i < mesh.Lights.Count; i++)
+        {
+            System.Windows.Media.Media3D.Point3D p = mesh.Lights[i].Position;
+            mesh.Lights[i].Position = new System.Windows.Media.Media3D.Point3D((p.X - cx) * scale, (p.Y - cy) * scale, (p.Z - cz) * scale);
+            if (mesh.Lights[i].Kind == "NavAuto")
+            {
+                if (Math.Abs(mesh.Lights[i].Position.X) < 0.08) mesh.Lights[i].Kind = "NavWhite";
+                else mesh.Lights[i].Kind = mesh.Lights[i].Position.X > 0 ? "NavRed" : "NavGreen";
+            }
         }
     }
+
 
     private string FindReferenceModel(string aircraft)
     {
@@ -4064,6 +5553,7 @@ public class MainForm : Form
     private CheckBox chkDucking;
     private CheckBox chkAudioSwitch;
     private CheckBox chkDiagnostics;
+    private CheckBox chkKillSound;
     private Button btnInstall;
     private Button btnOpenFolder;
     private Label lblStatus;
@@ -4079,11 +5569,16 @@ public class MainForm : Form
     private volatile Process currentWorkerProcess = null;
     private volatile bool isCancelRequested = false;
     private GameTracker tracker = new GameTracker();
+    private Label lblIndDiscord;
+    private Label lblIndMusic;
+    private Label lblIndAudio;
+    private Label lblIndPilot;
+    private System.Windows.Forms.Timer uiStatusTimer;
 
     public MainForm()
     {
         this.Text = "VTOL QoL — Smart Radio & Media Hub | by L.Shutze";
-        this.Size = new Size(580, 710);
+        this.Size = new Size(580, 772);
         this.StartPosition = FormStartPosition.CenterScreen;
         this.FormBorderStyle = FormBorderStyle.FixedSingle;
         this.MaximizeBox = false;
@@ -4195,16 +5690,17 @@ public class MainForm : Form
         chkDucking = CreateCheckBox("Авто-затихание радио при голосовой связи", 340, SettingsManager.GetBool("Ducking", true));
         chkAudioSwitch = CreateCheckBox("Авто-переключение звука/микрофона на VR-шлем", 366, SettingsManager.GetBool("AudioSwitch", true));
         chkDiagnostics = CreateCheckBox("Диагностика лога (для подбора паттернов распознавания)", 392, SettingsManager.GetBool("DiagnosticsEnabled", false));
+        chkKillSound = CreateCheckBox("Озвучка фрагов (War Thunder + серии Unreal Tournament 3)", 416, SettingsManager.GetBool("KillSoundEnabled", true));
 
         progressBar = new ProgressBar();
-        progressBar.Location = new Point(24, 428);
+        progressBar.Location = new Point(24, 452);
         progressBar.Size = new Size(520, 14);
         progressBar.Visible = false;
         this.Controls.Add(progressBar);
 
         lblStatus = new Label();
         lblStatus.Text = "Запуск...";
-        lblStatus.Location = new Point(22, 446);
+        lblStatus.Location = new Point(22, 470);
         lblStatus.Size = new Size(520, 22);
         lblStatus.ForeColor = Color.Silver;
         this.Controls.Add(lblStatus);
@@ -4212,7 +5708,7 @@ public class MainForm : Form
         btnInstall = new Button();
         btnInstall.Text = "▶ СТАРТ VTOL VR";
         btnInstall.Font = new Font("Consolas", 10f, FontStyle.Bold);
-        btnInstall.Location = new Point(24, 476);
+        btnInstall.Location = new Point(24, 500);
         btnInstall.Size = new Size(255, 42);
         btnInstall.FlatStyle = FlatStyle.Flat;
         btnInstall.BackColor = Color.FromArgb(0, 140, 60);
@@ -4220,20 +5716,20 @@ public class MainForm : Form
         btnInstall.Click += new EventHandler(BtnInstall_Click);
         this.Controls.Add(btnInstall);
 
-        btnSaveVault = new Button();
-        btnSaveVault.Text = "🛡 БЭКАП СОХРАНЕНИЙ";
-        btnSaveVault.Font = new Font("Consolas", 9.5f, FontStyle.Bold);
-        btnSaveVault.Location = new Point(290, 476);
-        btnSaveVault.Size = new Size(254, 42);
-        btnSaveVault.FlatStyle = FlatStyle.Flat;
-        btnSaveVault.BackColor = Color.FromArgb(130, 80, 0);
-        btnSaveVault.ForeColor = Color.White;
-        btnSaveVault.Click += new EventHandler(BtnSaveVault_Click);
-        this.Controls.Add(btnSaveVault);
+        btnLiveryManager = new Button();
+        btnLiveryManager.Text = "✈ МЕНЕДЖЕР ЛИВРЕЙ";
+        btnLiveryManager.Font = new Font("Consolas", 9.5f, FontStyle.Bold);
+        btnLiveryManager.Location = new Point(290, 500);
+        btnLiveryManager.Size = new Size(254, 42);
+        btnLiveryManager.FlatStyle = FlatStyle.Flat;
+        btnLiveryManager.BackColor = Color.FromArgb(70, 50, 110);
+        btnLiveryManager.ForeColor = Color.White;
+        btnLiveryManager.Click += new EventHandler(BtnLiveryManager_Click);
+        this.Controls.Add(btnLiveryManager);
 
         btnManageMusic = new Button();
         btnManageMusic.Text = "♫ ТРЕКИ";
-        btnManageMusic.Location = new Point(24, 526);
+        btnManageMusic.Location = new Point(24, 550);
         btnManageMusic.Size = new Size(125, 38);
         btnManageMusic.FlatStyle = FlatStyle.Flat;
         btnManageMusic.BackColor = Color.FromArgb(0, 95, 125);
@@ -4241,19 +5737,20 @@ public class MainForm : Form
         btnManageMusic.Click += new EventHandler(BtnManageMusic_Click);
         this.Controls.Add(btnManageMusic);
 
-        btnLiveryManager = new Button();
-        btnLiveryManager.Text = "✈ ЛИВРЕИ";
-        btnLiveryManager.Location = new Point(157, 526);
-        btnLiveryManager.Size = new Size(125, 38);
-        btnLiveryManager.FlatStyle = FlatStyle.Flat;
-        btnLiveryManager.BackColor = Color.FromArgb(70, 50, 110);
-        btnLiveryManager.ForeColor = Color.White;
-        btnLiveryManager.Click += new EventHandler(BtnLiveryManager_Click);
-        this.Controls.Add(btnLiveryManager);
+        btnSaveVault = new Button();
+        btnSaveVault.Text = "🛡 БЭКАП";
+        btnSaveVault.Location = new Point(157, 550);
+        btnSaveVault.Size = new Size(125, 38);
+        btnSaveVault.FlatStyle = FlatStyle.Flat;
+        btnSaveVault.BackColor = Color.FromArgb(130, 80, 0);
+        btnSaveVault.ForeColor = Color.White;
+        btnSaveVault.Click += new EventHandler(BtnSaveVault_Click);
+        this.Controls.Add(btnSaveVault);
+
 
         btnLogbook = new Button();
         btnLogbook.Text = "📋 ЛОГБУК";
-        btnLogbook.Location = new Point(290, 526);
+        btnLogbook.Location = new Point(290, 550);
         btnLogbook.Size = new Size(125, 38);
         btnLogbook.FlatStyle = FlatStyle.Flat;
         btnLogbook.BackColor = Color.FromArgb(40, 85, 70);
@@ -4263,7 +5760,7 @@ public class MainForm : Form
 
         btnAudioSettings = new Button();
         btnAudioSettings.Text = "🎧 АУДИО VR";
-        btnAudioSettings.Location = new Point(423, 526);
+        btnAudioSettings.Location = new Point(423, 550);
         btnAudioSettings.Size = new Size(122, 38);
         btnAudioSettings.FlatStyle = FlatStyle.Flat;
         btnAudioSettings.BackColor = Color.FromArgb(80, 60, 20);
@@ -4273,7 +5770,7 @@ public class MainForm : Form
 
         btnDiagnostics = new Button();
         btnDiagnostics.Text = "🔧 ЛОГ ИГРЫ";
-        btnDiagnostics.Location = new Point(24, 572);
+        btnDiagnostics.Location = new Point(24, 596);
         btnDiagnostics.Size = new Size(125, 32);
         btnDiagnostics.FlatStyle = FlatStyle.Flat;
         btnDiagnostics.BackColor = Color.FromArgb(30, 38, 34);
@@ -4283,24 +5780,45 @@ public class MainForm : Form
 
         Button btnAppLog = new Button();
         btnAppLog.Text = "🐞 ЛОГ ПРОГИ";
-        btnAppLog.Location = new Point(155, 572);
+        btnAppLog.Location = new Point(155, 596);
         btnAppLog.Size = new Size(124, 32);
         btnAppLog.FlatStyle = FlatStyle.Flat;
         btnAppLog.BackColor = Color.FromArgb(55, 35, 45);
         btnAppLog.ForeColor = Color.Gold;
         btnAppLog.Click += (s, e) => { try { Process.Start("notepad.exe", AppLogger.GetLogPath()); } catch { } };
         this.Controls.Add(btnAppLog);
-
-
         btnOpenFolder = new Button();
         btnOpenFolder.Text = "📁 ПАПКА RADIOMUSIC";
-        btnOpenFolder.Location = new Point(290, 572);
+        btnOpenFolder.Location = new Point(290, 596);
         btnOpenFolder.Size = new Size(254, 32);
         btnOpenFolder.FlatStyle = FlatStyle.Flat;
         btnOpenFolder.BackColor = Color.FromArgb(30, 38, 34);
         btnOpenFolder.ForeColor = Color.FromArgb(0, 255, 102);
         btnOpenFolder.Click += new EventHandler(BtnOpenFolder_Click);
         this.Controls.Add(btnOpenFolder);
+
+
+        Panel pnlIndicators = new Panel();
+        pnlIndicators.Location = new Point(24, 638);
+        pnlIndicators.Size = new Size(520, 44);
+        pnlIndicators.BackColor = Color.FromArgb(24, 30, 27);
+        pnlIndicators.BorderStyle = BorderStyle.FixedSingle;
+        this.Controls.Add(pnlIndicators);
+
+        lblIndDiscord = new Label() { Left = 8, Top = 5, Width = 245, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Silver, Text = "● Discord: ожидание" };
+        lblIndMusic = new Label() { Left = 260, Top = 5, Width = 250, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Silver, Text = "● Треки: проверка..." };
+        lblIndAudio = new Label() { Left = 8, Top = 23, Width = 245, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Silver, Text = "● VR Аудио: проверка..." };
+        lblIndPilot = new Label() { Left = 260, Top = 23, Width = 250, Height = 16, Font = new Font("Consolas", 8.5f, FontStyle.Bold), ForeColor = Color.Cyan, Text = "● Пилот: —" };
+
+        pnlIndicators.Controls.Add(lblIndDiscord);
+        pnlIndicators.Controls.Add(lblIndMusic);
+        pnlIndicators.Controls.Add(lblIndAudio);
+        pnlIndicators.Controls.Add(lblIndPilot);
+
+        uiStatusTimer = new System.Windows.Forms.Timer();
+        uiStatusTimer.Interval = 1500;
+        uiStatusTimer.Tick += (s, e) => RefreshStatusIndicators();
+        uiStatusTimer.Start();
 
         InitSystemTray();
         this.FormClosing += new FormClosingEventHandler(MainForm_FormClosing);
@@ -4322,6 +5840,87 @@ public class MainForm : Form
         chkDiagnostics.CheckedChanged += delegate { tracker.DiagnosticsEnabled = chkDiagnostics.Checked; SaveCheckboxSettings(); };
         chkShuffle.CheckedChanged += delegate { SaveCheckboxSettings(); };
         chkLoudNorm.CheckedChanged += delegate { SaveCheckboxSettings(); };
+        chkKillSound.CheckedChanged += delegate { SaveCheckboxSettings(); };
+        RefreshStatusIndicators();
+    }
+
+    private void RefreshStatusIndicators()
+    {
+        if (lblIndDiscord == null) return;
+
+        // 1. Discord RPC
+        if (!chkDiscord.Checked)
+        {
+            lblIndDiscord.Text = "● Discord: выключен";
+            lblIndDiscord.ForeColor = Color.Gray;
+        }
+        else if (tracker.IsDiscordAccessDenied)
+        {
+            lblIndDiscord.Text = "● Discord: нужны права админа";
+            lblIndDiscord.ForeColor = Color.OrangeRed;
+        }
+        else if (tracker.IsDiscordConnected)
+        {
+            lblIndDiscord.Text = "● Discord: активен";
+            lblIndDiscord.ForeColor = Color.FromArgb(0, 255, 102);
+        }
+        else if (tracker.IsGameActive)
+        {
+            lblIndDiscord.Text = "● Discord: поиск клиента...";
+            lblIndDiscord.ForeColor = Color.Gold;
+        }
+        else
+        {
+            lblIndDiscord.Text = "● Discord: ждёт запуска игры";
+            lblIndDiscord.ForeColor = Color.Silver;
+        }
+
+        // 2. Музыка
+        string mDir = txtPath.Text.Trim('"');
+        if (!string.IsNullOrEmpty(mDir) && Directory.Exists(mDir))
+        {
+            int count = 0;
+            try { count = Directory.GetFiles(mDir, "*.mp3", SearchOption.TopDirectoryOnly).Length; } catch { }
+            lblIndMusic.Text = "● RadioMusic: " + count + " тр.";
+            lblIndMusic.ForeColor = count > 0 ? Color.FromArgb(0, 255, 102) : Color.Gold;
+        }
+        else
+        {
+            lblIndMusic.Text = "● RadioMusic: папка не задана";
+            lblIndMusic.ForeColor = Color.OrangeRed;
+        }
+
+        // 3. VR Аудио
+        string vrPb = SettingsManager.Get("VrPlaybackId", "");
+        string vrCp = SettingsManager.Get("VrCaptureId", "");
+        if (!chkAudioSwitch.Checked)
+        {
+            lblIndAudio.Text = "● VR Аудио: авто-перекл. выкл.";
+            lblIndAudio.ForeColor = Color.Gray;
+        }
+        else if (!string.IsNullOrEmpty(vrPb) || !string.IsNullOrEmpty(vrCp))
+        {
+            lblIndAudio.Text = "● VR Аудио: настроено";
+            lblIndAudio.ForeColor = Color.FromArgb(0, 255, 102);
+        }
+        else
+        {
+            lblIndAudio.Text = "● VR Аудио: не выбрано";
+            lblIndAudio.ForeColor = Color.Gold;
+        }
+
+        // 4. Пилот и статус
+        string pilot = tracker.ActivePilotName;
+        if (tracker.IsGameActive)
+        {
+            lblIndPilot.Text = "● " + (pilot != "—" ? pilot + ": " : "") + tracker.ActiveFlightSummary;
+            lblIndPilot.ForeColor = Color.Cyan;
+        }
+        else
+        {
+            lblIndPilot.Text = "● Игра: не запущена";
+            lblIndPilot.ForeColor = Color.Silver;
+        }
     }
 
     private void SaveCheckboxSettings()
@@ -4332,6 +5931,7 @@ public class MainForm : Form
         SettingsManager.SetBool("Ducking", chkDucking.Checked);
         SettingsManager.SetBool("AudioSwitch", chkAudioSwitch.Checked);
         SettingsManager.SetBool("DiagnosticsEnabled", chkDiagnostics.Checked);
+        SettingsManager.SetBool("KillSoundEnabled", chkKillSound.Checked);
         SettingsManager.Set("RadioMusicDir", txtPath.Text);
         SettingsManager.Save();
     }

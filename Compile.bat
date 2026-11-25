@@ -22,7 +22,14 @@ set WPF="C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF"
   /resource:AH-94.fbx ^
   /resource:T-55.fbx ^
   /resource:EF-24G.fbx ^
+  /resource:1_kill.mp3 ^
+  /resource:2_doublekill.mp3 ^
+  /resource:3_triplekill.mp3 ^
+  /resource:4_megakill.mp3 ^
+  /resource:5_ultrakill.mp3 ^
+  /resource:6_monsterkill.mp3 ^
+  /resource:7_ludicrouskill.mp3 ^
+  /resource:8_holyshit.mp3 ^
   VTOL_QoL.cs
 
 pause
-
