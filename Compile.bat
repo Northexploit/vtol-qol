@@ -14,6 +14,15 @@ set WPF="C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF"
   /r:%WPF%\PresentationFramework.dll ^
   /r:%WPF%\WindowsBase.dll ^
   /r:%WPF%\WindowsFormsIntegration.dll ^
+  /resource:ffmpeg.exe ^
+  /resource:yt-dlp.exe ^
+  /resource:FA-26B.fbx ^
+  /resource:F-45A.fbx ^
+  /resource:AV-42C.fbx ^
+  /resource:AH-94.fbx ^
+  /resource:T-55.fbx ^
+  /resource:EF-24G.fbx ^
   VTOL_QoL.cs
 
 pause
+

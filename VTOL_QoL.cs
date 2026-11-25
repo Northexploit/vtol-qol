@@ -1381,8 +1381,141 @@ public static class LiveryParser
         return -1;
     }
 
+    private static Dictionary<string, string> userAircraftMap = null;
+
+    private static string GetMapFilePath()
+    {
+        string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL");
+        try { Directory.CreateDirectory(dir); } catch { }
+        return Path.Combine(dir, "livery_aircraft_map.ini");
+    }
+
+    public static void LoadUserAircraftMap()
+    {
+        userAircraftMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string p = GetMapFilePath();
+        if (!File.Exists(p)) return;
+        try
+        {
+            foreach (string line in File.ReadAllLines(p, Encoding.UTF8))
+            {
+                int idx = line.IndexOf('=');
+                if (idx > 0)
+                {
+                    string k = line.Substring(0, idx).Trim();
+                    string v = line.Substring(idx + 1).Trim();
+                    if (k.Length > 0 && v.Length > 0) userAircraftMap[k] = v;
+                }
+            }
+        }
+        catch { }
+    }
+
+    public static void SaveUserAircraftMapping(string folderPath, string aircraft)
+    {
+        if (userAircraftMap == null) LoadUserAircraftMap();
+        string key = Path.GetFileName(folderPath);
+        if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(aircraft) || aircraft == "Не определен") return;
+        userAircraftMap[key] = aircraft;
+        try
+        {
+            List<string> lines = new List<string>();
+            foreach (KeyValuePair<string, string> kv in userAircraftMap)
+                lines.Add(kv.Key + "=" + kv.Value);
+            File.WriteAllLines(GetMapFilePath(), lines.ToArray(), Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    public static bool IsLiveryFolder(string folder)
+    {
+        try
+        {
+            string[] allFiles = Directory.GetFiles(folder, "*.*", SearchOption.AllDirectories);
+            bool hasLiveryMarker = false;
+            bool hasMissionOrMap = false;
+
+            foreach (string f in allFiles)
+            {
+                string ext = Path.GetExtension(f).ToLowerInvariant();
+                string fn = Path.GetFileName(f).ToLowerInvariant();
+                if (ext == ".vtl" || ext == ".vtlb" || fn == "livery.cfg" || fn.StartsWith("texture."))
+                    hasLiveryMarker = true;
+                if (ext == ".vts" || ext == ".vtsb" || ext == ".vtm" || ext == ".vtmb" || ext == ".vtc" || ext == ".vtcb")
+                    hasMissionOrMap = true;
+            }
+
+            if (hasMissionOrMap && !hasLiveryMarker) return false;
+            return hasLiveryMarker;
+        }
+        catch { return false; }
+    }
+
+    private static Dictionary<string, string> acfTagsCache = null;
+
+    private static string GetSteamWorkshopTag(string folder)
+    {
+        string itemId = Path.GetFileName(folder);
+
+        // 1. Проверяем теги внутри WorkshopItemInfo.xml
+        string wsXml = Path.Combine(folder, "WorkshopItemInfo.xml");
+        if (File.Exists(wsXml))
+        {
+            try
+            {
+                string xml = File.ReadAllText(wsXml, Encoding.UTF8);
+                foreach (Match mTag in Regex.Matches(xml, @"<(?:Tag|string)>(.*?)</(?:Tag|string)>", RegexOptions.IgnoreCase))
+                {
+                    string raw = mTag.Groups[1].Value.Trim();
+                    string norm = NormalizeAircraftName(raw);
+                    if (norm == "FA-26B" || norm == "F-45A" || norm == "AV-42C" || norm == "AH-94" || norm == "T-55" || norm == "EF-24G")
+                        return norm;
+                }
+            }
+            catch { }
+        }
+
+        // 2. Проверяем кэш тегов Steam (appworkshop_667970.acf)
+        try
+        {
+            string wsRoot = Path.GetFullPath(Path.Combine(folder, @"..\.."));
+            string acfPath = Path.Combine(wsRoot, "appworkshop_667970.acf");
+            if (acfTagsCache == null && File.Exists(acfPath))
+            {
+                acfTagsCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                string acf = File.ReadAllText(acfPath, Encoding.UTF8);
+                foreach (Match mItem in Regex.Matches(acf, @"""(\d+)""\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}"))
+                {
+                    string id = mItem.Groups[1].Value;
+                    string block = mItem.Groups[2].Value;
+                    Match mTags = Regex.Match(block, @"""tags""\s*""([^""]+)""", RegexOptions.IgnoreCase);
+                    if (mTags.Success)
+                    {
+                        foreach (string rawTag in mTags.Groups[1].Value.Split(','))
+                        {
+                            string norm = NormalizeAircraftName(rawTag.Trim());
+                            if (norm == "FA-26B" || norm == "F-45A" || norm == "AV-42C" || norm == "AH-94" || norm == "T-55" || norm == "EF-24G")
+                            {
+                                acfTagsCache[id] = norm;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            string found;
+            if (acfTagsCache != null && acfTagsCache.TryGetValue(itemId, out found))
+                return found;
+        }
+        catch { }
+
+        return null;
+    }
+
     public static LiveryEntry ParseFolder(string folder, string source)
     {
+        if (userAircraftMap == null) LoadUserAircraftMap();
+
         LiveryEntry e = new LiveryEntry();
         e.FolderPath = folder;
         e.Name = Path.GetFileName(folder);
@@ -1398,13 +1531,27 @@ public static class LiveryParser
                 try
                 {
                     string xml = File.ReadAllText(wsXml, Encoding.UTF8);
-                    Match mTitle = Regex.Match(xml, @"<Title>(.*?)</Title>", RegexOptions.IgnoreCase);
+                    Match mTitle = Regex.Match(xml, @"<Title>(.*?)</Title>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
                     if (mTitle.Success && mTitle.Groups[1].Value.Trim().Length > 0)
                         e.Name = mTitle.Groups[1].Value.Trim();
                 }
                 catch { }
             }
 
+            // 1. Ручная привязка пользователя имеет высший приоритет
+            string folderKey = Path.GetFileName(folder);
+            string savedAc;
+            if (userAircraftMap.TryGetValue(folderKey, out savedAc))
+                e.Aircraft = savedAc;
+
+            // 2. Официальный тег из Steam Workshop
+            if (e.Aircraft == "Не определен" && source == "Workshop")
+            {
+                string wsTag = GetSteamWorkshopTag(folder);
+                if (!string.IsNullOrEmpty(wsTag)) e.Aircraft = wsTag;
+            }
+
+            // 3. Данные из конфига ливреи (.cfg / .vtl / .vtlb)
             List<string> allCfg = new List<string>();
             allCfg.AddRange(Directory.GetFiles(folder, "*.cfg", SearchOption.AllDirectories));
             allCfg.AddRange(Directory.GetFiles(folder, "*.vtl", SearchOption.AllDirectories));
@@ -1415,27 +1562,38 @@ public static class LiveryParser
                 if (Path.GetExtension(cfgFile).Equals(".vtlb", StringComparison.OrdinalIgnoreCase) && e.Name == Path.GetFileName(folder))
                     e.Name = Path.GetFileNameWithoutExtension(cfgFile);
 
-                string text;
-                try { text = File.ReadAllText(cfgFile, Encoding.UTF8); } catch { continue; }
-                Match m = Regex.Match(text, @"(?im)(?:vehicle|vehicleName|craft)\s*=\s*""?([A-Za-z0-9\-/]+)""?");
-                if (m.Success)
+                if (e.Aircraft != "Не определен") continue;
+
+                try
                 {
-                    e.Aircraft = NormalizeAircraftName(m.Groups[1].Value);
-                    e.Valid = true;
-                    break;
+                    string asciiText = Encoding.ASCII.GetString(File.ReadAllBytes(cfgFile));
+                    Match m = Regex.Match(asciiText, @"(?im)(?:vehicle|vehicleName|craft)\s*=\s*""?([A-Za-z0-9\-/]+)""?");
+                    if (m.Success)
+                    {
+                        e.Aircraft = NormalizeAircraftName(m.Groups[1].Value);
+                        break;
+                    }
+                    foreach (KeyValuePair<string, string> kv in aircraftAliases)
+                    {
+                        if (asciiText.IndexOf(kv.Key, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            e.Aircraft = kv.Value;
+                            break;
+                        }
+                    }
                 }
+                catch { }
             }
 
+            // 4. Поиск текстуры и превью
             List<string> imgs = new List<string>();
             imgs.AddRange(Directory.GetFiles(folder, "*.png", SearchOption.AllDirectories));
             imgs.AddRange(Directory.GetFiles(folder, "*.jpg", SearchOption.AllDirectories));
             imgs.AddRange(Directory.GetFiles(folder, "*.jpgb", SearchOption.AllDirectories));
             imgs.AddRange(Directory.GetFiles(folder, "*.pngb", SearchOption.AllDirectories));
 
-            string bestTex = null;
-            string bestPreview = null;
+            string bestTex = null, bestPreview = null;
             long bestSize = -1;
-
             foreach (string img in imgs)
             {
                 string fn = Path.GetFileNameWithoutExtension(img);
@@ -1443,56 +1601,35 @@ public static class LiveryParser
                               fn.IndexOf("preview", StringComparison.OrdinalIgnoreCase) >= 0 ||
                               fn.IndexOf("thumb", StringComparison.OrdinalIgnoreCase) >= 0 ||
                               fn.IndexOf("icon", StringComparison.OrdinalIgnoreCase) >= 0;
-
                 if (isPrev)
                 {
-                    if (bestPreview == null || fn.Equals("image", StringComparison.OrdinalIgnoreCase))
-                        bestPreview = img;
+                    if (bestPreview == null || fn.Equals("image", StringComparison.OrdinalIgnoreCase)) bestPreview = img;
                     continue;
                 }
-
                 long sz = new FileInfo(img).Length;
                 if (sz > bestSize) { bestSize = sz; bestTex = img; }
             }
 
             e.TexturePath = bestTex;
             e.PreviewPath = bestPreview ?? bestTex;
-
-            if (e.Aircraft == "Не определен")
-            {
-                foreach (KeyValuePair<string, string> kv in aircraftAliases)
-                {
-                    if (e.Name.IndexOf(kv.Key, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        folder.IndexOf(kv.Key, StringComparison.OrdinalIgnoreCase) >= 0)
-                    { e.Aircraft = kv.Value; break; }
-                }
-            }
-
-            if (imgs.Count > 0 && !e.Valid) e.Valid = true;
+            if (imgs.Count > 0) e.Valid = true;
         }
         catch { e.Valid = false; }
 
         return e;
     }
 
+
     public static System.Windows.Media.Imaging.BitmapImage LoadTextureBitmap(string path)
     {
         byte[] raw = File.ReadAllBytes(path);
         int offset = FindImageHeaderOffset(raw);
-
-        // Если заголовок скрыт (обфускация .jpgb / .pngb), пробуем подобрать байтовый сдвиг или 1-байтный XOR по сигнатуре JPEG (FF D8 FF E0/E1) или PNG (89 50 4E 47)
         if (offset < 0 && raw.Length > 16)
         {
             byte[] decoded = TryAutoDecryptImage(raw);
-            if (decoded != null)
-            {
-                raw = decoded;
-                offset = 0;
-            }
+            if (decoded != null) { raw = decoded; offset = 0; }
         }
-
-        if (offset < 0)
-            throw new Exception("Формат " + Path.GetExtension(path) + " зашифрован.");
+        if (offset < 0) throw new Exception("Формат " + Path.GetExtension(path) + " зашифрован.");
 
         using (MemoryStream ms = new MemoryStream(raw, offset, raw.Length - offset))
         {
@@ -1508,12 +1645,9 @@ public static class LiveryParser
 
     private static byte[] TryAutoDecryptImage(byte[] data)
     {
-        // 1. Проверка константного байтового сдвига (Caesar/Add) или 1-байтного XOR для JPEG (FF D8 FF) и PNG (89 50 4E 47)
         for (int start = 0; start <= 16; start++)
         {
             if (start + 4 >= data.Length) break;
-
-            // Тест 1-байтного XOR для JPEG (FF D8 FF)
             byte xJpg = (byte)(data[start] ^ 0xFF);
             if ((byte)(data[start + 1] ^ xJpg) == 0xD8 && (byte)(data[start + 2] ^ xJpg) == 0xFF)
             {
@@ -1521,8 +1655,6 @@ public static class LiveryParser
                 for (int i = 0; i < res.Length; i++) res[i] = (byte)(data[start + i] ^ xJpg);
                 return res;
             }
-
-            // Тест 1-байтного XOR для PNG (89 50 4E 47)
             byte xPng = (byte)(data[start] ^ 0x89);
             if ((byte)(data[start + 1] ^ xPng) == 0x50 && (byte)(data[start + 2] ^ xPng) == 0x4E && (byte)(data[start + 3] ^ xPng) == 0x47)
             {
@@ -1530,8 +1662,6 @@ public static class LiveryParser
                 for (int i = 0; i < res.Length; i++) res[i] = (byte)(data[start + i] ^ xPng);
                 return res;
             }
-
-            // Тест байтового сдвига (Add/Sub) для JPEG (FF D8 FF)
             int dJpg = (data[start] - 0xFF) & 0xFF;
             if (((data[start + 1] - dJpg) & 0xFF) == 0xD8 && ((data[start + 2] - dJpg) & 0xFF) == 0xFF)
             {
@@ -1539,8 +1669,6 @@ public static class LiveryParser
                 for (int i = 0; i < res.Length; i++) res[i] = (byte)((data[start + i] - dJpg) & 0xFF);
                 return res;
             }
-
-            // Тест байтового сдвига для PNG (89 50 4E 47)
             int dPng = (data[start] - 0x89) & 0xFF;
             if (((data[start + 1] - dPng) & 0xFF) == 0x50 && ((data[start + 2] - dPng) & 0xFF) == 0x4E && ((data[start + 3] - dPng) & 0xFF) == 0x47)
             {
@@ -1557,9 +1685,7 @@ public static class LiveryParser
         List<LiveryEntry> result = new List<LiveryEntry>();
         if (!Directory.Exists(customLiveriesDir)) return result;
         foreach (string sub in Directory.GetDirectories(customLiveriesDir))
-        {
             result.Add(ParseFolder(sub, "Local"));
-        }
         return result;
     }
 
@@ -1572,12 +1698,15 @@ public static class LiveryParser
             if (!Directory.Exists(workshopDir)) return result;
             foreach (string sub in Directory.GetDirectories(workshopDir))
             {
+                if (!IsLiveryFolder(sub)) continue;
                 result.Add(ParseFolder(sub, "Workshop"));
             }
         }
         catch { }
         return result;
     }
+
+
 
     public static bool InstallZip(string zipPath, string targetLiveriesDir)
     {
@@ -2074,11 +2203,13 @@ public class Livery3DViewerForm : Form
             foreach (string p in planes) cmbModelSelect.Items.Add(p);
             int foundIdx = Array.IndexOf(planes, entry.Aircraft);
             cmbModelSelect.SelectedIndex = foundIdx >= 0 ? foundIdx : 0;
-            cmbModelSelect.SelectedIndexChanged += (s, e) => {
-                entry.Aircraft = cmbModelSelect.SelectedItem.ToString();
-                LoadModelAndTexture();
-            };
-            pnlBottom.Controls.Add(cmbModelSelect);
+        cmbModelSelect.SelectedIndexChanged += (s, e) => {
+            entry.Aircraft = cmbModelSelect.SelectedItem.ToString();
+            LiveryParser.SaveUserAircraftMapping(entry.FolderPath, entry.Aircraft);
+            LoadModelAndTexture();
+        };
+
+        pnlBottom.Controls.Add(cmbModelSelect);
 
         Button btnUvLayer = new Button() { Text = "UV слой", Left = 485, Top = 7, Width = 80, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(45, 75, 60), ForeColor = Color.White };
         btnUvLayer.Click += (s, e) => { FbxLoader.UseSecondUV = !FbxLoader.UseSecondUV; LoadModelAndTexture(); };
@@ -2244,6 +2375,17 @@ public class Livery3DViewerForm : Form
         string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL", "models");
         try { Directory.CreateDirectory(dir); } catch { }
         string candidate = Path.Combine(dir, aircraft + ".fbx");
+        if (!File.Exists(candidate))
+        {
+            using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(aircraft + ".fbx"))
+            {
+                if (s != null)
+                {
+                    using (FileStream fs = new FileStream(candidate, FileMode.Create, FileAccess.Write))
+                        s.CopyTo(fs);
+                }
+            }
+        }
         if (File.Exists(candidate)) return candidate;
         return null;
     }
@@ -2291,9 +2433,9 @@ public class Livery3DViewerForm : Form
         private Label lblStatus;
         private List<LiveryEntry> currentEntries = new List<LiveryEntry>();
     private List<LiveryEntry> filteredEntries = new List<LiveryEntry>();
-    private readonly string[] aircrafts = new string[] { "Все самолеты", "FA-26B", "F-45A", "AV-42C", "AH-94", "T-55", "EF-24G" };
+    private readonly string[] aircrafts = new string[] { "Все самолеты", "Не определен", "FA-26B", "F-45A", "AV-42C", "AH-94", "T-55", "EF-24G" };
 
-        public LiveryManagerForm(string root)
+    public LiveryManagerForm(string root)
         {
             this.gameRoot = root;
             this.Text = "VTOL QoL — Менеджер ливрей и 3D-просмотр";
@@ -2328,41 +2470,86 @@ public class Livery3DViewerForm : Form
             chkWorkshop.CheckedChanged += (s, e) => LoadLiveries();
             this.Controls.Add(chkWorkshop);
 
-            lstLiveries = new ListBox();
-            lstLiveries.Location = new Point(20, 100);
-            lstLiveries.Size = new Size(465, 360);
-            lstLiveries.BackColor = Color.FromArgb(24, 28, 26);
-            lstLiveries.ForeColor = Color.White;
-            lstLiveries.BorderStyle = BorderStyle.FixedSingle;
-            lstLiveries.SelectedIndexChanged += (s, e) => UpdatePreview();
-            this.Controls.Add(lstLiveries);
+        lstLiveries = new ListBox();
+        lstLiveries.Location = new Point(20, 100);
+        lstLiveries.Size = new Size(465, 360);
+        lstLiveries.BackColor = Color.FromArgb(24, 28, 26);
+        lstLiveries.ForeColor = Color.White;
+        lstLiveries.BorderStyle = BorderStyle.FixedSingle;
+        lstLiveries.SelectedIndexChanged += (s, e) => UpdatePreview();
+        this.Controls.Add(lstLiveries);
 
-            Label lblPrevTitle = new Label() { Text = "ПРЕВЬЮ ЛИВРЕИ:", Left = 500, Top = 15, AutoSize = true, Font = new Font("Consolas", 9.5f, FontStyle.Bold) };
-            this.Controls.Add(lblPrevTitle);
+        ContextMenuStrip ctxLivery = new ContextMenuStrip();
+        ToolStripMenuItem item3D = new ToolStripMenuItem("🎮 Открыть в 3D-просмотре");
+        item3D.Click += Btn3D_Click;
+        ctxLivery.Items.Add(item3D);
 
-            picPreview = new PictureBox();
-            picPreview.Location = new Point(500, 38);
-            picPreview.Size = new Size(390, 220);
-            picPreview.BackColor = Color.FromArgb(24, 28, 26);
-            picPreview.BorderStyle = BorderStyle.FixedSingle;
-            picPreview.SizeMode = PictureBoxSizeMode.Zoom;
-            this.Controls.Add(picPreview);
+        ToolStripMenuItem itemAssignMenu = new ToolStripMenuItem("✈ Назначить борт вручную");
+        string[] assignPlanes = new string[] { "FA-26B", "F-45A", "AV-42C", "AH-94", "T-55", "EF-24G" };
+        foreach (string pl in assignPlanes)
+        {
+            string targetPlane = pl;
+            ToolStripMenuItem sub = new ToolStripMenuItem(targetPlane);
+            sub.Click += (s, e) => {
+                LiveryEntry entry = GetSelectedEntry();
+                if (entry == null) return;
+                entry.Aircraft = targetPlane;
+                LiveryParser.SaveUserAircraftMapping(entry.FolderPath, entry.Aircraft);
+                int idx = lstLiveries.SelectedIndex;
+                if (idx >= 0 && idx < filteredEntries.Count)
+                {
+                    lstLiveries.Items[idx] = string.Format("[{0}] {1}  ({2})", entry.Source, entry.Name, entry.Aircraft);
+                    UpdatePreview();
+                }
+            };
+            itemAssignMenu.DropDownItems.Add(sub);
+        }
+        ctxLivery.Items.Add(itemAssignMenu);
 
-            lblPreviewInfo = new Label() { Left = 500, Top = 264, Width = 390, Height = 20, ForeColor = Color.Cyan, Text = "Выберите ливрею из списка" };
-            this.Controls.Add(lblPreviewInfo);
+        ToolStripMenuItem itemFolder = new ToolStripMenuItem("📁 Открыть папку мода");
+        itemFolder.Click += (s, e) => {
+            LiveryEntry entry = GetSelectedEntry();
+            if (entry != null && Directory.Exists(entry.FolderPath)) Process.Start("explorer.exe", entry.FolderPath);
+        };
+        ctxLivery.Items.Add(itemFolder);
 
-            int top = 292, btnW = 190, btnH = 36, gap = 10;
-            Button btn3D = CreateBtn("🎮 3D-просмотр", 500, ref top, btnW, btnH, gap, Color.FromArgb(70, 50, 110));
-            btn3D.Click += Btn3D_Click;
+        lstLiveries.MouseDown += (s, e) => {
+            if (e.Button == MouseButtons.Right)
+            {
+                int idx = lstLiveries.IndexFromPoint(e.Location);
+                if (idx >= 0) lstLiveries.SelectedIndex = idx;
+            }
+        };
+        lstLiveries.ContextMenuStrip = ctxLivery;
 
-            Button btnInstallFolder = CreateBtn("+ Добавить скин", 500, ref top, btnW, btnH, gap, Color.FromArgb(0, 110, 140));
-            btnInstallFolder.Click += BtnInstallFolder_Click;
+        Label lblPrevTitle = new Label() { Text = "ПРЕВЬЮ ЛИВРЕИ:", Left = 500, Top = 15, AutoSize = true, Font = new Font("Consolas", 9.5f, FontStyle.Bold) };
+        this.Controls.Add(lblPrevTitle);
 
-            Button btnInstallZip = CreateBtn("+ Установить .zip", 500, ref top, btnW, btnH, gap, Color.FromArgb(0, 130, 90));
-            btnInstallZip.Click += BtnInstallZip_Click;
+        picPreview = new PictureBox();
+        picPreview.Location = new Point(500, 38);
+        picPreview.Size = new Size(390, 220);
+        picPreview.BackColor = Color.FromArgb(24, 28, 26);
+        picPreview.BorderStyle = BorderStyle.FixedSingle;
+        picPreview.SizeMode = PictureBoxSizeMode.Zoom;
+        this.Controls.Add(picPreview);
 
-            int topRight = 292;
-            Button btnDelete = CreateBtn("Удалить ливрею", 700, ref topRight, btnW, btnH, gap, Color.FromArgb(140, 35, 35));
+        lblPreviewInfo = new Label() { Left = 500, Top = 264, Width = 390, Height = 20, ForeColor = Color.Cyan, Text = "Выберите ливрею (ПКМ — назначить борт)" };
+        this.Controls.Add(lblPreviewInfo);
+
+        int top = 292, btnW = 190, btnH = 36, gap = 10;
+        Button btn3D = CreateBtn("🎮 3D-просмотр", 500, ref top, btnW, btnH, gap, Color.FromArgb(70, 50, 110));
+        btn3D.Click += Btn3D_Click;
+
+        Button btnInstallFolder = CreateBtn("+ Добавить скин", 500, ref top, btnW, btnH, gap, Color.FromArgb(0, 110, 140));
+        btnInstallFolder.Click += BtnInstallFolder_Click;
+
+        Button btnInstallZip = CreateBtn("+ Установить .zip", 500, ref top, btnW, btnH, gap, Color.FromArgb(0, 130, 90));
+        btnInstallZip.Click += BtnInstallZip_Click;
+
+        int topRight = 292;
+
+
+        Button btnDelete = CreateBtn("Удалить ливрею", 700, ref topRight, btnW, btnH, gap, Color.FromArgb(140, 35, 35));
             btnDelete.Click += BtnDelete_Click;
 
             Button btnOpenDir = CreateBtn("Папка CustomLiveries", 700, ref topRight, btnW, btnH, gap, Color.FromArgb(45, 55, 50));
@@ -3411,6 +3598,12 @@ public class MainForm : Form
                 string ytdlpPath = Path.Combine(toolsDir, "yt-dlp.exe");
                 ExtractResource("ffmpeg.exe", ffmpegPath);
                 ExtractResource("yt-dlp.exe", ytdlpPath);
+                string modelsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL", "models");
+                try { Directory.CreateDirectory(modelsDir); } catch { }
+                string[] planes = new string[] { "FA-26B.fbx", "F-45A.fbx", "AV-42C.fbx", "AH-94.fbx", "T-55.fbx", "EF-24G.fbx" };
+                foreach (string pl in planes)
+                    ExtractResource(pl, Path.Combine(modelsDir, pl));
+
 
                 File.AppendAllText(Path.Combine(gameDir, "links.txt"), url + "\r\n", Encoding.UTF8);
                 bool isLiveStream = url.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase) || url.EndsWith(".pls", StringComparison.OrdinalIgnoreCase) || url.Contains("stream") || url.Contains("radio");
