@@ -1,7 +1,7 @@
 @echo off
 set CSC="C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 set WPF="C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF"
-%CSC% /target:winexe /win32icon:icon.ico /out:VTOL_QoL.exe ^
+%CSC% /utf8output /target:winexe /win32icon:icon.ico /out:VTOL_QoL.exe ^
   /r:System.dll ^
   /r:System.Core.dll ^
   /r:System.Drawing.dll ^
@@ -30,6 +30,6 @@ set WPF="C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF"
   /resource:6_monsterkill.mp3 ^
   /resource:7_ludicrouskill.mp3 ^
   /resource:8_holyshit.mp3 ^
-  VTOL_QoL.cs
+  src\*.cs
 
 pause
