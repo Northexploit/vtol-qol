@@ -640,7 +640,7 @@ public class GameTracker
                                         }
                                     }
                                     // 5.6 Повреждения (отказы двигателей и отрыв пилонов/подвесок при попаданиях)
-                                    foreach (Match mEng in Regex.Matches(chunk, @"Failed engine\s+(?[^\r\n]+)", RegexOptions.IgnoreCase))
+                                    foreach (Match mEng in Regex.Matches(chunk, @"Failed engine\s+(?<part>[^\r\n]+)", RegexOptions.IgnoreCase))
                                     {
                                         string part = mEng.Groups["part"].Value.Trim();
                                         if (part.IndexOf("(Clone)", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -648,7 +648,7 @@ public class GameTracker
                                         else
                                             RecordReplayEvent("DAMAGE", "UNIT", "Повреждён двигатель: " + part);
                                     }
-                                    foreach (Match mJet in Regex.Matches(chunk, @"jettisoning by part destruction:\s*(?[^\r\n]+)", RegexOptions.IgnoreCase))
+                                    foreach (Match mJet in Regex.Matches(chunk, @"jettisoning by part destruction:\s*(?<item>[^\r\n]+)", RegexOptions.IgnoreCase))
                                     {
                                         RecordReplayEvent("PART_LOSS", mJet.Groups["item"].Value.Trim());
                                     }
@@ -658,7 +658,7 @@ public class GameTracker
                                     string acDisplay = FormatAircraftWithRole(currentAircraft, currentCrewRole);
                                     MatchCollection mcAllKills = Regex.Matches(
                                     chunk,
-                                    @"FlightLogger:\s*(?[^\r\n]+?)\s+was killed by\s+(?[^\r\n.]+?)(?:\s+with\s+(?[^\r\n.]+))?(?:.|$)",
+                                    @"FlightLogger:\s*(?<target>[^\r\n]+?)\s+was killed by\s+(?<killer>[^\r\n.]+?)(?:\s+with\s+(?<weapon>[^\r\n.]+?))?(?=\s*(?:\.|$|\r|\n))",
                                     RegexOptions.IgnoreCase
                                     );
                                     foreach (Match mk in mcAllKills)
@@ -719,7 +719,7 @@ public class GameTracker
                                 {
                                     Match mKilledBy = Regex.Match(
                                     chunk,
-                                    @"FlightLogger:\s*[^\r\n]?\(" + myNickEsc + @"\)[^\r\n]?\bwas killed by\s+(?[^\r\n.]+?)(?:\s+with\s+(?[^\r\n.]+))?(?:.|$)",
+                                    @"FlightLogger:\s*[^\r\n]?\(" + myNickEsc + @"\)[^\r\n]?\bwas killed by\s+(?<killer>[^\r\n.]+?)(?:\s+with\s+(?<weapon>[^\r\n.]+?))?(?=\s*(?:\.|$|\r|\n))",
                                     RegexOptions.IgnoreCase
                                     );
                                     if (mKilledBy.Success)
@@ -910,13 +910,13 @@ public class GameTracker
                         }
                     }
 
+                    IsGameActive = true;
+                    string acFullDisplay = FormatAircraftWithRole(currentAircraft, currentCrewRole);
+                    ActiveFlightSummary = inSortie ? (acFullDisplay + " (" + currentCallsign + ")") : "В ангаре / Меню";
+                    if (!string.IsNullOrEmpty(myNick)) ActivePilotName = myNick;
+
                     if (pipe != null)
                     {
-                        IsGameActive = true;
-                        string acFullDisplay = FormatAircraftWithRole(currentAircraft, currentCrewRole);
-                        ActiveFlightSummary = inSortie ? (acFullDisplay + " (" + currentCallsign + ")") : "В ангаре / Меню";
-                        if (!string.IsNullOrEmpty(myNick)) ActivePilotName = myNick;
-
                         string det = inSortie
                             ? ("Борт: " + acFullDisplay + (kills > 0 ? " | Сбито: " + kills : ""))
                             : "В ангаре / Меню";

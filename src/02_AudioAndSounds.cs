@@ -78,18 +78,18 @@ public interface IPropertyStore
 [ComImport, Guid("F8679F50-850A-41CF-9C72-430F290290C8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 public interface IPolicyConfig
 {
-    int GetMixFormat(string deviceId, IntPtr ppFormat);
-    int GetDeviceFormat(string deviceId, bool bDefault, IntPtr ppFormat);
-    int ResetDeviceFormat(string deviceId);
-    int SetDeviceFormat(string deviceId, IntPtr pEndpointFormat, IntPtr mixFormat);
-    int GetProcessingPeriod(string deviceId, bool bDefault, out long defaultPeriod, out long minimumPeriod);
-    int SetProcessingPeriod(string deviceId, ref long period);
-    int GetShareMode(string deviceId, IntPtr pMode);
-    int SetShareMode(string deviceId, IntPtr mode);
-    int GetPropertyValue(string deviceId, ref PROPERTYKEY key, IntPtr pv);
-    int SetPropertyValue(string deviceId, ref PROPERTYKEY key, IntPtr pv);
-    int SetDefaultEndpoint(string deviceId, ERole role);
-    int SetEndpointVisibility(string deviceId, bool bVisible);
+    int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr ppFormat);
+    int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string deviceId, bool bDefault, IntPtr ppFormat);
+    int ResetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string deviceId);
+    int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr pEndpointFormat, IntPtr mixFormat);
+    int GetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string deviceId, bool bDefault, out long defaultPeriod, out long minimumPeriod);
+    int SetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string deviceId, ref long period);
+    int GetShareMode([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr pMode);
+    int SetShareMode([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr mode);
+    int GetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string deviceId, ref PROPERTYKEY key, IntPtr pv);
+    int SetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string deviceId, ref PROPERTYKEY key, IntPtr pv);
+    int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string deviceId, ERole role);
+    int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string deviceId, bool bVisible);
 }
 
 [ComImport, Guid("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9")]

@@ -10,6 +10,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using OpenFileDialog = System.Windows.Forms.OpenFileDialog;
@@ -1174,12 +1175,18 @@ public class MainForm : Form
     }
 
     private DateTime lastNetCheckUtc = DateTime.MinValue;
-    private volatile bool netCheckBusy = false;
+    private int netCheckBusyFlag = 0;
 
     private void TriggerNetworkCheck(bool force = false)
     {
-        if (netCheckBusy && !force) return;
-        netCheckBusy = true;
+        if (force)
+        {
+            Interlocked.Exchange(ref netCheckBusyFlag, 1);
+        }
+        else if (Interlocked.CompareExchange(ref netCheckBusyFlag, 1, 0) != 0)
+        {
+            return;
+        }
         lastNetCheckUtc = DateTime.UtcNow;
 
         ThreadPool.QueueUserWorkItem(delegate {
@@ -1194,13 +1201,19 @@ public class MainForm : Form
                 }
                 else
                 {
-                    // Проверяем YouTube, Discord и Steam параллельно без преждевременного Dispose() по таймауту
-                    bool yt = false, dc = false, stm = false;
-                    CountdownEvent latch = new CountdownEvent(3);
-                    ThreadPool.QueueUserWorkItem(delegate { try { yt = CheckHostReachable("https://youtube.com"); } finally { try { if (!latch.IsSet) latch.Signal(); } catch { } } });
-                    ThreadPool.QueueUserWorkItem(delegate { try { dc = CheckHostReachable("https://discord.com"); } finally { try { if (!latch.IsSet) latch.Signal(); } catch { } } });
-                    ThreadPool.QueueUserWorkItem(delegate { try { stm = CheckHostReachable("https://steamcommunity.com"); } finally { try { if (!latch.IsSet) latch.Signal(); } catch { } } });
-                    latch.Wait(2000);
+                    // Проверяем YouTube, Discord и Steam параллельно с жёстким таймаутом 2 сек
+                    Func<string, bool> probe = delegate(string url) { try { return CheckHostReachable(url); } catch { return false; } };
+                    Task<bool>[] probes = new Task<bool>[]
+                    {
+                        Task.Run(delegate { return probe("https://youtube.com"); }),
+                        Task.Run(delegate { return probe("https://discord.com"); }),
+                        Task.Run(delegate { return probe("https://steamcommunity.com"); })
+                    };
+                    try { Task.WaitAll(probes, 2000); } catch { }
+
+                    bool yt = probes[0].Status == TaskStatus.RanToCompletion && probes[0].Result;
+                    bool dc = probes[1].Status == TaskStatus.RanToCompletion && probes[1].Result;
+                    bool stm = probes[2].Status == TaskStatus.RanToCompletion && probes[2].Result;
 
                     netYtOk = yt;
                     netDcOk = dc;
@@ -1219,7 +1232,7 @@ public class MainForm : Form
             }
             finally
             {
-                netCheckBusy = false;
+                Interlocked.Exchange(ref netCheckBusyFlag, 0);
             }
         });
     }

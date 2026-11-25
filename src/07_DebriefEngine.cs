@@ -22,6 +22,7 @@ public class DebriefSample
     public double Pitch;
     public double Roll;
     public double Speed;   // м/с
+    public double VX, VY, VZ; // точный вектор скорости из реплея (м/с)
 }
 
 public class DebriefEntity
@@ -30,7 +31,8 @@ public class DebriefEntity
     public string Name;
     public string Pilot;
     public string RawSource;
-    public string Type;       // "Air", "Missile", "Ground", "Sea", "Base"
+    public string Type;       // "Air", "Missile", "Ground", "Sea", "Base" (совместимый тип для карты)
+    public string Class;      // точный класс из реплея: "Air", "Chopper", "Ground", "Sea", "Missile"
     public string Coalition;  // "Allies", "Enemies", "Neutral"
     public string RoleTag;    // "AWACS", "Tanker", "Fighter", "Bomber", "SAM", "Missile"
     public bool IsPlayer;
@@ -107,6 +109,8 @@ public class TacticalBeam
     public double DirX;
     public double DirY;
     public double DirZ;
+    public string JamMode = "";   // "NOISE", "DRFM", "SAS" — только для Kind == "JAMMER"
+    public string JamBand = "";   // "Low", "Mid", "High" — только для Kind == "JAMMER"
 }
 
 public class TacticalEvent
@@ -120,6 +124,98 @@ public class TacticalEvent
     public string RawSource;
     public double WorldX;
     public double WorldY;
+    public double Altitude = double.NaN;   // высота события (если известна из трека)
+    public double SpeedKmh = double.NaN;   // скорость в момент события
+    public double DistanceM = double.NaN;  // дистанция до угрозы/цели
+    public string Category = "";           // "THREAT", "MISTAKE", "SUCCESS", "INFO" — для фильтров хронологии
+}
+
+// Точка реального взрыва из штатного реплея (eventTrack / WorldEventKeyframe)
+public class DebriefExplosion
+{
+    public double Time;
+    public double X;
+    public double Y;
+    public double Alt;
+}
+
+// Отстрел ЛТЦ/ДО из eventTrack (eventType 2 = Flare, 3 = Chaff).
+// В текущих реплеях VTOL VR таких кадров нет — список будет пустым, отрисовка молчит.
+public class DebriefFlare
+{
+    public double Time;
+    public double X;
+    public double Y;
+    public double Alt;
+    public bool IsChaff;   // true = ДО, false = ЛТЦ
+}
+
+// Один пуск ракеты, собранный строго из фактов реплея:
+// носитель (Pilot), момент старта (FirstTime), конец трека (LastTime) и факт поражения цели.
+public class DebriefLaunch
+{
+    public double Time;
+    public string MissileName;
+    public string MissileId;
+    public string Launcher;      // кто выпустил (Pilot ракеты)
+    public string Coalition;     // "Allies" / "Enemies" / "Neutral"
+    public string Side;          // "МОЙ" / "СОЮЗ" / "ВРАГ"
+    public string TargetName;    // имя поражённой цели, если она известна по факту
+    public double LaunchDist = double.NaN;   // 3D-дистанция до цели в момент пуска
+    public double FlightTime;    // время полёта ракеты до конца трека
+    public string Result;        // "ПОПАДАНИЕ" / "ПРОМАХ"
+}
+
+// Модель помех, восстановленная из IL игры (RadarJammer / RadarJammer+JTransmitter).
+// Никаких "примерных" конусов: мощность считается по той же формуле, что в игре.
+public static class JammerModel
+{
+    // RadarJammer..ctor: directionalPower = 8, signalLeakFactor = 0.03
+    public const double DirectionalPower = 8.0;
+    public const double SignalLeakFactor = 0.03;
+
+    // Угол (в градусах) от оси луча, на котором относительный сигнал падает до level.
+    // cos(theta)^directionalPower = level  =>  theta = acos(level^(1/power))
+    public static double AngleForLevel(double level)
+    {
+        if (level <= 0.0) return 90.0;
+        if (level >= 1.0) return 0.0;
+        return Math.Acos(Math.Pow(level, 1.0 / DirectionalPower)) * 180.0 / Math.PI;
+    }
+
+    // Аналог JTransmitter.GetSignalStrength (без множителей power/maxPowerOutput, они постоянны
+    // для конкретного передатчика). Возвращает относительный сигнал: 1.0 — точно по оси на
+    // опорной дистанции. 0 — цель вне лепестка или за препятствием.
+    public static double SignalFactor(double dirX, double dirY, double dirZ,
+                                      double fromX, double fromY, double fromZ,
+                                      double toX, double toY, double toZ)
+    {
+        double dl = Math.Sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+        if (dl < 1e-6) return 0.0;
+        double dx = toX - fromX;
+        double dy = toY - fromY;
+        double dz = toZ - fromZ;
+        double dist = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist < 1.0) return 0.0;
+
+        // dot(dir, target - pos) <= 0  ->  передатчик смотрит в другую сторону
+        double dot = (dx * dirX + dy * dirY + dz * dirZ) / dl;
+        if (dot <= 0.0) return 0.0;
+
+        double norm = dot / dist;                       // косинус угла между осью и целью
+        double lobe = Math.Pow(norm, DirectionalPower); // основной лепесток
+        double leak = SignalLeakFactor;                 // "просачивание" во все стороны
+        return lobe + leak;
+    }
+
+    // Цвет/подпись уровня помех для UI
+    public static string LevelLabel(double signal)
+    {
+        if (signal >= 0.75) return "СИЛЬНО";
+        if (signal >= 0.40) return "СРЕДНЕ";
+        if (signal >= 0.10) return "СЛАБО";
+        return "";
+    }
 }
 
 public class DebriefSession
@@ -181,6 +277,15 @@ public class DebriefSession
     public List<TacticalBeam> Beams = new List<TacticalBeam>();
     public List<TacticalEvent> Events = new List<TacticalEvent>();
     public List<TacticalEvent> Mistakes = new List<TacticalEvent>();
+    public List<DebriefExplosion> Explosions = new List<DebriefExplosion>();
+    public List<DebriefFlare> Flares = new List<DebriefFlare>();
+    public List<DebriefLaunch> Launches = new List<DebriefLaunch>();
+    // Точные пиковые значения полёта игрока (из velocity/rotation штатного реплея)
+    public double PlayerMaxG = 0.0;
+    public double PlayerMaxGTime = 0.0;
+    public double PlayerMaxSpeed = 0.0;
+    public double PlayerMinAlt = double.MaxValue;
+    public double PlayerMinAltTime = 0.0;
 
     public void ExpandBounds(double x, double y)
     {
@@ -2669,6 +2774,7 @@ public static class DebriefEngine
 
         // Добавляем чистые события из самого 3D-потока VTR (пуски ваших ракет и пуски союзников)
         BuildNativeVtrEvents(s);
+        BuildPilotInsights(s);
         s.Events.Sort((a, b) => a.Time.CompareTo(b.Time));
 
         ComputeSessionBounds(s);
@@ -3136,6 +3242,30 @@ public static class DebriefEngine
             double maxT = totalDur > 1.0f ? totalDur : 1.0;
             Dictionary<int, DebriefEntity> idToEntity = new Dictionary<int, DebriefEntity>();
 
+            // Точный тип юнита из штатного реплея: ReplayRecorder.ReplayEntity.entityType
+            // 0/1 — самолёты сторон A/B, 2/3 — наземные A/B, 4/5 — морские A/B, 6 — ракета, 7/8 — вертолёты A/B
+            Dictionary<int, int> idToEntityType = new Dictionary<int, int>();
+            try
+            {
+                System.Collections.IDictionary entDict = recType.GetField("entityDict", bf).GetValue(recorder) as System.Collections.IDictionary;
+                if (entDict != null)
+                {
+                    foreach (System.Collections.DictionaryEntry ede in entDict)
+                    {
+                        object re = ede.Value;
+                        if (re == null) continue;
+                        Type ret = re.GetType();
+                        System.Reflection.FieldInfo fIdE = ret.GetField("id", bf);
+                        System.Reflection.FieldInfo fTypeE = ret.GetField("entityType", bf);
+                        if (fIdE == null || fTypeE == null) continue;
+                        int eid = Convert.ToInt32(fIdE.GetValue(re));
+                        int etype = Convert.ToInt32(fTypeE.GetValue(re));
+                        idToEntityType[eid] = etype;
+                    }
+                }
+            }
+            catch { }
+
             foreach (System.Collections.DictionaryEntry de in trackDict)
             {
                 int entId = Convert.ToInt32(de.Key);
@@ -3165,6 +3295,15 @@ public static class DebriefEngine
                 bool isMissile = Regex.IsMatch(name, @"\b(?:ASMRM|AIM-|ASF-MRM|ASF-SRM|AIRS-T|AGM-|GBU-|MK-|HARM|FLKM|BSM|9M311|SaawMissile|CAGM)\b", RegexOptions.IgnoreCase);
                 bool isMe = !string.IsNullOrEmpty(myNick) && IsPlayerInBracketTag(name, myNick);
 
+                int entTypeCode = -1;
+                if (idToEntityType.TryGetValue(entId, out entTypeCode) == false) entTypeCode = -1;
+                if (entTypeCode >= 0)
+                {
+                    // Штатная классификация из файла реплея — без эвристик по имени
+                    isMissile = entTypeCode == 6;
+                    isGround = entTypeCode == 2 || entTypeCode == 3 || entTypeCode == 4 || entTypeCode == 5;
+                }
+
                 bool isExplicitAlly = isMe ||
                       name.IndexOf("Allied", StringComparison.OrdinalIgnoreCase) >= 0 ||
                       name.IndexOf("TasherMan", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -3175,14 +3314,34 @@ public static class DebriefEngine
                                        name.IndexOf("arnie", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                        name.IndexOf("idk", StringComparison.OrdinalIgnoreCase) >= 0);
 
+                // entityType: чётные = сторона A (союзники), нечётные = сторона B (противник)
+                string coalition;
+                if (entTypeCode >= 0 && entTypeCode != 6)
+                    coalition = (entTypeCode % 2 == 0) ? "Allies" : "Enemies";
+                else
+                    coalition = isExplicitEnemy ? "Enemies" : "Allies";
+
+                string unitType = isMissile ? "Missile" : (isGround ? "Ground" : "Air");
+                string unitClass = isMissile ? "Missile"
+                                 : (entTypeCode == 4 || entTypeCode == 5) ? "Sea"
+                                 : (entTypeCode == 7 || entTypeCode == 8) ? "Chopper"
+                                 : (isGround ? "Ground" : "Air");
+                string roleTag;
+                if (isMissile) roleTag = "Missile";
+                else if (unitClass == "Sea") roleTag = "Ship";
+                else if (unitClass == "Ground")
+                    roleTag = Regex.IsMatch(name, @"(?:SAM|Radar|SAAW|Phalanx|C-RAM|CIWS|VLS|Launcher|Turret)", RegexOptions.IgnoreCase) ? "SAM" : "Ground";
+                else roleTag = DetectUnitRole(name);
+
                 DebriefEntity ent = new DebriefEntity
                 {
                     Id = "vtr_" + entId,
                     Name = name,
                     Pilot = name,
-                    Type = isMissile ? "Missile" : (isGround ? "Ground" : "Air"),
-                    Coalition = isExplicitEnemy ? "Enemies" : "Allies",
-                    RoleTag = isMissile ? "Missile" : DetectUnitRole(name),
+                    Type = unitType,
+                    Class = unitClass,
+                    Coalition = coalition,
+                    RoleTag = roleTag,
                     IsPlayer = isMe
                 };
 
@@ -3193,9 +3352,13 @@ public static class DebriefEngine
                     float kt = 0f;
                     double wx = 0, wy = 0, wz = 0;
 
+                    double vx = 0, vy = 0, vz = 0;
+                    double qx = 0, qy = 0, qz = 0, qw = 0;
+                    bool hasQuat = false;
+
                     foreach (System.Reflection.FieldInfo kff in kfType.GetFields(bf))
                     {
-                        if (kff.FieldType == typeof(float) && (kff.Name.IndexOf("t", StringComparison.OrdinalIgnoreCase) >= 0))
+                        if (kff.FieldType == typeof(float) && kff.Name.Equals("t", StringComparison.OrdinalIgnoreCase))
                             kt = (float)kff.GetValue(kf);
                         else if (kff.FieldType.Name == "FixedPoint")
                         {
@@ -3223,6 +3386,30 @@ public static class DebriefEngine
                                 }
                             }
                         }
+                        else if (kff.FieldType.Name == "Vector3" && kff.Name.Equals("velocity", StringComparison.OrdinalIgnoreCase))
+                        {
+                            object v3 = kff.GetValue(kf);
+                            if (v3 != null)
+                            {
+                                Type v3T = v3.GetType();
+                                vx = Convert.ToDouble(v3T.GetField("x", bf).GetValue(v3));
+                                vy = Convert.ToDouble(v3T.GetField("y", bf).GetValue(v3));
+                                vz = Convert.ToDouble(v3T.GetField("z", bf).GetValue(v3));
+                            }
+                        }
+                        else if (kff.FieldType.Name == "Quaternion" && kff.Name.Equals("rotation", StringComparison.OrdinalIgnoreCase))
+                        {
+                            object q = kff.GetValue(kf);
+                            if (q != null)
+                            {
+                                Type qT = q.GetType();
+                                qx = Convert.ToDouble(qT.GetField("x", bf).GetValue(q));
+                                qy = Convert.ToDouble(qT.GetField("y", bf).GetValue(q));
+                                qz = Convert.ToDouble(qT.GetField("z", bf).GetValue(q));
+                                qw = Convert.ToDouble(qT.GetField("w", bf).GetValue(q));
+                                hasQuat = true;
+                            }
+                        }
                         else if (kff.FieldType.Name == "Vector3" && wx == 0 && wz == 0)
                         {
                             object v3 = kff.GetValue(kf);
@@ -3234,7 +3421,24 @@ public static class DebriefEngine
                     }
 
                     double hdg = 0, spd = 0, pitch = 0, roll = 0;
-                    if (ent.Track.Count > 0)
+                    if (hasQuat)
+                    {
+                        // Точная ориентация из кватерниона штатного реплея (Unity: x,y,z,w)
+                        double fx = 2.0 * (qx * qz + qw * qy);
+                        double fy = 2.0 * (qy * qz - qw * qx);
+                        double fz = 1.0 - 2.0 * (qx * qx + qy * qy);
+                        hdg = (Math.Atan2(fx, fz) * 180.0 / Math.PI + 360.0) % 360.0;
+                        pitch = Math.Asin(Math.Max(-1.0, Math.Min(1.0, fy))) * 180.0 / Math.PI;
+
+                        // Крен: наклон вектора "вправо" и "вверх" относительно мировой вертикали
+                        double rx = 1.0 - 2.0 * (qy * qy + qz * qz);
+                        double ry = 2.0 * (qx * qy + qw * qz);
+                        double uy = 1.0 - 2.0 * (qx * qx + qz * qz);
+                        if (Math.Abs(ry) > 1e-4 || Math.Abs(uy) > 1e-4)
+                            roll = -Math.Atan2(ry, uy) * 180.0 / Math.PI;
+                        spd = Math.Sqrt(vx * vx + vy * vy + vz * vz);
+                    }
+                    else if (ent.Track.Count > 0)
                     {
                         DebriefSample prev = ent.Track[ent.Track.Count - 1];
                         double dt = kt - prev.Time;
@@ -3265,7 +3469,7 @@ public static class DebriefEngine
                             roll = prev.Roll * 0.85;
                         }
                     }
-                    ent.Track.Add(new DebriefSample { Time = kt, X = wx, Y = wz, Alt = wy, Heading = hdg, Pitch = pitch, Roll = roll, Speed = spd });
+                    ent.Track.Add(new DebriefSample { Time = kt, X = wx, Y = wz, Alt = wy, Heading = hdg, Pitch = pitch, Roll = roll, Speed = spd, VX = vx, VY = vy, VZ = vz });
                     if (kt < ent.FirstTime) ent.FirstTime = kt;
                     if (kt > ent.LastTime) ent.LastTime = kt;
                     if (kt > maxT) maxT = kt;
@@ -3409,6 +3613,14 @@ public static class DebriefEngine
 
                         if (isJammer)
                         {
+                            // В штатном реплее у джаммера есть только: режим (NOISE/DRFM/SAS), диапазон
+                            // (Low/Mid/High), направление антенны и кадры Start/Stop. Цели в файле НЕТ,
+                            // поэтому не приписываем подавление конкретному юниту — рисуем реальный сектор/луч.
+                            bool segActive = false;
+                            double segStart = 0, segEnd = 0;
+                            double segDx = 0, segDy = 0, segDz = 0;
+                            string segMode = "", segBand = "";
+
                             for (int k = 0; k < kfList.Count; k++)
                             {
                                 object kf = kfList[k];
@@ -3440,45 +3652,43 @@ public static class DebriefEngine
                                         dirZ = Convert.ToDouble(v3t.GetField("z", bf).GetValue(kv));
                                     }
                                 }
-                                string jamFullTag = string.IsNullOrEmpty(txBand) ? txMode : (txMode + " · " + txBand);
 
-                                if (evState.Equals("Stop", StringComparison.OrdinalIgnoreCase)) continue;
+                                double len3d = Math.Sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+                                bool isStop = evState.Equals("Stop", StringComparison.OrdinalIgnoreCase) || len3d < 1e-4;
 
-                                double endKt = srcEnt.LastTime;
-                                if (k + 1 < kfList.Count && kfList[k + 1] != null)
+                                if (!isStop)
                                 {
-                                    System.Reflection.FieldInfo ftNext = kfList[k + 1].GetType().GetField("t", bf);
-                                    if (ftNext != null)
+                                    if (segActive && (!string.Equals(segMode, txMode, StringComparison.OrdinalIgnoreCase) ||
+                                                      !string.Equals(segBand, txBand, StringComparison.OrdinalIgnoreCase)))
                                     {
-                                        float nextT = (float)ftNext.GetValue(kfList[k + 1]);
-                                        if (nextT > kt) endKt = Math.Min(endKt, nextT);
+                                        AddJammerBeam(session, srcEnt, segStart, segEnd, segMode, segBand, segDx, segDy, segDz);
+                                        segActive = false;
                                     }
+                                    if (!segActive)
+                                    {
+                                        segActive = true;
+                                        segStart = kt;
+                                        segMode = txMode;
+                                        segBand = txBand;
+                                    }
+                                    segEnd = kt + 0.35;
+                                    segDx = dirX / len3d;
+                                    segDy = dirY / len3d;
+                                    segDz = dirZ / len3d;
                                 }
-                                if (endKt <= kt) continue;
-
-                            double len3d = Math.Sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
-                            if (len3d > 0.001)
-                            {
-                                DebriefSample s1 = srcEnt.GetStateAt(kt) ?? (srcEnt.Track.Count > 0 ? srcEnt.Track[0] : null);
-                                session.Beams.Add(new TacticalBeam
+                                else if (segActive)
                                 {
-                                    StartTime = kt,
-                                    EndTime = endKt,
-                                    Kind = "JAMMER",
-                                    FromId = srcEnt.Id,
-                                    ToId = "",
-                                    FromName = srcEnt.Name,
-                                    ToName = jamFullTag,
-                                    FromX = s1 != null ? s1.X : 0,
-                                    FromY = s1 != null ? s1.Y : 0,
-                                    DirX = dirX / len3d,
-                                    DirY = dirZ / len3d,
-                                    DirZ = dirY / len3d
-                                });
-                                decodedBeams++;
+                                    segEnd = Math.Max(kt, segEnd);
+                                    AddJammerBeam(session, srcEnt, segStart, segEnd, segMode, segBand, segDx, segDy, segDz);
+                                    segActive = false;
+                                }
                             }
-                        }
-                        continue;
+                            if (segActive)
+                            {
+                                segEnd = Math.Max(srcEnt.LastTime, segEnd);
+                                AddJammerBeam(session, srcEnt, segStart, segEnd, segMode, segBand, segDx, segDy, segDz);
+                            }
+                            continue;
                         }
 
                         for (int k = 0; k < kfList.Count; k++)
@@ -3551,6 +3761,84 @@ public static class DebriefEngine
                 }
             }
             catch { }
+
+            // Точные взрывы из штатного eventTrack (eventType 0 = Explosion)
+            try
+            {
+                object evtTrack = recType.GetField("eventTrack", bf).GetValue(recorder);
+                System.Collections.IList ekfs = null;
+                if (evtTrack != null)
+                {
+                    Type etT = evtTrack.GetType();
+                    while (etT != null && ekfs == null)
+                    {
+                        foreach (System.Reflection.FieldInfo f in etT.GetFields(bf | System.Reflection.BindingFlags.DeclaredOnly))
+                            if (typeof(System.Collections.IList).IsAssignableFrom(f.FieldType)) { ekfs = f.GetValue(evtTrack) as System.Collections.IList; if (ekfs != null) break; }
+                        etT = etT.BaseType;
+                    }
+                }
+                if (ekfs != null)
+                {
+                    int flareCount = 0, chaffCount = 0;
+                    foreach (object kf in ekfs)
+                    {
+                        if (kf == null) continue;
+                        Type kft = kf.GetType();
+                        if (kft.Name != "WorldEventKeyframe") continue;
+                        System.Reflection.FieldInfo fEt = kft.GetField("eventType", bf);
+                        if (fEt == null) continue;
+                        int evType = Convert.ToInt32(fEt.GetValue(kf));
+                        if (evType != 0 && evType != 2 && evType != 3) continue;
+                        double ex = 0, ey = 0, ez = 0, etime = 0;
+                        foreach (System.Reflection.FieldInfo f in kft.GetFields(bf))
+                        {
+                            object v = f.GetValue(kf);
+                            if (v == null) continue;
+                            if (f.FieldType == typeof(float) && f.Name.Equals("t", StringComparison.OrdinalIgnoreCase))
+                                etime = (float)v;
+                            else if (f.FieldType.Name == "FixedPoint")
+                            {
+                                Type fpT = v.GetType();
+                                System.Reflection.FieldInfo gp = fpT.GetField("globalPoint", bf);
+                                if (gp != null)
+                                {
+                                    object v3 = gp.GetValue(v);
+                                    Type v3t = v3.GetType();
+                                    ex = Convert.ToDouble(v3t.GetField("x", bf).GetValue(v3));
+                                    ey = Convert.ToDouble(v3t.GetField("y", bf).GetValue(v3));
+                                    ez = Convert.ToDouble(v3t.GetField("z", bf).GetValue(v3));
+                                }
+                            }
+                        }
+                        if (evType == 0)
+                        {
+                            // Игра пишет серию кадров на один взрыв (кластер, попадание, детонация),
+                            // поэтому склеиваем близкие по времени и месту события в один маркер.
+                            bool dup = false;
+                            for (int ei = session.Explosions.Count - 1; ei >= 0; ei--)
+                            {
+                                DebriefExplosion prev = session.Explosions[ei];
+                                if (etime - prev.Time > 0.25) break;
+                                if (Math.Abs(etime - prev.Time) > 0.25) continue;
+                                double ddx = ex - prev.X, ddy = ez - prev.Y, ddz = ey - prev.Alt;
+                                if (ddx * ddx + ddy * ddy + ddz * ddz <= 3600.0) { dup = true; break; }
+                            }
+                            if (!dup)
+                                session.Explosions.Add(new DebriefExplosion { Time = etime, X = ex, Y = ez, Alt = ey });
+                        }
+                        else
+                        {
+                            session.Flares.Add(new DebriefFlare { Time = etime, X = ex, Y = ez, Alt = ey, IsChaff = (evType == 3) });
+                            if (evType == 3) chaffCount++; else flareCount++;
+                        }
+                    }
+                    log.AppendFormat(" | Взрывов={0}, ЛТЦ={1}, ДО={2}", session.Explosions.Count, flareCount, chaffCount);
+                }
+            }
+            catch { }
+
+            ComputePlayerPeaks(session);
+
             log.AppendFormat(" | Лучей РЛС/АРЛ/РЭБ={0} | Итого юнитов={1}, кадров={2}, длительность={3:F1}с", decodedBeams, session.Entities.Count, totalFrames, maxT);
             diagLog = log.ToString();
             if (session.Entities.Count > 0 && totalFrames > 10)
@@ -3569,6 +3857,176 @@ public static class DebriefEngine
         diagLog = log.ToString();
         return false;
     }
+    private static void ComputePlayerPeaks(DebriefSession s)
+    {
+        DebriefEntity player = null;
+        foreach (DebriefEntity e in s.Entities)
+            if (e.IsPlayer && e.Track.Count > 1) { player = e; break; }
+        if (player == null) return;
+
+        for (int i = 1; i < player.Track.Count; i++)
+        {
+            DebriefSample a = player.Track[i - 1];
+            DebriefSample b = player.Track[i];
+            double dt = b.Time - a.Time;
+            if (dt <= 0.02) continue;
+            double va = Math.Sqrt(a.VX * a.VX + a.VY * a.VY + a.VZ * a.VZ);
+            double vb = Math.Sqrt(b.VX * b.VX + b.VY * b.VY + b.VZ * b.VZ);
+            if (va < 5.0 || vb < 5.0) continue; // обрыв трека / телепорт
+            double dvx = b.VX - a.VX, dvy = b.VY - a.VY, dvz = b.VZ - a.VZ;
+            double dv = Math.Sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+            double g = dv / dt / 9.80665;
+            if (g > 25.0) continue; // выброс в данных
+            if (g > s.PlayerMaxG) { s.PlayerMaxG = g; s.PlayerMaxGTime = b.Time; }
+            if (b.Speed > s.PlayerMaxSpeed) s.PlayerMaxSpeed = b.Speed;
+            if (b.Alt < s.PlayerMinAlt) { s.PlayerMinAlt = b.Alt; s.PlayerMinAltTime = b.Time; }
+        }
+    }
+
+    // Анализ реальных данных полёта: перегрузка, CFIT, реакция на пуск.
+    // Никаких домыслов о том, чего нет в файле (например, отстрела ЛТЦ/ДО — их в реплее нет).
+    private static void BuildPilotInsights(DebriefSession s)
+    {
+        DebriefEntity player = null;
+        foreach (DebriefEntity e in s.Entities)
+            if (e.IsPlayer) { player = e; break; }
+
+        foreach (TacticalEvent ev in s.Events)
+        {
+            if (string.IsNullOrEmpty(ev.Category))
+            {
+                if (ev.Kind == "THREAT" || ev.Kind == "RWR" || ev.Kind == "RADAR" || ev.Kind == "JAMMER") ev.Category = "THREAT";
+                else if (ev.Kind == "KILL" || ev.Kind == "GROUND_KILL" || (ev.Kind == "LAUNCH" && ev.Severity == "GOOD")) ev.Category = "SUCCESS";
+                else if (ev.Kind == "KIA" && ev.Severity == "WARNING") ev.Category = "INFO";   // потеря союзника — не ошибка пилота
+                else if (ev.Kind == "KIA" || ev.Kind == "DAMAGE" || ev.Kind == "MISTAKE" || ev.Kind == "CFIT") ev.Category = "MISTAKE";
+                else ev.Category = "INFO";
+            }
+            if (player != null && double.IsNaN(ev.Altitude))
+            {
+                DebriefSample st = player.GetStateAt(ev.Time);
+                if (st != null) { ev.Altitude = st.Alt; ev.SpeedKmh = st.Speed * 3.6; }
+            }
+        }
+
+        if (player == null || player.Track.Count < 2) return;
+
+        if (s.PlayerMaxG >= 9.0)
+        {
+            DebriefSample at = player.GetStateAt(s.PlayerMaxGTime);
+            TacticalEvent ev = new TacticalEvent
+            {
+                Time = s.PlayerMaxGTime,
+                Kind = "MISTAKE",
+                Severity = s.PlayerMaxG >= 11.0 ? "CRITICAL" : "WARNING",
+                Category = "MISTAKE",
+                Title = string.Format("Перегрузка {0:F1} G", s.PlayerMaxG),
+                Description = string.Format("Пиковая перегрузка борта {0:F1} G на высоте {1:F0} м. Устойчивая перегрузка выше 9 G ведёт к потере сознания и разрушению планера.", s.PlayerMaxG, at != null ? at.Alt : 0),
+                Advice = "Плавнее работайте РУС на выводе из пикирования: наращивайте перегрузку постепенно и следите за индикатором G.",
+                WorldX = at != null ? at.X : 0,
+                WorldY = at != null ? at.Y : 0,
+                Altitude = at != null ? at.Alt : double.NaN
+            };
+            s.Events.Add(ev);
+            s.Mistakes.Add(ev);
+        }
+
+        DebriefSample last = player.Track[player.Track.Count - 1];
+        double ground = s.GetGroundAltitudeAt(last.X, last.Y);
+        double agl = last.Alt - ground;
+        bool destroyedByWeapon = false;
+        foreach (TacticalEvent ev in s.Events)
+            if (ev.Kind == "KIA" && Math.Abs(ev.Time - last.Time) < 3.0) { destroyedByWeapon = true; break; }
+
+        bool cfit = !destroyedByWeapon && last.Time < s.Duration - 3.0 && agl < 60.0 && last.Speed > 25.0;
+        if (cfit)
+        {
+            TacticalEvent ev = new TacticalEvent
+            {
+                Time = last.Time,
+                Kind = "CFIT",
+                Severity = "CRITICAL",
+                Category = "MISTAKE",
+                Title = "Столкновение с рельефом",
+                Description = string.Format("Трек оборвался на высоте {0:F0} м над рельефом при скорости {1:F0} км/ч — признаки столкновения с землёй (CFIT).", agl, last.Speed * 3.6),
+                Advice = "Контролируйте высоту по радиовысотомеру в горах и на малых высотах; не отвлекайтесь на БРЛС в пикировании.",
+                WorldX = last.X,
+                WorldY = last.Y,
+                Altitude = last.Alt,
+                SpeedKmh = last.Speed * 3.6
+            };
+            s.Events.Add(ev);
+            s.Mistakes.Add(ev);
+        }
+
+        // Реакция на пуск: считаем реальные курс и перегрузку в течение 8 секунд после угрозы
+        foreach (TacticalEvent threat in s.Events.ToArray())
+        {
+            if (threat.Kind != "THREAT" || threat.Severity != "CRITICAL") continue;
+            DebriefSample t0 = player.GetStateAt(threat.Time);
+            DebriefSample t1 = player.GetStateAt(threat.Time + 8.0);
+            if (t0 == null || t1 == null) continue;
+
+            double dHdg = Math.Abs(((t1.Heading - t0.Heading + 540.0) % 360.0) - 180.0);
+            double maxG = 0;
+            for (int i = 1; i < player.Track.Count; i++)
+            {
+                DebriefSample a = player.Track[i - 1], b = player.Track[i];
+                if (b.Time < threat.Time || b.Time > threat.Time + 8.0) continue;
+                double dt = b.Time - a.Time;
+                if (dt <= 0.02) continue;
+                double dv = Math.Sqrt(Math.Pow(b.VX - a.VX, 2) + Math.Pow(b.VY - a.VY, 2) + Math.Pow(b.VZ - a.VZ, 2));
+                double g = dv / dt / 9.80665;
+                if (g > maxG) maxG = g;
+            }
+
+            if (dHdg < 35.0 && maxG < 3.5)
+            {
+                TacticalEvent ev = new TacticalEvent
+                {
+                    Time = threat.Time + 8.0,
+                    Kind = "MISTAKE",
+                    Severity = "WARNING",
+                    Category = "MISTAKE",
+                    Title = "Нет оборонительного манёвра после пуска",
+                    Description = string.Format("Через 8 с после пуска по вам ({0}) курс изменился на {1:F0}°, перегрузка не превысила {2:F1} G — ракета продолжала наведение.", threat.Title, dHdg, maxG),
+                    Advice = "Сразу после пуска/срабатывания СПО: отворот 90–120° (notch) к линии визирования, снижение и отстрел ДО; на конечном участке — манёвр 7–9 G.",
+                    WorldX = t0.X,
+                    WorldY = t0.Y,
+                    Altitude = t0.Alt,
+                    SpeedKmh = t0.Speed * 3.6
+                };
+                s.Events.Add(ev);
+                s.Mistakes.Add(ev);
+            }
+        }
+    }
+
+    private static void AddJammerBeam(DebriefSession s, DebriefEntity src, double startT, double endT,
+        string mode, string band, double dx, double dy, double dz)
+    {
+        if (endT <= startT + 0.05) return;
+        DebriefSample st = src.GetStateAt(startT) ?? (src.Track.Count > 0 ? src.Track[0] : null);
+        if (st == null) return;
+        string tag = string.IsNullOrEmpty(band) ? mode : (mode + " · " + band);
+        s.Beams.Add(new TacticalBeam
+        {
+            StartTime = startT,
+            EndTime = endT,
+            Kind = "JAMMER",
+            FromId = src.Id,
+            ToId = "",
+            FromName = src.Name,
+            ToName = tag,
+            JamMode = mode ?? "",
+            JamBand = band ?? "",
+            FromX = st.X,
+            FromY = st.Y,
+            DirX = dx,
+            DirY = dz,   // мировая ось Z -> плоскость карты
+            DirZ = dy    // мировая ось Y -> высота
+        });
+    }
+
     private static void BuildNativeVtrEvents(DebriefSession s)
     {
         // 1. Все пуски ракет (твои, союзные и вражеские по захваченной цели)
@@ -3671,6 +4129,8 @@ public static class DebriefEngine
 
         // 2. Все попадания ракет и гибель юнитов (трек цели должен оборваться в пределах +-2.5 сек от взрыва ракеты)
         HashSet<string> killedIds = new HashSet<string>();
+        // Ракета -> имя поражённой цели (только подтверждённые попадания)
+        Dictionary<string, string> hitByMissile = new Dictionary<string, string>();
 
         foreach (DebriefEntity msl in s.Entities)
         {
@@ -3705,6 +4165,7 @@ public static class DebriefEngine
             if (hitVictim != null)
             {
                 killedIds.Add(hitVictim.Id);
+                hitByMissile[msl.Id] = hitVictim.Name;
                 double hitTime = msl.LastTime;
                 DebriefSample hitPos = hitVictim.GetStateAt(Math.Min(hitTime, hitVictim.LastTime)) ?? mEnd;
 
@@ -3813,6 +4274,53 @@ public static class DebriefEngine
                 WorldY = jb.FromY
             });
         }
+
+        // 4. Сводная аналитика пусков: только факты из треков (носитель, время, время полёта, поражение)
+        foreach (DebriefEntity msl in s.Entities)
+        {
+            if (msl.Type != "Missile" || msl.Track.Count == 0) continue;
+
+            bool isMine = msl.Pilot != null && msl.Pilot.StartsWith("MY_MISSILE:");
+            string side = isMine ? "МОЙ" : (msl.Coalition == "Allies" ? "СОЮЗ" : (msl.Coalition == "Enemies" ? "ВРАГ" : "—"));
+
+            DebriefLaunch dl = new DebriefLaunch();
+            dl.Time = msl.FirstTime;
+            dl.MissileName = msl.Name;
+            dl.MissileId = msl.Id;
+            dl.Launcher = isMine ? "" : (msl.Pilot ?? "");
+            dl.Coalition = msl.Coalition;
+            dl.Side = side;
+            dl.FlightTime = Math.Max(0.0, msl.LastTime - msl.FirstTime);
+
+            string targetName;
+            if (hitByMissile.TryGetValue(msl.Id, out targetName))
+            {
+                dl.TargetName = targetName;
+                dl.Result = "ПОПАДАНИЕ";
+
+                // Дистанция пуска — 3D-расстояние до цели в момент старта ракеты
+                foreach (DebriefEntity cand in s.Entities)
+                {
+                    if (cand.Name != targetName) continue;
+                    DebriefSample tAtLaunch = cand.GetStateAt(msl.FirstTime);
+                    if (tAtLaunch == null) break;
+                    DebriefSample mAtLaunch = msl.Track[0];
+                    dl.LaunchDist = Math.Sqrt(
+                        Math.Pow(tAtLaunch.X - mAtLaunch.X, 2) +
+                        Math.Pow(tAtLaunch.Y - mAtLaunch.Y, 2) +
+                        Math.Pow(tAtLaunch.Alt - mAtLaunch.Alt, 2));
+                    break;
+                }
+            }
+            else
+            {
+                dl.TargetName = "";
+                dl.Result = "ПРОМАХ";
+            }
+
+            s.Launches.Add(dl);
+        }
+        s.Launches.Sort((a, b) => a.Time.CompareTo(b.Time));
     }
 
 

@@ -30,8 +30,15 @@ public class DebriefRadarForm : Form
     private ComboBox cmbSpeed;
     private Label lblTimeHud;
     private Label lblTelemetryHud;
+    private Label lblSummary;
     private ListBox lstMistakes;
     private TextBox txtCoachAdvice;
+    private Button btnFilterAll;
+    private Button btnFilterThreats;
+    private Button btnFilterMistakes;
+    private Button btnFilterSuccess;
+    private string eventFilter = "ALL";
+    private List<TacticalEvent> currentEvents = new List<TacticalEvent>();
 
     private List<string> replayFiles = new List<string>();
     private DebriefSession session = null;
@@ -71,6 +78,23 @@ public class DebriefRadarForm : Form
     private string lastJamBannerActor = "";
     private HashSet<string> triggeredJamEvents = new HashSet<string>();
 
+    // Линейка (измерение расстояния и азимута по карте)
+    private bool rulerActive = false;
+    private bool rulerHasA = false;
+    private bool rulerHasB = false;
+    private PointF rulerA = PointF.Empty;
+    private PointF rulerB = PointF.Empty;
+    private Button btnRuler;
+
+    // Аналитика пусков
+    private ListBox lstLaunches;
+    private List<DebriefLaunch> launchList = new List<DebriefLaunch>();
+    private Button btnTabChrono;
+    private Button btnTabLaunches;
+    private bool launchesMode = false;
+    private Panel pnlFiltersRef;
+    private Label lblChronoTitle;
+
 
     public DebriefRadarForm()
     {
@@ -83,6 +107,7 @@ public class DebriefRadarForm : Form
         this.StartPosition = FormStartPosition.CenterParent;
         this.FormBorderStyle = FormBorderStyle.Sizable;
         this.MaximizeBox = true;
+        this.KeyPreview = true;
         this.BackColor = Color.FromArgb(16, 20, 18);
         this.SizeChanged += (s, e) => { this.PerformLayout(); if (pnlRadar != null) pnlRadar.Invalidate(); if (pnlTimeline != null) pnlTimeline.Invalidate(); };
 
@@ -102,18 +127,17 @@ public class DebriefRadarForm : Form
         btnBrowseFile.Click += BtnBrowseFile_Click;
         pnlTop.Controls.Add(btnBrowseFile);
 
-        Button btnImportLog = new Button() { Text = "📥 Из Player.log", Left = 454, Top = 5, Width = 136, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(140, 85, 0), ForeColor = Color.White, Font = new Font("Consolas", 8.5f, FontStyle.Bold) };
-        btnImportLog.Click += BtnImportLog_Click;
-        pnlTop.Controls.Add(btnImportLog);
-
-        Button btnFitAll = new Button() { Text = "🌐 Бой", Left = 594, Top = 5, Width = 54, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(38, 78, 62), ForeColor = Color.White };
+        Button btnFitAll = new Button() { Text = "🌐 Бой", Left = 456, Top = 5, Width = 62, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(38, 78, 62), ForeColor = Color.White };
         btnFitAll.Click += (s, e) => { followPlayer = false; chkFollowPlayer.Checked = false; FitCameraToBattle(); pnlRadar.Invalidate(); };
         pnlTop.Controls.Add(btnFitAll);
 
-        btnToggle3D = new Button() { Text = "📐 3D", Left = 650, Top = 5, Width = 44, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 52, 65), ForeColor = Color.LightGray, Font = new Font("Consolas", 7.8f, FontStyle.Bold) };
+        // Крупный переключатель 2D/3D — основной элемент управления видом
+        btnToggle3D = new Button() { Text = "📐 3D-ПРОСМОТР", Left = 524, Top = 3, Width = 156, Height = 30, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 52, 65), ForeColor = Color.LightGray, Font = new Font("Consolas", 9.5f, FontStyle.Bold) };
+        btnToggle3D.FlatAppearance.BorderSize = 1;
         btnToggle3D.Click += (s, e) =>
         {
             is3DMode = !is3DMode;
+            btnToggle3D.Text = is3DMode ? "🗺 2D-КАРТА" : "📐 3D-ПРОСМОТР";
             btnToggle3D.BackColor = is3DMode ? Color.FromArgb(0, 125, 165) : Color.FromArgb(40, 52, 65);
             btnToggle3D.ForeColor = is3DMode ? Color.White : Color.LightGray;
             pnlRadar.Visible = !is3DMode;
@@ -123,7 +147,7 @@ public class DebriefRadarForm : Form
         };
         pnlTop.Controls.Add(btnToggle3D);
 
-        chkFollowPlayer = new CheckBox() { Text = "Следить:", Left = 696, Top = 8, AutoSize = true, Checked = false, ForeColor = Color.FromArgb(180, 240, 200) };
+        chkFollowPlayer = new CheckBox() { Text = "Следить:", Left = 692, Top = 9, AutoSize = true, Checked = false, ForeColor = Color.FromArgb(180, 240, 200) };
         chkFollowPlayer.CheckedChanged += (s, e) => { followPlayer = chkFollowPlayer.Checked; UpdateFrame(); };
         pnlTop.Controls.Add(chkFollowPlayer);
 
@@ -183,6 +207,25 @@ public class DebriefRadarForm : Form
         pnlRadar.Paint += PnlRadar_Paint;
         pnlRadar.MouseDown += (s, e) =>
         {
+            // Линейка: режим включён кнопкой или зажат Ctrl — ставим точки, не трогая камеру
+            if (e.Button == MouseButtons.Left && session != null &&
+                (rulerActive || (Control.ModifierKeys & Keys.Control) == Keys.Control))
+            {
+                if (!rulerHasA || rulerHasB)
+                {
+                    rulerA = e.Location;
+                    rulerHasA = true;
+                    rulerHasB = false;
+                }
+                else
+                {
+                    rulerB = e.Location;
+                    rulerHasB = true;
+                }
+                pnlRadar.Invalidate();
+                return;
+            }
+
             if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
             {
                 bool hitAircraft = false;
@@ -256,6 +299,26 @@ public class DebriefRadarForm : Form
             pnlRadar.Invalidate();
         };
         this.Controls.Add(pnlRadar);
+
+        // Кнопка-переключатель линейки (места в верхней панели нет — держим поверх карты)
+        btnRuler = new Button()
+        {
+            Text = "📏",
+            Left = pnlRadar.Width - 44,
+            Top = 8,
+            Width = 34,
+            Height = 26,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(32, 40, 36),
+            ForeColor = Color.FromArgb(190, 215, 205),
+            Font = new Font("Consolas", 9f, FontStyle.Bold),
+            TabStop = false
+        };
+        btnRuler.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        btnRuler.FlatAppearance.BorderSize = 1;
+        btnRuler.FlatAppearance.BorderColor = Color.FromArgb(55, 70, 62);
+        btnRuler.Click += (s, e) => SetRulerMode(!rulerActive);
+        pnlRadar.Controls.Add(btnRuler);
         glRadar3D = new OpenGLRadarControl();
         glRadar3D.Location = pnlRadar.Location;
         glRadar3D.Size = pnlRadar.Size;
@@ -320,49 +383,131 @@ public class DebriefRadarForm : Form
         pnlRight.BorderStyle = BorderStyle.FixedSingle;
         this.Controls.Add(pnlRight);
 
-        Label lblTelTitle = new Label() { Text = "/// ТЕЛЕМЕТРИЯ И СВОДКА БОЯ ///", Left = 10, Top = 8, AutoSize = true, Font = new Font("Consolas", 9.5f, FontStyle.Bold), ForeColor = Color.Cyan };
-        pnlRight.Controls.Add(lblTelTitle);
-
         lblTelemetryHud = new Label()
         {
             Left = 10,
-            Top = 28,
+            Top = 8,
             Width = 356,
-            Height = 84,
+            Height = 68,
             BackColor = Color.FromArgb(15, 20, 18),
             ForeColor = Color.FromArgb(0, 255, 102),
             BorderStyle = BorderStyle.FixedSingle,
             Padding = new Padding(6),
+            Font = new Font("Consolas", 8.5f),
             Text = "Загрузите вылет для просмотра телеметрии..."
         };
         pnlRight.Controls.Add(lblTelemetryHud);
 
-        Label lblErrTitle = new Label() { Text = "/// ХРОНОЛОГИЯ И ОШИБКИ ПИЛОТА ///", Left = 10, Top = 120, AutoSize = true, Font = new Font("Consolas", 9.5f, FontStyle.Bold), ForeColor = Color.Gold };
-        pnlRight.Controls.Add(lblErrTitle);
+        // Компактная сводка боя: только реальные цифры из файла
+        lblSummary = new Label()
+        {
+            Left = 10,
+            Top = 84,
+            Width = 356,
+            Height = 62,
+            BackColor = Color.FromArgb(18, 24, 21),
+            ForeColor = Color.FromArgb(200, 235, 210),
+            BorderStyle = BorderStyle.FixedSingle,
+            Padding = new Padding(6),
+            Font = new Font("Consolas", 8f),
+            Text = "Сводка появится после загрузки повтора."
+        };
+        pnlRight.Controls.Add(lblSummary);
+
+        lblChronoTitle = new Label() { Text = "/// ХРОНОЛОГИЯ БОЯ ///", Left = 10, Top = 152, AutoSize = true, Font = new Font("Consolas", 9.5f, FontStyle.Bold), ForeColor = Color.Gold, Visible = false };
+        pnlRight.Controls.Add(lblChronoTitle);
+
+        btnTabChrono = new Button()
+        {
+            Text = "ХРОНОЛОГИЯ",
+            Left = 10,
+            Top = 152,
+            Width = 112,
+            Height = 21,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(0, 110, 80),
+            ForeColor = Color.White,
+            Font = new Font("Consolas", 8f, FontStyle.Bold),
+            TabStop = false
+        };
+        btnTabChrono.FlatAppearance.BorderSize = 1;
+        btnTabChrono.FlatAppearance.BorderColor = Color.FromArgb(55, 70, 62);
+        btnTabChrono.Click += (s, e) => SetLaunchesMode(false);
+        pnlRight.Controls.Add(btnTabChrono);
+
+        btnTabLaunches = new Button()
+        {
+            Text = "ПУСКИ",
+            Left = 128,
+            Top = 152,
+            Width = 80,
+            Height = 21,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(32, 40, 36),
+            ForeColor = Color.FromArgb(170, 190, 180),
+            Font = new Font("Consolas", 8f, FontStyle.Bold),
+            TabStop = false
+        };
+        btnTabLaunches.FlatAppearance.BorderSize = 1;
+        btnTabLaunches.FlatAppearance.BorderColor = Color.FromArgb(55, 70, 62);
+        btnTabLaunches.Click += (s, e) => SetLaunchesMode(true);
+        pnlRight.Controls.Add(btnTabLaunches);
+
+        // Фильтры хронологии
+        Panel pnlFilters = new Panel() { Left = 8, Top = 178, Width = 360, Height = 24, BackColor = Color.FromArgb(20, 25, 23) };
+        pnlFilters.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        pnlFiltersRef = pnlFilters;
+        pnlRight.Controls.Add(pnlFilters);
+
+        btnFilterAll = MakeFilterButton("ВСЕ", 0, true);
+        btnFilterThreats = MakeFilterButton("УГРОЗЫ", 1, false);
+        btnFilterMistakes = MakeFilterButton("ОШИБКИ", 2, false);
+        btnFilterSuccess = MakeFilterButton("УСПЕХИ", 3, false);
+        pnlFilters.Controls.Add(btnFilterAll);
+        pnlFilters.Controls.Add(btnFilterThreats);
+        pnlFilters.Controls.Add(btnFilterMistakes);
+        pnlFilters.Controls.Add(btnFilterSuccess);
 
         lstMistakes = new ListBox();
-        lstMistakes.Location = new Point(10, 142);
-        lstMistakes.Size = new Size(356, 241);
+        lstMistakes.Location = new Point(10, 206);
+        lstMistakes.Size = new Size(356, 184);
         lstMistakes.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         lstMistakes.BackColor = Color.FromArgb(16, 20, 18);
         lstMistakes.ForeColor = Color.White;
         lstMistakes.BorderStyle = BorderStyle.FixedSingle;
         lstMistakes.DrawMode = DrawMode.OwnerDrawFixed;
-        lstMistakes.ItemHeight = 20;
+        lstMistakes.ItemHeight = 34;
+        lstMistakes.IntegralHeight = false;
         lstMistakes.DrawItem += LstMistakes_DrawItem;
         lstMistakes.SelectedIndexChanged += LstMistakes_SelectedIndexChanged;
         pnlRight.Controls.Add(lstMistakes);
 
-        Label lblAdvTitle = new Label() { Text = "РАЗБОР МОМЕНТА И СОВЕТ:", Left = 10, Top = 391, AutoSize = true, Font = new Font("Consolas", 9f, FontStyle.Bold), ForeColor = Color.FromArgb(0, 255, 102) };
+        // Второй список — аналитика пусков (тот же прямоугольник, виден только во вкладке «ПУСКИ»)
+        lstLaunches = new ListBox();
+        lstLaunches.Location = lstMistakes.Location;
+        lstLaunches.Size = lstMistakes.Size;
+        lstLaunches.Anchor = lstMistakes.Anchor;
+        lstLaunches.BackColor = Color.FromArgb(16, 20, 18);
+        lstLaunches.ForeColor = Color.White;
+        lstLaunches.BorderStyle = BorderStyle.FixedSingle;
+        lstLaunches.DrawMode = DrawMode.OwnerDrawFixed;
+        lstLaunches.ItemHeight = 34;
+        lstLaunches.IntegralHeight = false;
+        lstLaunches.DrawItem += LstLaunches_DrawItem;
+        lstLaunches.SelectedIndexChanged += LstLaunches_SelectedIndexChanged;
+        lstLaunches.Visible = false;
+        pnlRight.Controls.Add(lstLaunches);
+
+        Label lblAdvTitle = new Label() { Text = "/// РАЗБОР МОМЕНТА ///", Left = 10, Top = 396, AutoSize = true, Font = new Font("Consolas", 9f, FontStyle.Bold), ForeColor = Color.FromArgb(0, 255, 102) };
         lblAdvTitle.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         pnlRight.Controls.Add(lblAdvTitle);
 
         txtCoachAdvice = new TextBox()
         {
             Left = 10,
-            Top = 411,
+            Top = 415,
             Width = 356,
-            Height = 142,
+            Height = 140,
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
             Multiline = true,
             ReadOnly = true,
@@ -370,7 +515,8 @@ public class DebriefRadarForm : Form
             BackColor = Color.FromArgb(15, 20, 18),
             ForeColor = Color.FromArgb(225, 245, 230),
             BorderStyle = BorderStyle.FixedSingle,
-            Text = "Выберите событие или ошибку в списке выше, чтобы перейти к моменту боя на карте и увидеть тактический разбор."
+            Font = new Font("Consolas", 8.5f),
+            Text = "Выберите событие в хронологии, чтобы перейти к этому моменту боя на карте и увидеть разбор."
         };
         pnlRight.Controls.Add(txtCoachAdvice);
         // Нижняя панель плеера
@@ -381,13 +527,13 @@ public class DebriefRadarForm : Form
         btnPlayPause.Click += (s, e) => TogglePlay();
         pnlBottom.Controls.Add(btnPlayPause);
         cmbSpeed = new ComboBox() { Left = 110, Top = 19, Width = 68, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(30, 38, 34), ForeColor = Color.Cyan };
-        cmbSpeed.Items.AddRange(new object[] { "1x", "2x", "5x", "10x", "20x" });
-        cmbSpeed.SelectedIndex = 1;
+        cmbSpeed.Items.AddRange(new object[] { "0.25x", "0.5x", "1x", "2x", "5x", "10x", "20x" });
+        cmbSpeed.SelectedIndex = 3;
         cmbSpeed.SelectedIndexChanged += (s, e) =>
         {
             string sVal = cmbSpeed.SelectedItem.ToString().Replace("x", "");
             double sp;
-            if (double.TryParse(sVal, out sp)) playSpeed = sp;
+            if (double.TryParse(sVal, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out sp)) playSpeed = sp;
         };
         pnlBottom.Controls.Add(cmbSpeed);
         lblTimeHud = new Label() { Left = 186, Top = 22, Width = 135, Height = 20, ForeColor = Color.Cyan, Font = new Font("Consolas", 9.5f, FontStyle.Bold), Text = "00:00 / 00:00" };
@@ -449,6 +595,155 @@ public class DebriefRadarForm : Form
         };
         RefreshReplayList();
     }
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (session == null) return base.ProcessCmdKey(ref msg, keyData);
+        if (ActiveControl is TextBoxBase) return base.ProcessCmdKey(ref msg, keyData);
+        if (ActiveControl is ComboBox) return base.ProcessCmdKey(ref msg, keyData);
+
+        Keys key = keyData & Keys.KeyCode;
+        bool shift = (keyData & Keys.Shift) == Keys.Shift;
+
+        if (key == Keys.Space)
+        {
+            TogglePlay();
+            return true;
+        }
+        if (key == Keys.Left || key == Keys.Right)
+        {
+            double step = shift ? 5.0 : 1.0;
+            currentTime += (key == Keys.Left ? -step : step);
+            if (currentTime < 0) currentTime = 0;
+            if (currentTime > session.Duration) currentTime = session.Duration;
+            UpdateFrame();
+            return true;
+        }
+        if (key == Keys.Home)
+        {
+            currentTime = 0;
+            UpdateFrame();
+            return true;
+        }
+        if (key == Keys.End)
+        {
+            currentTime = session.Duration;
+            UpdateFrame();
+            return true;
+        }
+        if (key == Keys.Escape)
+        {
+            SetRulerMode(false);
+            return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    private void SetRulerMode(bool on)
+    {
+        rulerActive = on;
+        if (!on) { rulerHasA = false; rulerHasB = false; }
+        if (btnRuler != null)
+        {
+            btnRuler.BackColor = on ? Color.FromArgb(0, 110, 80) : Color.FromArgb(32, 40, 36);
+            btnRuler.ForeColor = on ? Color.White : Color.FromArgb(190, 215, 205);
+        }
+        if (pnlRadar != null) pnlRadar.Invalidate();
+    }
+
+    private void SetLaunchesMode(bool on)
+    {
+        launchesMode = on;
+        if (lstMistakes != null) lstMistakes.Visible = !on;
+        if (lstLaunches != null) lstLaunches.Visible = on;
+        if (pnlFiltersRef != null) pnlFiltersRef.Visible = !on;
+        if (btnTabChrono != null)
+        {
+            btnTabChrono.BackColor = on ? Color.FromArgb(32, 40, 36) : Color.FromArgb(0, 110, 80);
+            btnTabChrono.ForeColor = on ? Color.FromArgb(170, 190, 180) : Color.White;
+        }
+        if (btnTabLaunches != null)
+        {
+            btnTabLaunches.BackColor = on ? Color.FromArgb(0, 110, 80) : Color.FromArgb(32, 40, 36);
+            btnTabLaunches.ForeColor = on ? Color.White : Color.FromArgb(170, 190, 180);
+        }
+        if (on) RefreshLaunchList();
+    }
+
+    private void RefreshLaunchList()
+    {
+        if (lstLaunches == null) return;
+        lstLaunches.BeginUpdate();
+        lstLaunches.Items.Clear();
+        foreach (DebriefLaunch dl in launchList)
+            lstLaunches.Items.Add(dl);
+        lstLaunches.EndUpdate();
+    }
+
+    private void LstLaunches_DrawItem(object sender, DrawItemEventArgs e)
+    {
+        if (e.Index < 0 || e.Index >= lstLaunches.Items.Count) return;
+        DebriefLaunch dl = (DebriefLaunch)lstLaunches.Items[e.Index];
+        bool sel = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+        Color bg = sel ? Color.FromArgb(30, 62, 50) : (e.Index % 2 == 0 ? Color.FromArgb(16, 20, 18) : Color.FromArgb(19, 24, 21));
+
+        Color fg = Color.LightGray;
+        Color accent = Color.Gray;
+        if (dl.Side == "МОЙ") { fg = Color.FromArgb(140, 235, 175); accent = Color.FromArgb(0, 200, 110); }
+        else if (dl.Side == "СОЮЗ") { fg = Color.FromArgb(150, 205, 235); accent = Color.FromArgb(90, 160, 210); }
+        else if (dl.Side == "ВРАГ") { fg = Color.FromArgb(255, 170, 140); accent = Color.FromArgb(220, 90, 60); }
+
+        using (SolidBrush br = new SolidBrush(bg)) e.Graphics.FillRectangle(br, e.Bounds);
+        using (SolidBrush accentBr = new SolidBrush(accent))
+            e.Graphics.FillRectangle(accentBr, e.Bounds.Left, e.Bounds.Top, 3, e.Bounds.Height);
+
+        Rectangle line1 = new Rectangle(e.Bounds.Left + 8, e.Bounds.Top + 2, e.Bounds.Width - 12, 16);
+        Rectangle line2 = new Rectangle(e.Bounds.Left + 8, e.Bounds.Top + 17, e.Bounds.Width - 12, 15);
+
+        using (Font f1 = new Font("Consolas", 8.5f, FontStyle.Bold))
+        using (Font f2 = new Font("Consolas", 7.5f))
+        {
+            string head = string.Format("{0}  🚀 {1}  {2}", FormatSec(dl.Time), dl.MissileName,
+                string.IsNullOrEmpty(dl.Launcher) ? "" : "· " + dl.Launcher);
+            using (SolidBrush fbr = new SolidBrush(fg))
+                e.Graphics.DrawString(head, f1, fbr, line1);
+
+            StringBuilder sub = new StringBuilder();
+            sub.AppendFormat("{0}  ", dl.Side);
+            if (!double.IsNaN(dl.LaunchDist)) sub.AppendFormat("D {0:F1} км  ", dl.LaunchDist / 1000.0);
+            sub.AppendFormat("T {0:F0} с  ", dl.FlightTime);
+            sub.AppendFormat("Цель: {0}  ", string.IsNullOrEmpty(dl.TargetName) ? "—" : dl.TargetName);
+            sub.Append(dl.Result);
+            using (SolidBrush fbr = new SolidBrush(Color.FromArgb(150, 170, 162)))
+                e.Graphics.DrawString(sub.ToString(), f2, fbr, line2);
+        }
+    }
+
+    private void LstLaunches_SelectedIndexChanged(object sender, EventArgs e)
+    {
+        DebriefLaunch dl = lstLaunches.SelectedItem as DebriefLaunch;
+        if (dl == null || session == null) return;
+
+        currentTime = dl.Time;
+        foreach (DebriefEntity ent in session.Entities)
+        {
+            if (ent.Id != dl.MissileId || ent.Track.Count == 0) continue;
+            camCenterX = ent.Track[0].X;
+            camCenterY = ent.Track[0].Y;
+            break;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine(string.Format("[{0}]  ПУСК · {1}", FormatSec(dl.Time), dl.Side));
+        sb.AppendLine(string.Format("Ракета: {0}", dl.MissileName));
+        sb.AppendLine(string.Format("Носитель: {0}", string.IsNullOrEmpty(dl.Launcher) ? "—" : dl.Launcher));
+        sb.AppendLine(string.Format("Цель: {0}", string.IsNullOrEmpty(dl.TargetName) ? "по треку не определена" : dl.TargetName));
+        sb.AppendLine(string.Format("Дистанция пуска: {0}", double.IsNaN(dl.LaunchDist) ? "—" : string.Format("{0:F1} км", dl.LaunchDist / 1000.0)));
+        sb.AppendLine(string.Format("Время полёта: {0:F0} с", dl.FlightTime));
+        sb.AppendLine(string.Format("Результат: {0}", dl.Result));
+        txtCoachAdvice.Text = sb.ToString();
+        UpdateFrame();
+    }
+
     private void FitCameraToBattle()
     {
         if (session == null) return;
@@ -474,6 +769,57 @@ public class DebriefRadarForm : Form
         currentTime = ratio * session.Duration;
         UpdateFrame();
     }
+    private Button MakeFilterButton(string text, int index, bool active)
+    {
+        Button b = new Button()
+        {
+            Text = text,
+            Left = 2 + index * 90,
+            Top = 1,
+            Width = 86,
+            Height = 22,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = active ? Color.FromArgb(0, 110, 80) : Color.FromArgb(32, 40, 36),
+            ForeColor = active ? Color.White : Color.FromArgb(170, 190, 180),
+            Font = new Font("Consolas", 8f, FontStyle.Bold),
+            Tag = text
+        };
+        b.FlatAppearance.BorderSize = 1;
+        b.FlatAppearance.BorderColor = Color.FromArgb(55, 70, 62);
+        b.Click += (s, e) => SetEventFilter(text);
+        return b;
+    }
+
+    private void SetEventFilter(string filter)
+    {
+        eventFilter = filter;
+        Button[] btns = new Button[] { btnFilterAll, btnFilterThreats, btnFilterMistakes, btnFilterSuccess };
+        foreach (Button b in btns)
+        {
+            if (b == null) continue;
+            bool active = (string)b.Tag == filter;
+            b.BackColor = active ? Color.FromArgb(0, 110, 80) : Color.FromArgb(32, 40, 36);
+            b.ForeColor = active ? Color.White : Color.FromArgb(170, 190, 180);
+        }
+        ApplyEventFilter();
+    }
+
+    private void ApplyEventFilter()
+    {
+        if (lstMistakes == null) return;
+        lstMistakes.BeginUpdate();
+        lstMistakes.Items.Clear();
+        foreach (TacticalEvent ev in currentEvents)
+        {
+            if (eventFilter == "ALL") { }
+            else if (eventFilter == "УГРОЗЫ" && ev.Category != "THREAT") continue;
+            else if (eventFilter == "ОШИБКИ" && ev.Category != "MISTAKE") continue;
+            else if (eventFilter == "УСПЕХИ" && ev.Category != "SUCCESS") continue;
+            lstMistakes.Items.Add(ev);
+        }
+        lstMistakes.EndUpdate();
+    }
+
     private void RefreshReplayList()
     {
         cmbReplays.Items.Clear();
@@ -507,32 +853,6 @@ public class DebriefRadarForm : Form
         }
     }
 
-    private void BtnImportLog_Click(object sender, EventArgs e)
-    {
-        try
-        {
-            string logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "Low", @"Boundless Dynamics, LLC\VTOLVR\Player.log");
-            if (!File.Exists(logPath))
-            {
-                using (OpenFileDialog ofd = new OpenFileDialog() { Title = "Укажите файл Player.log", Filter = "Player.log (*.log;*.txt)|*.log;*.txt|Все файлы (*.*)|*.*" })
-                {
-                    if (ofd.ShowDialog(this) != DialogResult.OK) return;
-                    logPath = ofd.FileName;
-                }
-            }
-            string myNick = SettingsManager.Get("LastPilotNick", "");
-            string importedRep = DebriefEngine.ImportFromPlayerLog(logPath, myNick);
-            RefreshReplayList();
-            int idx = replayFiles.IndexOf(importedRep);
-            if (idx >= 0) cmbReplays.SelectedIndex = idx;
-            MessageBox.Show(this, "Вылет успешно восстановлен из Player.log!\nФайл: " + Path.GetFileName(importedRep), "Импорт завершён", MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, "Ошибка импорта лога: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-    }
-
     private void LoadSelectedReplay()
     {
         int idx = cmbReplays.SelectedIndex;
@@ -551,6 +871,9 @@ public class DebriefRadarForm : Form
             currentTime = 0;
             smoothBadgeOffsets.Clear();
             triggeredJamEvents.Clear();
+            launchList = new List<DebriefLaunch>(session.Launches ?? new List<DebriefLaunch>());
+            rulerHasA = false;
+            rulerHasB = false;
             lastJamSurgeTime = -99.0;
             lastJamBannerActor = "";
             followEntityId = "";
@@ -568,17 +891,14 @@ public class DebriefRadarForm : Form
             }
             cmbFollowTarget.SelectedIndex = 0;
             FitCameraToBattle();
-            lstMistakes.Items.Clear();
-            foreach (TacticalEvent ev in session.Events)
-                lstMistakes.Items.Add(ev);
-            if (session.Mistakes.Count > 0)
-            {
-                txtCoachAdvice.Text = string.Format("Обнаружено тактических ошибок и угроз: {0}.\r\nВыберите любую запись в списке выше, чтобы перейти к моменту боя на карте.", session.Mistakes.Count);
-            }
-            else
-            {
-                txtCoachAdvice.Text = "Грубых тактических ошибок за этот вылет не зафиксировано! Отличная работа.";
-            }
+
+            currentEvents = new List<TacticalEvent>(session.Events);
+            currentEvents.Sort((a, b) => a.Time.CompareTo(b.Time));
+            SetEventFilter(eventFilter);
+            RefreshLaunchList();
+            SetLaunchesMode(false);
+            UpdateSummary();
+            UpdateCoachIntro();
             UpdateFrame();
         }
         catch (Exception ex)
@@ -591,21 +911,97 @@ public class DebriefRadarForm : Form
         if (e.Index < 0 || e.Index >= lstMistakes.Items.Count) return;
         TacticalEvent ev = (TacticalEvent)lstMistakes.Items[e.Index];
         bool sel = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
-        Color bg = sel ? Color.FromArgb(35, 65, 52) : Color.FromArgb(16, 20, 18);
+        Color bg = sel ? Color.FromArgb(30, 62, 50) : (e.Index % 2 == 0 ? Color.FromArgb(16, 20, 18) : Color.FromArgb(19, 24, 21));
         Color fg = Color.LightGray;
+        Color accent = Color.Gray;
         string badge = "•";
-        if (ev.Severity == "CRITICAL") { fg = Color.OrangeRed; badge = "✖ [КРИТ]"; }
-        else if (ev.Kind == "RWR" || ev.Kind == "THREAT") { fg = Color.Orange; badge = "📡 [RWR]"; }
-        else if (ev.Kind == "RADAR") { fg = Color.DeepSkyBlue; badge = "🎯 [БРЛС]"; }
-        else if (ev.Kind == "DAMAGE") { fg = Color.Gold; badge = "💥 [ПОВР]"; }
-        else if (ev.Severity == "WARNING") { fg = Color.Gold; badge = "⚠ [ОШИБКА]"; }
-        else if (ev.Severity == "GOOD") { fg = Color.FromArgb(0, 255, 102); badge = "★ [УСПЕХ]"; }
-        else if (ev.Kind == "LAUNCH") { fg = Color.Cyan; badge = "🚀 [ПУСК]"; }
-        else if (ev.Kind == "JAMMER") { fg = Color.FromArgb(215, 140, 255); badge = "⚡ [РЭБ]"; }
+
+        if (ev.Category == "THREAT") { fg = Color.FromArgb(255, 175, 90); accent = Color.FromArgb(230, 120, 60); }
+        if (ev.Category == "MISTAKE") { fg = Color.FromArgb(255, 120, 110); accent = Color.FromArgb(220, 70, 70); }
+        if (ev.Category == "SUCCESS") { fg = Color.FromArgb(110, 240, 150); accent = Color.FromArgb(0, 200, 110); }
+        if (ev.Category == "INFO") { fg = Color.FromArgb(170, 200, 220); accent = Color.FromArgb(90, 130, 160); }
+
+        if (ev.Kind == "THREAT") badge = "⚠ УГРОЗА";
+        else if (ev.Kind == "RWR") badge = "📡 ОБЛУЧЕНИЕ";
+        else if (ev.Kind == "JAMMER") badge = "⚡ РЭБ";
+        else if (ev.Kind == "LAUNCH" && ev.Severity == "GOOD") badge = "🚀 ПУСК";
+        else if (ev.Kind == "LAUNCH") badge = "🚀 ПУСК СОЮЗНИКА";
+        else if (ev.Kind == "KILL") badge = "★ СБИТ";
+        else if (ev.Kind == "GROUND_KILL") badge = "★ ЦЕЛЬ";
+        else if (ev.Kind == "KIA" && ev.Severity == "WARNING") badge = "✚ ПОТЕРЯ";
+        else if (ev.Kind == "KIA") badge = "✖ ПОТЕРЯ БОРТА";
+        else if (ev.Kind == "CFIT") badge = "✖ CFIT";
+        else if (ev.Kind == "DAMAGE") badge = "💥 ПОВРЕЖДЕНИЕ";
+        else if (ev.Kind == "MISTAKE") badge = "⚠ ОШИБКА";
+        else if (ev.Kind == "EJECT") badge = "🪂 КАТАПУЛЬТ";
+
         using (SolidBrush br = new SolidBrush(bg)) e.Graphics.FillRectangle(br, e.Bounds);
-        string line = string.Format("[{0}] {1} {2}", FormatSec(ev.Time), badge, ev.Title);
-        using (SolidBrush fbr = new SolidBrush(fg))
-            e.Graphics.DrawString(line, lstMistakes.Font, fbr, e.Bounds.Left + 4, e.Bounds.Top + 2);
+        using (SolidBrush accentBr = new SolidBrush(accent))
+            e.Graphics.FillRectangle(accentBr, e.Bounds.Left, e.Bounds.Top, 3, e.Bounds.Height);
+
+        Rectangle line1 = new Rectangle(e.Bounds.Left + 8, e.Bounds.Top + 2, e.Bounds.Width - 12, 16);
+        Rectangle line2 = new Rectangle(e.Bounds.Left + 8, e.Bounds.Top + 17, e.Bounds.Width - 12, 15);
+
+        using (Font f1 = new Font("Consolas", 8.5f, FontStyle.Bold))
+        using (Font f2 = new Font("Consolas", 7.5f))
+        {
+            string head = string.Format("{0}  {1}  {2}", FormatSec(ev.Time), badge, ev.Title);
+            using (SolidBrush fbr = new SolidBrush(fg))
+                e.Graphics.DrawString(head, f1, fbr, line1);
+
+            StringBuilder sub = new StringBuilder();
+            if (!double.IsNaN(ev.Altitude)) sub.AppendFormat("H {0:F0} м  ", ev.Altitude);
+            if (!double.IsNaN(ev.SpeedKmh)) sub.AppendFormat("V {0:F0} км/ч  ", ev.SpeedKmh);
+            if (!string.IsNullOrEmpty(ev.Description))
+            {
+                string d = ev.Description.Replace("\r", " ").Replace("\n", " ");
+                if (d.Length > 78) d = d.Substring(0, 75) + "...";
+                sub.Append(d);
+            }
+            using (SolidBrush fbr = new SolidBrush(Color.FromArgb(150, 170, 162)))
+                e.Graphics.DrawString(sub.ToString(), f2, fbr, line2);
+        }
+    }
+
+    private void UpdateSummary()
+    {
+        if (lblSummary == null) return;
+        if (session == null)
+        {
+            lblSummary.Text = "Сводка появится после загрузки повтора.";
+            return;
+        }
+        int threats = 0, mistakes = 0, kills = 0;
+        foreach (TacticalEvent ev in session.Events)
+        {
+            if (ev.Category == "THREAT") threats++;
+            else if (ev.Category == "MISTAKE") mistakes++;
+            else if (ev.Kind == "KILL" || ev.Kind == "GROUND_KILL") kills++;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.AppendFormat("Сбито: {0}   Целей: {1}   Пусков: {2}\r\n", session.PlayerKills, session.AlliedKills, session.PlayerLaunches);
+        sb.AppendFormat("Угроз: {0}   Ошибок: {1}   RWR: {2}\r\n", threats, mistakes, session.RwrSpikesCount);
+        if (session.PlayerMaxG > 0.5)
+            sb.AppendFormat("Макс. G: {0:F1}   Макс. V: {1:F0} км/ч   Взрывов: {2}", session.PlayerMaxG, session.PlayerMaxSpeed * 3.6,
+                session.Explosions != null ? session.Explosions.Count : 0);
+        else
+            sb.AppendFormat("Длительность: {0}   Взрывов: {1}", FormatSec(session.Duration),
+                session.Explosions != null ? session.Explosions.Count : 0);
+        lblSummary.Text = sb.ToString();
+    }
+
+    private void UpdateCoachIntro()
+    {
+        if (txtCoachAdvice == null) return;
+        if (session == null) return;
+        int mistakes = 0;
+        foreach (TacticalEvent ev in session.Events)
+            if (ev.Category == "MISTAKE") mistakes++;
+
+        if (mistakes == 0)
+            txtCoachAdvice.Text = "Грубых ошибок пилота не зафиксировано.\r\nВыберите любое событие в хронологии, чтобы перейти к нему на карте.";
+        else
+            txtCoachAdvice.Text = string.Format("Зафиксировано ошибок пилота: {0}.\r\nВыберите запись с меткой «ОШИБКА» или «CFIT», чтобы перейти к моменту и увидеть разбор.", mistakes);
     }
     private void LstMistakes_SelectedIndexChanged(object sender, EventArgs e)
     {
@@ -618,13 +1014,25 @@ public class DebriefRadarForm : Form
             camCenterY = ev.WorldY;
         }
         StringBuilder sb = new StringBuilder();
-        sb.AppendLine(string.Format("Таймкод: {0} — {1}", FormatSec(ev.Time), ev.Title));
+        string catLabel = ev.Category == "THREAT" ? "УГРОЗА"
+                        : ev.Category == "MISTAKE" ? "ОШИБКА ПИЛОТА"
+                        : ev.Category == "SUCCESS" ? "РЕЗУЛЬТАТ"
+                        : "ИНФОРМАЦИЯ";
+        sb.AppendLine(string.Format("[{0}]  {1}   ·   {2}", FormatSec(ev.Time), catLabel, ev.Title));
+        if (!double.IsNaN(ev.Altitude) || !double.IsNaN(ev.SpeedKmh))
+        {
+            sb.Append("Параметры в этот момент: ");
+            if (!double.IsNaN(ev.Altitude)) sb.AppendFormat("высота {0:F0} м; ", ev.Altitude);
+            if (!double.IsNaN(ev.SpeedKmh)) sb.AppendFormat("скорость {0:F0} км/ч; ", ev.SpeedKmh);
+            sb.Length -= 2;
+            sb.AppendLine();
+        }
         sb.AppendLine();
         sb.AppendLine(ev.Description);
         if (!string.IsNullOrEmpty(ev.Advice))
         {
             sb.AppendLine();
-            sb.AppendLine("💡 ТАКТИЧЕСКИЙ РАЗБОР:");
+            sb.AppendLine("РЕКОМЕНДАЦИЯ:");
             sb.AppendLine(ev.Advice);
         }
         txtCoachAdvice.Text = sb.ToString();
@@ -664,10 +1072,12 @@ public class DebriefRadarForm : Form
                 }
                 string modeTag = session.HasExactTelemetry ? "[3D-ТРЕК]" : "[ЛОГ+КАРТА]";
                 lblTelemetryHud.Text = string.Format(
-                "Борт: {0} {1}\nALT: {2:F0} м | SPD: {3:F0} км/ч | HDG: {4:F0}°\nФраги: {5} (союзн: {6}) | Пусков: {7} | RWR: {8}",
-                trackedEnt.Name, modeTag,
-                st.Alt, st.Speed * 3.6, st.Heading,
-                session.PlayerKills, session.AlliedKills, session.PlayerLaunches, session.RwrSpikesCount);
+                    "{0} {1}\r\n" +
+                    "H {2:F0} м   V {3:F0} км/ч\r\n" +
+                    "HDG {4:F0}°   PITCH {5:+0;-0;0}°   BANK {6:+0;-0;0}°",
+                    trackedEnt.Name, modeTag,
+                    st.Alt, st.Speed * 3.6,
+                    st.Heading, st.Pitch, st.Roll);
             }
         }
 
@@ -1044,9 +1454,90 @@ public class DebriefRadarForm : Form
             }
         }
 
+        // 1.75 Реальные взрывы из eventTrack реплея: короткая вспышка в момент t,
+        // затем затухающий маркер, чтобы было видно, где именно сработало.
+        if (session != null && session.Explosions != null && session.Explosions.Count > 0)
+        {
+            using (Font exFont = new Font("Consolas", 6.4f, FontStyle.Bold))
+            {
+                foreach (DebriefExplosion ex in session.Explosions)
+                {
+                    double age = currentTime - ex.Time;
+                    if (age < 0.0 || age > 2.5) continue;
+
+                    PointF ep = WorldToScreen3D(ex.X, ex.Y, ex.Alt, w, h);
+                    if (ep.X < -40 || ep.X > w + 40 || ep.Y < -40 || ep.Y > h + 40) continue;
+
+                    double fade = Math.Max(0.0, 1.0 - age / 2.5);
+                    int a = (int)(235 * fade);
+                    if (a <= 4) continue;
+
+                    float flashR = age <= 0.35
+                        ? (float)(4.0 + age * 60.0)
+                        : (float)(6.0 + Math.Min(4.0, age));
+
+                    if (age <= 0.35)
+                    {
+                        using (SolidBrush core = new SolidBrush(Color.FromArgb(Math.Min(255, a + 20), 255, 240, 180)))
+                            g.FillEllipse(core, ep.X - flashR * 0.45f, ep.Y - flashR * 0.45f, flashR * 0.9f, flashR * 0.9f);
+                    }
+                    using (Pen ring = new Pen(Color.FromArgb(a, 255, 165, 40), age <= 0.35 ? 2.0f : 1.2f))
+                        g.DrawEllipse(ring, ep.X - flashR, ep.Y - flashR, flashR * 2f, flashR * 2f);
+                    using (Pen cross = new Pen(Color.FromArgb(a, 255, 120, 30), 1.0f))
+                    {
+                        g.DrawLine(cross, ep.X - flashR * 0.55f, ep.Y, ep.X + flashR * 0.55f, ep.Y);
+                        g.DrawLine(cross, ep.X, ep.Y - flashR * 0.55f, ep.X, ep.Y + flashR * 0.55f);
+                    }
+
+                    if (age <= 0.8 && pixelsPerMeter > 0.008)
+                    {
+                        string lbl = "ВЗРЫВ " + ex.Time.ToString("F0") + "с";
+                        SizeF ls = g.MeasureString(lbl, exFont);
+                        using (SolidBrush lbg = new SolidBrush(Color.FromArgb((int)(170 * fade), 30, 18, 6)))
+                            g.FillRectangle(lbg, ep.X + flashR + 2f, ep.Y - ls.Height * 0.5f, ls.Width + 4f, ls.Height);
+                        using (SolidBrush lfg = new SolidBrush(Color.FromArgb(a, 255, 205, 130)))
+                            g.DrawString(lbl, exFont, lfg, ep.X + flashR + 4f, ep.Y - ls.Height * 0.5f);
+                    }
+                }
+            }
+        }
+
+        // 1.76 Отстрел ЛТЦ/ДО из eventTrack (eventType 2 = Flare, 3 = Chaff).
+        // В текущих реплеях VTOL VR таких кадров нет — блок молча ничего не рисует,
+        // но готов, если игра начнёт писать их в файл.
+        if (session != null && session.Flares != null && session.Flares.Count > 0)
+        {
+            using (Font flFont = new Font("Consolas", 6.0f, FontStyle.Bold))
+            {
+                foreach (DebriefFlare fl in session.Flares)
+                {
+                    double age = currentTime - fl.Time;
+                    if (age < 0.0 || age > 4.0) continue;
+
+                    PointF fp = WorldToScreen3D(fl.X, fl.Y, fl.Alt, w, h);
+                    if (fp.X < -30 || fp.X > w + 30 || fp.Y < -30 || fp.Y > h + 30) continue;
+
+                    double fade = Math.Max(0.0, 1.0 - age / 4.0);
+                    int a = (int)(220 * fade);
+                    if (a <= 4) continue;
+
+                    float r = 3.5f + (float)(age * 2.5);
+                    Color c = fl.IsChaff ? Color.FromArgb(a, 200, 210, 225) : Color.FromArgb(a, 255, 120, 60);
+                    using (Pen p = new Pen(c, 1.3f))
+                        g.DrawEllipse(p, fp.X - r, fp.Y - r, r * 2f, r * 2f);
+                    if (age <= 1.5)
+                    {
+                        string lbl = fl.IsChaff ? "ДО" : "ЛТЦ";
+                        using (SolidBrush fg = new SolidBrush(c))
+                            g.DrawString(lbl, flFont, fg, fp.X + r + 2f, fp.Y - 6f);
+                    }
+                }
+            }
+        }
+
         // 1.8 Анимированные лучи радаров, захватов АРЛ-ракет с индикатором дистанции (km) и подлётного времени (TTI)
         float pulse01 = (float)(0.5 + 0.5 * Math.Sin(currentTime * 6.5));
-            Dictionary<string, string> jammedTargets = new Dictionary<string, string>(); // EntityId -> Режим (DRFM / SAS)
+            Dictionary<string, string> jammedTargets = new Dictionary<string, string>(); // EntityId -> уровень помех
             if (showBeams)
             {
                 using (Font beamTagFont = new Font("Consolas", 6.6f, FontStyle.Bold))
@@ -1110,39 +1601,42 @@ public class DebriefRadarForm : Form
                                 }
                             }
 
-                            string jMode = bm.ToName ?? "";
-                            bool clipOnTarget = jMode.IndexOf("DRFM", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                jMode.IndexOf("SAS", StringComparison.OrdinalIgnoreCase) >= 0;
+                            string jamModeName = bm.JamMode ?? "";
+                            if (jamModeName.Length == 0) jamModeName = bm.ToName ?? "";
+                            bool isDirMode = jamModeName.IndexOf("DRFM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                             jamModeName.IndexOf("SAS", StringComparison.OrdinalIgnoreCase) >= 0;
 
                             string srcCoalition = "Allies";
                             foreach (DebriefEntity se in session.Entities)
                                 if (se.Id == bm.FromId) { srcCoalition = se.Coalition; break; }
 
-                            Func<DebriefEntity, bool> hasRadarSystem = (ent) =>
+                            // Логика 0.7.0: DRFM/SAS работают по конкретной цели, поэтому луч обрезаем
+                            // на первом радиолокационном юните в коридоре вдоль оси, а бейдж ставим только ему.
+                            // NOISE — зона подавления: бейджи на юнитах не ставим (по решению пользователя).
+                            if (isDirMode)
                             {
-                                if (ent.Type == "Air") return true;
-                                if (ent.Type != "Ground") return false;
-                                string nm = ent.Name ?? "";
-                                if (nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("Infantry", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0)
-                                    return false;
-                                return ent.RoleTag == "SAM" ||
-                                       nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0;
-                            };
+                                Func<DebriefEntity, bool> hasRadarSystem = (ent) =>
+                                {
+                                    if (ent.Class == "Air" || ent.Class == "Chopper") return true;
+                                    if (ent.Class != "Ground") return false;
+                                    string nm = ent.Name ?? "";
+                                    if (nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        nm.IndexOf("Infantry", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        nm.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        nm.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        nm.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0)
+                                        return false;
+                                    return ent.RoleTag == "SAM" ||
+                                           nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                           nm.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                           nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                           nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                           nm.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                           nm.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                           nm.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0;
+                                };
 
-                            double hitTargetAlt = double.NaN;
-                            if (clipOnTarget)
-                            {
                                 string hitEntityId = "";
                                 foreach (DebriefEntity cand in session.Entities)
                                 {
@@ -1161,31 +1655,12 @@ public class DebriefRadarForm : Form
                                     {
                                         maxRay = proj;
                                         hitEntityId = cand.Id;
-                                        hitTargetAlt = cs.Alt;
                                     }
                                 }
                                 if (!string.IsNullOrEmpty(hitEntityId))
-                                    jammedTargets[hitEntityId] = jMode.ToUpperInvariant();
-                            }
-                            else
-                            {
-                                double tanHalfSector = Math.Tan(5.0 * Math.PI / 180.0);
-                                foreach (DebriefEntity cand in session.Entities)
-                                {
-                                    if (cand.Id == bm.FromId || cand.Coalition == srcCoalition || !hasRadarSystem(cand)) continue;
-                                    DebriefSample cs;
-                                    if (!liveById.TryGetValue(cand.Id, out cs)) continue;
-
-                                    double dx = cs.X - fx;
-                                    double dy = cs.Y - fy;
-                                    double proj = dx * ux2d + dy * uy2d;
-                                    if (proj <= 500.0 || proj >= maxRay) continue;
-
-                                    double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
-                                    double sectorHalfW = Math.Max(1800.0, proj * tanHalfSector);
-                                    if (perp <= sectorHalfW && !jammedTargets.ContainsKey(cand.Id))
-                                        jammedTargets[cand.Id] = jMode.ToUpperInvariant();
-                                }
+                                    jammedTargets[hitEntityId] = jamModeName.ToUpperInvariant();
+                                else
+                                    continue;   // цель не найдена — луч DRFM/SAS «в никуда» не рисуем
                             }
 
                             tx = fx + ux2d * maxRay;
@@ -1249,7 +1724,8 @@ public class DebriefRadarForm : Form
                                 float px = -uy;
                                 float py = ux;
 
-                                string jamModeName = bm.ToName ?? "";
+                                string jamModeName = bm.JamMode ?? "";
+                                if (jamModeName.Length == 0) jamModeName = bm.ToName ?? "";
                                 bool isDrfm = jamModeName.IndexOf("DRFM", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                               jamModeName.IndexOf("SAS", StringComparison.OrdinalIgnoreCase) >= 0;
 
@@ -1262,30 +1738,45 @@ public class DebriefRadarForm : Form
                                 }
                                 else
                                 {
-                                    float halfAngleRad = 5.0f * (float)Math.PI / 180f;
-                                    float tanHalf = (float)Math.Tan(halfAngleRad);
-                                    float endHalfW = screenLen * tanHalf;
+                                    // Лепесток NOISE по реальной формуле: pow(cos, directionalPower).
+                                    // Границы 10% и 50% от осевого сигнала (углы считаются из directionalPower=8).
+                                    float halfAngle10 = (float)(JammerModel.AngleForLevel(0.10) * Math.PI / 180.0);
+                                    float halfAngle50 = (float)(JammerModel.AngleForLevel(0.50) * Math.PI / 180.0);
+                                    float tan10 = (float)Math.Tan(halfAngle10);
+                                    float tan50 = (float)Math.Tan(halfAngle50);
+                                    float endHalfW10 = screenLen * tan10;
+                                    float endHalfW50 = screenLen * tan50;
 
-                                    using (Pen edgePen = new Pen(Color.FromArgb(75, 200, 110, 255), 1.0f))
+                                    // Приглушённая, медленная пульсация конуса NOISE (1.6 Гц)
+                                    float jamPulse = (float)(0.5 + 0.5 * Math.Sin(currentTime * 1.6));
+                                    int edgeAlpha = (int)(22 + 16 * jamPulse);
+                                    int coreAlpha = (int)(40 + 26 * jamPulse);
+
+                                    using (Pen edgePen = new Pen(Color.FromArgb(edgeAlpha, 200, 110, 255), 1.0f))
                                     {
-                                        g.DrawLine(edgePen, p1.X, p1.Y, p2.X + px * endHalfW, p2.Y + py * endHalfW);
-                                        g.DrawLine(edgePen, p1.X, p1.Y, p2.X - px * endHalfW, p2.Y - py * endHalfW);
+                                        g.DrawLine(edgePen, p1.X, p1.Y, p2.X + px * endHalfW10, p2.Y + py * endHalfW10);
+                                        g.DrawLine(edgePen, p1.X, p1.Y, p2.X - px * endHalfW10, p2.Y - py * endHalfW10);
+                                    }
+                                    using (Pen coreEdge = new Pen(Color.FromArgb(coreAlpha, 200, 110, 255), 1.1f) { DashStyle = DashStyle.Dot })
+                                    {
+                                        g.DrawLine(coreEdge, p1.X, p1.Y, p2.X + px * endHalfW50, p2.Y + py * endHalfW50);
+                                        g.DrawLine(coreEdge, p1.X, p1.Y, p2.X - px * endHalfW50, p2.Y - py * endHalfW50);
                                     }
 
-                                    // Плавная, не мельтешащая скорость обновления засветков (4.5 Гц)
-                                    int tick = (int)(currentTime * 4.5);
-                                    int barsCount = Math.Min(36, Math.Max(10, (int)(screenLen / 22f)));
+                                    // Медленное обновление засветков (2 Гц) и сниженная яркость, чтобы не рябило
+                                    int tick = (int)(currentTime * 2.0);
+                                    int barsCount = Math.Min(28, Math.Max(8, (int)(screenLen / 26f)));
                                     for (int i = 0; i < barsCount; i++)
                                     {
                                         int hash = ((i * 73856093) ^ (tick * 19349663)) & 0x7FFFFFFF;
                                         float dist = 20f + ((hash % 1000) / 1000.0f) * (screenLen - 24f);
                                         float latNorm = (((hash / 1000) % 200) - 100) / 100.0f;
-                                        float latOffset = latNorm * (dist * tanHalf * 0.85f);
+                                        float latOffset = latNorm * (dist * tan50 * 0.85f);
 
                                         float bx = p1.X + ux * dist + px * latOffset;
                                         float by = p1.Y + uy * dist + py * latOffset;
-                                        int alpha = 90 + ((hash / 200000) % 130);
-                                        float barHalfW = Math.Max(3.0f, Math.Min(8.0f, dist * tanHalf * 0.35f));
+                                        int alpha = 38 + ((hash / 200000) % 46);
+                                        float barHalfW = Math.Max(1.2f, Math.Min(3.0f, dist * tan50 * 0.12f));
 
                                         PointF[] bar = new PointF[]
                                         {
@@ -1354,7 +1845,7 @@ public class DebriefRadarForm : Form
                     using (Pen ringPen = new Pen(Color.FromArgb(alpha, 210, 110, 255), 1.3f) { DashStyle = DashStyle.Dot })
                         g.DrawEllipse(ringPen, pt.X - ringR, pt.Y - ringR, ringR * 2f, ringR * 2f);
 
-                    string txt = "⚡ JAMMED (" + mode + ")";
+                    string txt = "⚡ ПОДАВЛЕНИЕ · " + mode;
                     SizeF sz = g.MeasureString(txt, jamTagFont);
                     float bx = pt.X - sz.Width * 0.5f;
                     float by = pt.Y - 26f;
@@ -1722,7 +2213,7 @@ new PointF(pos.X - rSize, pos.Y)
                 using (SolidBrush b2 = new SolidBrush(Color.FromArgb(170, 235, 195)))
                     g.DrawString(line2, hudBodyFont, b2, hx + 10f, curY + 17f);
                 using (SolidBrush b3 = new SolidBrush(Color.FromArgb(120, 180, 150)))
-                    g.DrawString("Клик по борту — выбрать | Пробел — пауза", hudBodyFont, b3, hx + 10f, curY + 35f);
+                    g.DrawString("Пробел — пауза | Ctrl+ЛКМ — линейка", hudBodyFont, b3, hx + 10f, curY + 35f);
             }
             else
             {
@@ -1848,6 +2339,45 @@ new PointF(pos.X - rSize, pos.Y)
                     }
                 }
             }
+            // Линейка: измерение расстояния и азимута по карте (рисуется поверх всех слоёв)
+            if (rulerHasA)
+            {
+                PointF pa = rulerA;
+                PointF pb = rulerHasB ? rulerB : pa;
+                if (rulerHasB)
+                {
+                    using (Pen rp = new Pen(Color.FromArgb(230, 255, 215, 90), 1.8f))
+                    {
+                        rp.DashStyle = DashStyle.Dash;
+                        g.DrawLine(rp, pa, pb);
+                    }
+                }
+                using (SolidBrush dotBr = new SolidBrush(Color.FromArgb(255, 255, 215, 90)))
+                {
+                    g.FillEllipse(dotBr, pa.X - 4, pa.Y - 4, 8, 8);
+                    if (rulerHasB) g.FillEllipse(dotBr, pb.X - 4, pb.Y - 4, 8, 8);
+                }
+                if (rulerHasB && pixelsPerMeter > 0)
+                {
+                    double mdx = (pb.X - pa.X) / pixelsPerMeter;
+                    double mdy = -(pb.Y - pa.Y) / pixelsPerMeter;
+                    double distM = Math.Sqrt(mdx * mdx + mdy * mdy);
+                    double az = (Math.Atan2(mdx, mdy) * 180.0 / Math.PI + 360.0) % 360.0;
+                    string label = distM >= 1000.0
+                        ? string.Format("{0:F1} км · {1:000}°", distM / 1000.0, az)
+                        : string.Format("{0:F0} м · {1:000}°", distM, az);
+                    using (Font rf = new Font("Consolas", 8.5f, FontStyle.Bold))
+                    {
+                        SizeF sz = g.MeasureString(label, rf);
+                        float lx = (pa.X + pb.X) * 0.5f - sz.Width * 0.5f;
+                        float ly = (pa.Y + pb.Y) * 0.5f - sz.Height - 4f;
+                        using (SolidBrush bgB = new SolidBrush(Color.FromArgb(210, 18, 22, 18)))
+                            g.FillRectangle(bgB, lx - 4f, ly - 2f, sz.Width + 8f, sz.Height + 4f);
+                        using (SolidBrush txB = new SolidBrush(Color.FromArgb(255, 255, 230, 130)))
+                            g.DrawString(label, rf, txB, lx, ly);
+                    }
+                }
+            }
         }
         catch { /* Защита от редких OverflowException GDI+ при экстремальном зуме */ }
     }
@@ -1917,6 +2447,23 @@ new PointF(pos.X - rSize, pos.Y)
                     ent.Name, ent.Pilot ?? "-", ent.Type, ent.RoleTag ?? "-", ent.Coalition,
                     FormatSec(ent.FirstTime), FormatSec(ent.LastTime),
                     st.X, st.Y, st.Alt, st.Speed * 3.6, st.Heading, ent.Track.Count);
+
+                // Дистанция и азимут до борта игрока — только по координатам из трека
+                DebriefEntity playerEnt = null;
+                foreach (DebriefEntity pe in session.Entities)
+                    if (pe.IsPlayer) { playerEnt = pe; break; }
+                if (playerEnt != null && playerEnt != ent)
+                {
+                    DebriefSample ps = playerEnt.GetStateAt(currentTime);
+                    if (ps != null)
+                    {
+                        double ddx = st.X - ps.X;
+                        double ddy = st.Y - ps.Y;
+                        double distM = Math.Sqrt(ddx * ddx + ddy * ddy);
+                        double az = (Math.Atan2(ddx, ddy) * 180.0 / Math.PI + 360.0) % 360.0;
+                        report += string.Format("\r\nДо вас: {0:F1} км · азимут {1:000}°", distM / 1000.0, az);
+                    }
+                }
             }
         }
 
@@ -1944,6 +2491,8 @@ new PointF(pos.X - rSize, pos.Y)
 
         if (!string.IsNullOrEmpty(report))
             txtCoachAdvice.Text = report;
+        else
+            UpdateCoachIntro();
         return hitAir;
     }
 

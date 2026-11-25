@@ -406,62 +406,102 @@ public class OpenGLRadarControl : Control
                         double ux2d = horizLen > 1e-4 ? (bm.DirX / horizLen) : 0.0;
                         double uy2d = horizLen > 1e-4 ? (bm.DirY / horizLen) : 0.0;
                         double maxRay = 95000.0;
-                        string jMode = bm.ToName ?? "";
-                        bool isDirMode = jMode.IndexOf("DRFM", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        jMode.IndexOf("SAS", StringComparison.OrdinalIgnoreCase) >= 0;
+                        string jamModeName = bm.JamMode ?? "";
+                        if (jamModeName.Length == 0) jamModeName = bm.ToName ?? "";
+                        bool isDirMode = jamModeName.IndexOf("DRFM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                         jamModeName.IndexOf("SAS", StringComparison.OrdinalIgnoreCase) >= 0;
                         string srcCoal = "Allies";
                         foreach (DebriefEntity se in s.Entities)
                             if (se.Id == bm.FromId) { srcCoal = se.Coalition; break; }
+
+                        // DRFM/SAS работают по конкретной цели: обрезаем луч на первом радиолокационном
+                        // юните в коридоре вдоль оси и ставим бейдж только ему (логика 0.7.0).
+                        // NOISE — зона подавления, бейджи на юнитах не ставим.
                         if (isDirMode)
                         {
+                            Func<DebriefEntity, bool> hasRadarSystem = (ent) =>
+                            {
+                                if (ent.Class == "Air" || ent.Class == "Chopper") return true;
+                                if (ent.Class != "Ground") return false;
+                                string nm = ent.Name ?? "";
+                                if (nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("Infantry", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    return false;
+                                return ent.RoleTag == "SAM" ||
+                                       nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0;
+                            };
+
                             string hitId = "";
                             foreach (DebriefEntity cand in s.Entities)
                             {
-                                if (cand.Id == bm.FromId || cand.Type == "Missile" || cand.Coalition == srcCoal) continue;
+                                if (cand.Id == bm.FromId || cand.Coalition == srcCoal || !hasRadarSystem(cand)) continue;
                                 DebriefSample cs;
                                 if (!liveById.TryGetValue(cand.Id, out cs)) continue;
-                                double dx = cs.X - fx, dy = cs.Y - fy;
+                                double dx = cs.X - fx;
+                                double dy = cs.Y - fy;
                                 double proj = dx * ux2d + dy * uy2d;
                                 if (proj <= 500.0 || proj >= maxRay) continue;
                                 double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
-                                if (perp <= Math.Max(1800.0, proj * 0.06))
-                                { maxRay = proj; tz = cs.Alt; hitId = cand.Id; }
+                                double hitRadius = Math.Max(1800.0, proj * 0.06);
+                                if (perp <= hitRadius)
+                                {
+                                    maxRay = proj;
+                                    hitId = cand.Id;
+                                }
                             }
-                            if (!string.IsNullOrEmpty(hitId)) jammedTargets[hitId] = jMode.ToUpperInvariant();
+                            if (!string.IsNullOrEmpty(hitId))
+                                jammedTargets[hitId] = jamModeName.ToUpperInvariant();
+                            else
+                                continue;   // цель не найдена — луч DRFM/SAS «в никуда» не рисуем
                         }
+
                         tx = fx + ux2d * maxRay;
                         ty = fy + uy2d * maxRay;
+                        double ray3d = horizLen > 0.05 ? (maxRay / horizLen) : maxRay;
+                        tz = Math.Max(s.GetGroundAltitudeAt(tx, ty), fz + bm.DirZ * ray3d);
+
                         if (!isDirMode)
                         {
-                            double ray3d = horizLen > 0.05 ? (maxRay / horizLen) : maxRay;
-                            tz = Math.Max(s.GetGroundAltitudeAt(tx, ty), fz + bm.DirZ * ray3d);
-                            double tanHalf = Math.Tan(5.0 * Math.PI / 180.0);
-                            foreach (DebriefEntity cand in s.Entities)
-                            {
-                                if (cand.Id == bm.FromId || cand.Type == "Missile" || cand.Coalition == srcCoal) continue;
-                                DebriefSample cs;
-                                if (!liveById.TryGetValue(cand.Id, out cs)) continue;
-                                double dx = cs.X - fx, dy = cs.Y - fy;
-                                double proj = dx * ux2d + dy * uy2d;
-                                if (proj <= 500.0 || proj >= maxRay) continue;
-                                double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
-                                if (perp <= Math.Max(1800.0, proj * tanHalf) && !jammedTargets.ContainsKey(cand.Id))
-                                    jammedTargets[cand.Id] = jMode.ToUpperInvariant();
-                            }
-                            // Для NOISE: конус строба с бегущими 3D-засветками как в 2D-режиме
+                            // Приглушённая медленная пульсация конуса NOISE (1.6 Гц)
+                            double jamPulse = 0.5 + 0.5 * Math.Sin(curT * 1.6);
+                            byte edgeAlpha = (byte)(22 + 16 * jamPulse);
+                            byte coreAlpha = (byte)(40 + 26 * jamPulse);
+
+                            // Границы лепестка 10% и 50% от осевого сигнала (углы из directionalPower=8)
                             double px2d = -uy2d, py2d = ux2d;
-                            double halfW = maxRay * Math.Tan(5.0 * Math.PI / 180.0);
+                            double halfW10 = maxRay * Math.Tan(JammerModel.AngleForLevel(0.10) * Math.PI / 180.0);
+                            double halfW = maxRay * Math.Tan(JammerModel.AngleForLevel(0.50) * Math.PI / 180.0);
                             glLineWidth(1.1f);
-                            glColor4ub(200, 110, 255, 85);
+                            glColor4ub(200, 110, 255, coreAlpha);
                             glBegin(GL_LINES);
                             glVertex3d(fx * 0.001, fz * 0.001, -fy * 0.001);
                             glVertex3d((tx + px2d * halfW) * 0.001, tz * 0.001, -(ty + py2d * halfW) * 0.001);
                             glVertex3d(fx * 0.001, fz * 0.001, -fy * 0.001);
                             glVertex3d((tx - px2d * halfW) * 0.001, tz * 0.001, -(ty - py2d * halfW) * 0.001);
                             glEnd();
-                            int tick = (int)(curT * 4.5);
+                            // Внешняя граница лепестка — уровень 10%
+                            glLineWidth(1.0f);
+                            glColor4ub(200, 110, 255, edgeAlpha);
+                            glBegin(GL_LINES);
+                            glVertex3d(fx * 0.001, fz * 0.001, -fy * 0.001);
+                            glVertex3d((tx + px2d * halfW10) * 0.001, tz * 0.001, -(ty + py2d * halfW10) * 0.001);
+                            glVertex3d(fx * 0.001, fz * 0.001, -fy * 0.001);
+                            glVertex3d((tx - px2d * halfW10) * 0.001, tz * 0.001, -(ty - py2d * halfW10) * 0.001);
+                            glEnd();
+                            // Медленное обновление засветков (2 Гц) и сниженная яркость
+                            int tick = (int)(curT * 2.0);
                             glBegin(GL_QUADS);
-                            for (int i = 0; i < 28; i++)
+                            for (int i = 0; i < 20; i++)
                             {
                                 int hash = ((i * 73856093) ^ (tick * 19349663)) & 0x7FFFFFFF;
                                 double frac = 0.05 + ((hash % 1000) / 1000.0) * 0.90;
@@ -469,8 +509,8 @@ public class OpenGLRadarControl : Control
                                 double bx = fx + ux2d * (maxRay * frac) + px2d * (halfW * frac * lat * 0.85);
                                 double by = fy + uy2d * (maxRay * frac) + py2d * (halfW * frac * lat * 0.85);
                                 double bz = fz + (tz - fz) * frac;
-                                byte al = (byte)(100 + ((hash / 200000) % 130));
-                                double bw = Math.Max(0.25, halfW * frac * 0.35 * 0.001);
+                                byte al = (byte)(38 + ((hash / 200000) % 46));
+                                double bw = Math.Max(0.04, halfW * frac * 0.06 * 0.001);
                                 glColor4ub(210, 115, 255, al);
                                 glVertex3d(bx * 0.001 - px2d * bw, bz * 0.001, -(by * 0.001 - py2d * bw));
                                 glVertex3d(bx * 0.001 + px2d * bw, bz * 0.001, -(by * 0.001 + py2d * bw));
@@ -849,6 +889,60 @@ public class OpenGLRadarControl : Control
                         g.DrawString(text, fnt, fg, rect.X + 4f, rect.Y + 1.5f);
                 }
             };
+            // Взрывы из eventTrack в 3D-проекции: короткая вспышка и затухающее кольцо
+            if (s != null && s.Explosions != null && s.Explosions.Count > 0)
+            {
+                foreach (DebriefExplosion ex in s.Explosions)
+                {
+                    double age = curT - ex.Time;
+                    if (age < 0.0 || age > 2.5) continue;
+                    PointF ep = Project3DToScreen(ex.X, ex.Y, ex.Alt, cx, cy, groundCamAlt, distKm, yaw, pitch, w, h);
+                    if (ep.X < -40 || ep.X > w + 40 || ep.Y < -40 || ep.Y > h + 40) continue;
+
+                    double fade = Math.Max(0.0, 1.0 - age / 2.5);
+                    int a = (int)(235 * fade);
+                    if (a <= 4) continue;
+
+                    float flashR = age <= 0.35
+                        ? (float)(4.0 + age * 60.0)
+                        : (float)(6.0 + Math.Min(4.0, age));
+                    if (age <= 0.35)
+                    {
+                        using (SolidBrush core = new SolidBrush(Color.FromArgb(Math.Min(255, a + 20), 255, 240, 180)))
+                            g.FillEllipse(core, ep.X - flashR * 0.45f, ep.Y - flashR * 0.45f, flashR * 0.9f, flashR * 0.9f);
+                    }
+                    using (Pen ring = new Pen(Color.FromArgb(a, 255, 165, 40), age <= 0.35 ? 2.0f : 1.2f))
+                        g.DrawEllipse(ring, ep.X - flashR, ep.Y - flashR, flashR * 2f, flashR * 2f);
+                }
+            }
+            // ЛТЦ/ДО из eventTrack (в текущих реплеях данных нет — блок молчит)
+            if (s != null && s.Flares != null && s.Flares.Count > 0)
+            {
+                using (Font flFont = new Font("Consolas", 6.0f, FontStyle.Bold))
+                {
+                    foreach (DebriefFlare fl in s.Flares)
+                    {
+                        double age = curT - fl.Time;
+                        if (age < 0.0 || age > 4.0) continue;
+                        PointF fp = Project3DToScreen(fl.X, fl.Y, fl.Alt, cx, cy, groundCamAlt, distKm, yaw, pitch, w, h);
+                        if (fp.X < -30 || fp.X > w + 30 || fp.Y < -30 || fp.Y > h + 30) continue;
+
+                        double fade = Math.Max(0.0, 1.0 - age / 4.0);
+                        int a = (int)(220 * fade);
+                        if (a <= 4) continue;
+                        float r = 3.5f + (float)(age * 2.5);
+                        Color c = fl.IsChaff ? Color.FromArgb(a, 200, 210, 225) : Color.FromArgb(a, 255, 120, 60);
+                        using (Pen p = new Pen(c, 1.3f))
+                            g.DrawEllipse(p, fp.X - r, fp.Y - r, r * 2f, r * 2f);
+                        if (age <= 1.5)
+                        {
+                            string lbl = fl.IsChaff ? "ДО" : "ЛТЦ";
+                            using (SolidBrush fg = new SolidBrush(c))
+                                g.DrawString(lbl, flFont, fg, fp.X + r + 2f, fp.Y - 6f);
+                        }
+                    }
+                }
+            }
             using (Font acFont = new Font("Consolas", 7.8f, FontStyle.Bold))
             using (Font wpnFont = new Font("Consolas", 6.8f, FontStyle.Italic))
             using (Font evFont = new Font("Consolas", 8.0f, FontStyle.Bold))
@@ -864,7 +958,7 @@ public class OpenGLRadarControl : Control
                     using (Pen ringPen = new Pen(Color.FromArgb(alpha, 210, 110, 255), 1.3f) { DashStyle = DashStyle.Dot })
                         g.DrawEllipse(ringPen, pt.X - ringR, pt.Y - ringR, ringR * 2f, ringR * 2f);
 
-                    string txt = "⚡ JAMMED (" + mode + ")";
+                    string txt = "⚡ ПОДАВЛЕНИЕ · " + mode;
                     SizeF sz = g.MeasureString(txt, jamTagFont);
                     float bx = pt.X - sz.Width * 0.5f;
                     float by = pt.Y - 26f;
