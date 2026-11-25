@@ -673,6 +673,9 @@ public static class WorkshopBrowser
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr LoadLibrary(string lpFileName);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FreeLibrary(IntPtr hModule);
+
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
     private static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
 
@@ -695,6 +698,10 @@ public static class WorkshopBrowser
         catch { }
         finally
         {
+            if (hMod != IntPtr.Zero)
+            {
+                try { FreeLibrary(hMod); } catch { }
+            }
             Environment.SetEnvironmentVariable("SteamAppId", null);
             Environment.SetEnvironmentVariable("SteamGameId", null);
         }
@@ -775,6 +782,8 @@ public static class WorkshopBrowser
 
         if (Process.GetProcessesByName("steam").Length == 0)
             throw new Exception("Клиент Steam не запущен. Запустите Steam для скачивания ливреи.");
+        if (Process.GetProcessesByName("VTOLVR").Length > 0)
+            throw new Exception("Закройте VTOL VR перед скачиванием ливреи из Steam Workshop, чтобы не блокировать загрузку в игре.");
 
         string steamLibRoot = Path.GetFullPath(Path.Combine(gameRoot, @"..\..\.."));
         string gameWorkshopContent = Path.Combine(steamLibRoot, @"steamapps\workshop\content\667970");
@@ -871,25 +880,19 @@ public static class WorkshopBrowser
 
     private static void WriteWorkshopMetadata(string targetFolder, WorkshopCatalogItem item)
     {
-        string xmlPath = Path.Combine(targetFolder, "WorkshopItemInfo.xml");
-        if (!File.Exists(xmlPath))
-        {
-            StringBuilder sb = new StringBuilder();
-            sb.AppendLine("<WorkshopItemInfo>");
-            sb.AppendLine("  <Title>" + System.Security.SecurityElement.Escape(item.Title) + "</Title>");
-            if (!string.IsNullOrEmpty(item.AircraftTag) && item.AircraftTag != "Не определен")
-                sb.AppendLine("  <Tag>" + System.Security.SecurityElement.Escape(item.AircraftTag) + "</Tag>");
-            sb.AppendLine("</WorkshopItemInfo>");
-            File.WriteAllText(xmlPath, sb.ToString(), Encoding.UTF8);
-        }
+        // Не записываем посторонние файлы внутрь папки Steam Workshop, чтобы не вызывать перепроверку хешей в Steam!
         if (!string.IsNullOrEmpty(item.AircraftTag) && item.AircraftTag != "Не определен")
             LiveryParser.SaveUserAircraftMapping(targetFolder, item.AircraftTag);
     }
+
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ulong Flat_UGC_UnsubscribeItem(IntPtr self, ulong nPublishedFileID);
 
     private static bool TryNativeSteamUnsubscribe(string gameRoot, ulong fileId)
     {
+        if (Process.GetProcessesByName("VTOLVR").Length > 0)
+            throw new Exception("Закройте VTOL VR перед удалением ливреи из Steam Workshop.");
+
         IntPtr hMod = IntPtr.Zero;
         try
         {
@@ -897,9 +900,14 @@ public static class WorkshopBrowser
             if (ugcPtr == IntPtr.Zero) return false;
 
             Flat_UGC_UnsubscribeItem fnUnsub = GetUgcExport<Flat_UGC_UnsubscribeItem>(hMod, "SteamAPI_ISteamUGC_UnsubscribeItem");
+            SteamAPI_RunCallbacksDelegate fnCallbacks = GetUgcExport<SteamAPI_RunCallbacksDelegate>(hMod, "SteamAPI_RunCallbacks");
             if (fnUnsub == null) return false;
 
             ulong callHandle = fnUnsub(ugcPtr, fileId);
+            if (fnCallbacks != null)
+            {
+                for (int i = 0; i < 6; i++) { fnCallbacks(); Thread.Sleep(100); }
+            }
             AppLogger.Log("WORKSHOP", "Flat SteamUGC UnsubscribeItem вызван, handle=" + callHandle);
             return callHandle != 0;
         }
@@ -925,24 +933,8 @@ public static class WorkshopBrowser
 
         if (Directory.Exists(folderPath))
             Directory.Delete(folderPath, true);
-
-        try
-        {
-            string wsRoot = Path.GetFullPath(Path.Combine(folderPath, @"..\.."));
-            string acfPath = Path.Combine(wsRoot, "appworkshop_667970.acf");
-            if (File.Exists(acfPath))
-            {
-                string acf = File.ReadAllText(acfPath, Encoding.UTF8);
-                string updated = Regex.Replace(acf, @"\s*""" + Regex.Escape(itemId) + @"""\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", "");
-                if (updated != acf)
-                    File.WriteAllText(acfPath, updated, new UTF8Encoding(false));
-            }
-        }
-        catch (Exception ex)
-        {
-            AppLogger.Error("WORKSHOP", "Очистка appworkshop_667970.acf", ex);
-        }
     }
+
 
 }
 

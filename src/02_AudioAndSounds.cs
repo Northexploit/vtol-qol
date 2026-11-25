@@ -247,15 +247,40 @@ public static class AudioInterop
     }
 }
 
+[ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IAudioMeterInformation
+{
+    int GetPeakValue(out float pfPeak);
+    int GetMeteringChannelCount(out int pnChannels);
+    int GetChannelsPeakValues(int u32ChannelCount, [Out] float[] afPeakValues);
+    int QueryHardwareSupport(out int pdwHardwareSupportMask);
+}
+
 public static class AudioSessionDucking
 {
     private static float? originalVolume = null;
+    private static bool isCurrentlyDucked = false;
+    private static DateTime lastVoiceUtc = DateTime.MinValue;
     private static readonly object dlock = new object();
 
     public static void SetDuck(bool duck, string processName)
     {
         lock (dlock)
         {
+            // При первом вызове проверяем, не осталось ли зависшее приглушение с прошлой сессии
+            if (!originalVolume.HasValue)
+            {
+                string saved = SettingsManager.Get("PreDuckVolume", "");
+                float parsed;
+                if (!string.IsNullOrEmpty(saved) && float.TryParse(saved, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out parsed) && parsed > 0.35f)
+                {
+                    originalVolume = parsed;
+                }
+            }
+
+            if (!duck && !isCurrentlyDucked && !originalVolume.HasValue)
+                return;
+
             IMMDeviceEnumerator enumerator = null;
             IMMDevice device = null;
             IAudioSessionManager2 sm = null;
@@ -284,22 +309,41 @@ public static class AudioSessionDucking
                         {
                             Process proc = null;
                             try { proc = Process.GetProcessById(pid); } catch { }
-                            if (proc != null && proc.ProcessName.Equals(processName, StringComparison.OrdinalIgnoreCase))
+                            if (proc != null)
                             {
-                                ISimpleAudioVolume vol = (ISimpleAudioVolume)sc;
-                                Guid ctx = Guid.Empty;
-                                if (duck)
+                                string pName = proc.ProcessName;
+                                proc.Dispose();
+                                if (pName.Equals(processName, StringComparison.OrdinalIgnoreCase))
                                 {
-                                    float cur;
-                                    vol.GetMasterVolume(out cur);
-                                    if (originalVolume == null) originalVolume = cur;
-                                    vol.SetMasterVolume(0.25f, ref ctx);
-                                }
-                                else
-                                {
-                                    float restore = originalVolume.HasValue ? originalVolume.Value : 1.0f;
-                                    vol.SetMasterVolume(restore, ref ctx);
-                                    originalVolume = null;
+                                    ISimpleAudioVolume vol = (ISimpleAudioVolume)sc;
+                                    Guid ctx = Guid.Empty;
+                                    if (duck)
+                                    {
+                                        float cur;
+                                        vol.GetMasterVolume(out cur);
+                                        if (!originalVolume.HasValue)
+                                        {
+                                            // Если громкость уже была занижена прошлым сбоем (< 0.35), считаем нормой 1.0f
+                                            originalVolume = cur > 0.35f ? cur : 1.0f;
+                                            SettingsManager.Set("PreDuckVolume", originalVolume.Value.ToString("F2", System.Globalization.CultureInfo.InvariantCulture));
+                                            SettingsManager.Save();
+                                        }
+                                        vol.SetMasterVolume(0.25f, ref ctx);
+                                        isCurrentlyDucked = true;
+                                    }
+                                    else
+                                    {
+                                        float restore = originalVolume.HasValue ? originalVolume.Value : 1.0f;
+                                        if (restore < 0.35f) restore = 1.0f;
+                                        vol.SetMasterVolume(restore, ref ctx);
+                                        originalVolume = null;
+                                        isCurrentlyDucked = false;
+                                        if (!string.IsNullOrEmpty(SettingsManager.Get("PreDuckVolume", "")))
+                                        {
+                                            SettingsManager.Set("PreDuckVolume", "");
+                                            SettingsManager.Save();
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -321,46 +365,41 @@ public static class AudioSessionDucking
 
     public static bool IsMicInUse()
     {
+        IMMDeviceEnumerator enumerator = null;
+        IMMDevice micDev = null;
+        IAudioMeterInformation meter = null;
         try
         {
-            string baseKey = @"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
-            using (RegistryKey root = Registry.CurrentUser.OpenSubKey(baseKey))
+            enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+            int hr = enumerator.GetDefaultAudioEndpoint(EDataFlow.eCapture, ERole.eCommunications, out micDev);
+            if (hr != 0 || micDev == null) return false;
+
+            Guid iidMeter = typeof(IAudioMeterInformation).GUID;
+            object objMeter;
+            hr = micDev.Activate(ref iidMeter, 23, IntPtr.Zero, out objMeter);
+            if (hr != 0 || objMeter == null) return false;
+
+            meter = (IAudioMeterInformation)objMeter;
+            float peak = 0f;
+            meter.GetPeakValue(out peak);
+
+            // Порог реального голоса с микрофона (игнорирует тишину и простой Discord в канале)
+            if (peak >= 0.035f)
             {
-                if (root == null) return false;
-                foreach (string sub in root.GetSubKeyNames())
-                {
-                    if (sub.Equals("NonPackaged", StringComparison.OrdinalIgnoreCase))
-                    {
-                        using (RegistryKey npKey = root.OpenSubKey(sub))
-                        {
-                            if (npKey == null) continue;
-                            foreach (string app in npKey.GetSubKeyNames())
-                            {
-                                if (app.IndexOf("discord", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    app.IndexOf("teamspeak", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    app.IndexOf("ts3client", StringComparison.OrdinalIgnoreCase) >= 0)
-                                {
-                                    using (RegistryKey appKey = npKey.OpenSubKey(app))
-                                    {
-                                        object stop = appKey != null ? appKey.GetValue("LastUsedTimeStop") : null;
-                                        if (stop != null && Convert.ToInt64(stop) == 0) return true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    else if (sub.IndexOf("discord", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        using (RegistryKey appKey = root.OpenSubKey(sub))
-                        {
-                            object stop = appKey != null ? appKey.GetValue("LastUsedTimeStop") : null;
-                            if (stop != null && Convert.ToInt64(stop) == 0) return true;
-                        }
-                    }
-                }
+                lastVoiceUtc = DateTime.UtcNow;
+                return true;
             }
+            // Удерживаем плавность 1.2 секунды между словами
+            if ((DateTime.UtcNow - lastVoiceUtc).TotalSeconds <= 1.2)
+                return true;
         }
         catch { }
+        finally
+        {
+            if (meter != null) Marshal.ReleaseComObject(meter);
+            if (micDev != null) Marshal.ReleaseComObject(micDev);
+            if (enumerator != null) Marshal.ReleaseComObject(enumerator);
+        }
         return false;
     }
 }

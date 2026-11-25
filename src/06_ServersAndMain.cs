@@ -1194,15 +1194,13 @@ public class MainForm : Form
                 }
                 else
                 {
-                    // Проверяем YouTube, Discord и Steam параллельно, чтобы не ждать 3 таймаута подряд
+                    // Проверяем YouTube, Discord и Steam параллельно без преждевременного Dispose() по таймауту
                     bool yt = false, dc = false, stm = false;
-                    using (CountdownEvent latch = new CountdownEvent(3))
-                    {
-                        ThreadPool.QueueUserWorkItem(delegate { try { yt = CheckHostReachable("https://youtube.com"); } finally { latch.Signal(); } });
-                        ThreadPool.QueueUserWorkItem(delegate { try { dc = CheckHostReachable("https://discord.com"); } finally { latch.Signal(); } });
-                        ThreadPool.QueueUserWorkItem(delegate { try { stm = CheckHostReachable("https://steamcommunity.com"); } finally { latch.Signal(); } });
-                        latch.Wait(2000);
-                    }
+                    CountdownEvent latch = new CountdownEvent(3);
+                    ThreadPool.QueueUserWorkItem(delegate { try { yt = CheckHostReachable("https://youtube.com"); } finally { try { if (!latch.IsSet) latch.Signal(); } catch { } } });
+                    ThreadPool.QueueUserWorkItem(delegate { try { dc = CheckHostReachable("https://discord.com"); } finally { try { if (!latch.IsSet) latch.Signal(); } catch { } } });
+                    ThreadPool.QueueUserWorkItem(delegate { try { stm = CheckHostReachable("https://steamcommunity.com"); } finally { try { if (!latch.IsSet) latch.Signal(); } catch { } } });
+                    latch.Wait(2000);
 
                     netYtOk = yt;
                     netDcOk = dc;
@@ -2224,6 +2222,15 @@ public class MainForm : Form
     [STAThread]
     static void Main(string[] args)
     {
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (s, e) =>
+        {
+            try { File.WriteAllText("crash_last.log", e.Exception.ToString()); } catch { }
+        };
+        AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+        {
+            try { File.WriteAllText("crash_last.log", e.ExceptionObject.ToString()); } catch { }
+        };
         bool isShuffleMode = (args != null && args.Length >= 1 && args[0] == "--shuffle");
         if (!isShuffleMode)
             AppLogger.InitSession();

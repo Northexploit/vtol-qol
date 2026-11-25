@@ -5,6 +5,7 @@ using System.Drawing.Drawing2D;
 using System.IO;
 using System.Text;
 using System.Windows.Forms;
+using OpenFileDialog = System.Windows.Forms.OpenFileDialog;
 
 // =========================================================================
 // === ТАКТИЧЕСКИЙ РАДАР-ПЛАНШЕТ ДЕБРИФИНГА И РАЗБОР ОШИБОК ПИЛОТА ==========
@@ -23,6 +24,7 @@ public class DebriefRadarForm : Form
     private ComboBox cmbReplays;
     private Button btnBrowseFile;
     private DoubleBufferedPanel pnlRadar;
+    private OpenGLRadarControl glRadar3D;
     private DoubleBufferedPanel pnlTimeline;
     private Button btnPlayPause;
     private ComboBox cmbSpeed;
@@ -41,97 +43,292 @@ public class DebriefRadarForm : Form
     // Параметры камеры тактического планшета
     private double camCenterX = 0.0;
     private double camCenterY = 0.0;
-    private double pixelsPerMeter = 0.012; // ~12 px на 1 км по умолчанию
+    private double targetCamX = 0.0;
+    private double targetCamY = 0.0;
+    private bool hasSmoothCamTarget = false;
+    private double pixelsPerMeter = 0.0085;
     private bool isPanning = false;
     private Point lastPanMouse;
-    private bool followPlayer = true;
+    private bool followPlayer = false;
     private CheckBox chkFollowPlayer;
+    private ComboBox cmbFollowTarget;
+    private string followEntityId = "";
+    private CheckBox chkShowTerrain;
+    private CheckBox chkShowBeams;
+    private CheckBox chkShowAllies;
+    private bool showTerrain = true;
+    private bool showBeams = true;
+    private bool showAllies = true;
+    private bool is3DMode = false;
+    private double camYawDeg = 35.0;
+    private double camPitchDeg = 38.0;
+    private Button btnToggle3D;
+    private Dictionary<string, PointF> smoothBadgeOffsets = new Dictionary<string, PointF>();
+    private float beamDashPhase = 0f;
+    private System.Diagnostics.Stopwatch frameSw = System.Diagnostics.Stopwatch.StartNew();
+    private double lastTickSec = 0.0;
+    private double lastJamSurgeTime = -99.0;
+    private string lastJamBannerActor = "";
+    private HashSet<string> triggeredJamEvents = new HashSet<string>();
+
 
     public DebriefRadarForm()
     {
-        this.Text = "VTOL QoL — Тактический дебрифинг и разбор ошибок пилота";
+        this.SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        this.DoubleBuffered = true;
+        this.Text = "VTOL QoL — Тактический дебрифинг и 2D-карта боя";
         DarkWindowHelper.Apply(this);
-        this.Size = new Size(1160, 720);
-        this.MinimumSize = new Size(960, 580);
+        this.Size = new Size(1240, 745);
+        this.MinimumSize = new Size(1020, 580);
         this.StartPosition = FormStartPosition.CenterParent;
         this.FormBorderStyle = FormBorderStyle.Sizable;
         this.MaximizeBox = true;
         this.BackColor = Color.FromArgb(16, 20, 18);
-        this.ForeColor = Color.FromArgb(0, 255, 102);
-        this.Font = new Font("Consolas", 9.5f);
+        this.SizeChanged += (s, e) => { this.PerformLayout(); if (pnlRadar != null) pnlRadar.Invalidate(); if (pnlTimeline != null) pnlTimeline.Invalidate(); };
 
-        // Верхняя панель выбора повтора
-        Panel pnlTop = new Panel() { Left = 14, Top = 10, Width = 1116, Height = 38, BackColor = Color.FromArgb(24, 30, 27), BorderStyle = BorderStyle.FixedSingle };
+        // Верхняя панель выбора повтора и слоёв карты
+        Panel pnlTop = new Panel() { Left = 14, Top = 10, Width = 1196, Height = 38, BackColor = Color.FromArgb(24, 30, 27), BorderStyle = BorderStyle.FixedSingle };
         pnlTop.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         this.Controls.Add(pnlTop);
 
-        Label lblFile = new Label() { Text = "Вылет / Повтор:", Left = 10, Top = 10, AutoSize = true, ForeColor = Color.LightGray };
+        Label lblFile = new Label() { Text = "Вылет:", Left = 10, Top = 10, AutoSize = true, ForeColor = Color.LightGray };
         pnlTop.Controls.Add(lblFile);
 
-        cmbReplays = new ComboBox() { Left = 128, Top = 6, Width = 540, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(30, 38, 34), ForeColor = Color.Cyan };
+        cmbReplays = new ComboBox() { Left = 64, Top = 6, Width = 290, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(30, 38, 34), ForeColor = Color.Cyan };
         cmbReplays.SelectedIndexChanged += (s, e) => LoadSelectedReplay();
         pnlTop.Controls.Add(cmbReplays);
 
-        btnBrowseFile = new Button() { Text = "📂 Открыть .acmi / .vtolrep", Left = 678, Top = 5, Width = 215, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 105, 135), ForeColor = Color.White };
+        btnBrowseFile = new Button() { Text = "📂 Файл...", Left = 360, Top = 5, Width = 88, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 105, 135), ForeColor = Color.White };
         btnBrowseFile.Click += BtnBrowseFile_Click;
         pnlTop.Controls.Add(btnBrowseFile);
 
-        chkFollowPlayer = new CheckBox() { Text = "Следить за пилотом", Left = 905, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.FromArgb(180, 240, 200) };
-        chkFollowPlayer.CheckedChanged += (s, e) => { followPlayer = chkFollowPlayer.Checked; pnlRadar.Invalidate(); };
+        Button btnImportLog = new Button() { Text = "📥 Из Player.log", Left = 454, Top = 5, Width = 136, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(140, 85, 0), ForeColor = Color.White, Font = new Font("Consolas", 8.5f, FontStyle.Bold) };
+        btnImportLog.Click += BtnImportLog_Click;
+        pnlTop.Controls.Add(btnImportLog);
+
+        Button btnFitAll = new Button() { Text = "🌐 Бой", Left = 594, Top = 5, Width = 54, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(38, 78, 62), ForeColor = Color.White };
+        btnFitAll.Click += (s, e) => { followPlayer = false; chkFollowPlayer.Checked = false; FitCameraToBattle(); pnlRadar.Invalidate(); };
+        pnlTop.Controls.Add(btnFitAll);
+
+        btnToggle3D = new Button() { Text = "📐 3D", Left = 650, Top = 5, Width = 44, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 52, 65), ForeColor = Color.LightGray, Font = new Font("Consolas", 7.8f, FontStyle.Bold) };
+        btnToggle3D.Click += (s, e) =>
+        {
+            is3DMode = !is3DMode;
+            btnToggle3D.BackColor = is3DMode ? Color.FromArgb(0, 125, 165) : Color.FromArgb(40, 52, 65);
+            btnToggle3D.ForeColor = is3DMode ? Color.White : Color.LightGray;
+            pnlRadar.Visible = !is3DMode;
+            glRadar3D.Visible = is3DMode;
+            if (is3DMode) glRadar3D.Invalidate();
+            else pnlRadar.Invalidate();
+        };
+        pnlTop.Controls.Add(btnToggle3D);
+
+        chkFollowPlayer = new CheckBox() { Text = "Следить:", Left = 696, Top = 8, AutoSize = true, Checked = false, ForeColor = Color.FromArgb(180, 240, 200) };
+        chkFollowPlayer.CheckedChanged += (s, e) => { followPlayer = chkFollowPlayer.Checked; UpdateFrame(); };
         pnlTop.Controls.Add(chkFollowPlayer);
+
+        cmbFollowTarget = new ComboBox() { Left = 772, Top = 6, Width = 135, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(30, 38, 34), ForeColor = Color.FromArgb(180, 240, 200), Font = new Font("Consolas", 8f) };
+        cmbFollowTarget.SelectedIndexChanged += (s, e) =>
+        {
+            if (cmbFollowTarget.SelectedIndex <= 0) followEntityId = "";
+            else
+            {
+                string sel = cmbFollowTarget.SelectedItem.ToString();
+                int idxBr = sel.LastIndexOf('[');
+                if (idxBr >= 0 && sel.EndsWith("]"))
+                    followEntityId = sel.Substring(idxBr + 1, sel.Length - idxBr - 2);
+            }
+            UpdateFrame();
+        };
+        pnlTop.Controls.Add(cmbFollowTarget);
+
+        chkShowTerrain = new CheckBox() { Text = "Рельеф", Left = 913, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.Cyan };
+        chkShowTerrain.CheckedChanged += (s, e) => { showTerrain = chkShowTerrain.Checked; pnlRadar.Invalidate(); };
+        pnlTop.Controls.Add(chkShowTerrain);
+
+        chkShowBeams = new CheckBox() { Text = "RWR", Left = 982, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.Gold };
+        chkShowBeams.CheckedChanged += (s, e) => { showBeams = chkShowBeams.Checked; pnlRadar.Invalidate(); };
+        pnlTop.Controls.Add(chkShowBeams);
+
+        chkShowAllies = new CheckBox() { Text = "Союз", Left = 1034, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.DeepSkyBlue };
+        chkShowAllies.CheckedChanged += (s, e) => { showAllies = chkShowAllies.Checked; pnlRadar.Invalidate(); };
+        pnlTop.Controls.Add(chkShowAllies);
+
+        Button btnInspector = new Button() { Text = "🔍 Дамп", Left = 1092, Top = 5, Width = 84, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(65, 55, 110), ForeColor = Color.White, Font = new Font("Consolas", 8f, FontStyle.Bold) };
+        btnInspector.Click += BtnInspector_Click;
+        pnlTop.Controls.Add(btnInspector);
+
+        Button btnCleanOld = new Button() { Text = "🗑", Left = 1181, Top = 5, Width = 28, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(120, 38, 38), ForeColor = Color.White };
+        btnCleanOld.Click += (s, e) =>
+        {
+            if (MessageBox.Show(this, "Удалить все старые/дублирующие повторы из папки Replays?", "Очистка повторов", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+            {
+                string dir = DebriefEngine.GetReplaysDir();
+                foreach (string f in Directory.GetFiles(dir, "*.vtolrep"))
+                {
+                    try { File.Delete(f); File.Delete(f + ".debug.txt"); } catch { }
+                }
+                RefreshReplayList();
+            }
+        };
+        pnlTop.Controls.Add(btnCleanOld);
 
         // Левая основная зона: тактический радар-планшет
         pnlRadar = new DoubleBufferedPanel();
         pnlRadar.Location = new Point(14, 56);
-        pnlRadar.Size = new Size(740, 540);
+        pnlRadar.Size = new Size(810, 565);
         pnlRadar.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-        pnlRadar.BackColor = Color.FromArgb(12, 16, 15);
+        pnlRadar.BackColor = Color.FromArgb(11, 20, 26);
         pnlRadar.BorderStyle = BorderStyle.FixedSingle;
         pnlRadar.Paint += PnlRadar_Paint;
-        pnlRadar.MouseDown += (s, e) => {
+        pnlRadar.MouseDown += (s, e) =>
+        {
             if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
             {
+                bool hitAircraft = false;
+                if (e.Button == MouseButtons.Left && session != null)
+                    hitAircraft = InspectNearestObjectAt(e.Location);
+
+                if (hitAircraft)
+                {
+                    if (!chkFollowPlayer.Checked) chkFollowPlayer.Checked = true;
+                }
+                else
+                {
+                    hasSmoothCamTarget = false;
+                    if (followPlayer || chkFollowPlayer.Checked)
+                    {
+                        followPlayer = false;
+                        chkFollowPlayer.Checked = false;
+                    }
+                }
+
                 isPanning = true;
-                followPlayer = false;
-                chkFollowPlayer.Checked = false;
                 lastPanMouse = e.Location;
             }
         };
+
         pnlRadar.MouseUp += (s, e) => { isPanning = false; };
-        pnlRadar.MouseMove += (s, e) => {
+        pnlRadar.MouseMove += (s, e) =>
+        {
             if (!isPanning) return;
             double dx = e.X - lastPanMouse.X;
             double dy = e.Y - lastPanMouse.Y;
-            camCenterX -= dx / pixelsPerMeter;
-            camCenterY += dy / pixelsPerMeter;
+            if (Math.Abs(dx) < 1 && Math.Abs(dy) < 1) return;
+
+            if (is3DMode && (e.Button & MouseButtons.Right) == MouseButtons.Right)
+            {
+                camYawDeg = (camYawDeg + dx * 0.45 + 360.0) % 360.0;
+                camPitchDeg = Math.Max(5.0, Math.Min(89.0, camPitchDeg + dy * 0.40));
+                lastPanMouse = e.Location;
+                pnlRadar.Invalidate();
+                return;
+            }
+
+            hasSmoothCamTarget = false;
+            if (followPlayer)
+            {
+                followPlayer = false;
+                chkFollowPlayer.Checked = false;
+            }
+
+            if (is3DMode)
+            {
+                double yawRad = camYawDeg * Math.PI / 180.0;
+                double sinP = Math.Max(0.25, Math.Sin(camPitchDeg * Math.PI / 180.0));
+                double wdx = (dx * Math.Cos(yawRad) - (dy / sinP) * Math.Sin(yawRad)) / pixelsPerMeter;
+                double wdy = (dx * Math.Sin(yawRad) + (dy / sinP) * Math.Cos(yawRad)) / pixelsPerMeter;
+                camCenterX -= wdx;
+                camCenterY += wdy;
+            }
+            else
+            {
+                camCenterX -= dx / pixelsPerMeter;
+                camCenterY += dy / pixelsPerMeter;
+            }
             lastPanMouse = e.Location;
             pnlRadar.Invalidate();
         };
-        pnlRadar.MouseWheel += (s, e) => {
+        pnlRadar.MouseWheel += (s, e) =>
+        {
             double factor = e.Delta > 0 ? 1.25 : 0.8;
             pixelsPerMeter = Math.Max(0.0008, Math.Min(0.25, pixelsPerMeter * factor));
             pnlRadar.Invalidate();
         };
         this.Controls.Add(pnlRadar);
+        glRadar3D = new OpenGLRadarControl();
+        glRadar3D.Location = pnlRadar.Location;
+        glRadar3D.Size = pnlRadar.Size;
+        glRadar3D.Anchor = pnlRadar.Anchor;
+        glRadar3D.Visible = false;
+        glRadar3D.GetSession = () => session;
+        glRadar3D.GetCurrentTime = () => currentTime;
+        glRadar3D.GetCamX = () => camCenterX;
+        glRadar3D.GetCamY = () => camCenterY;
+        glRadar3D.GetCamDist = () => Math.Max(1.0, Math.Min(350.0, 9.5 / Math.Max(0.00003, pixelsPerMeter)));
+        glRadar3D.GetYaw = () => camYawDeg;
+        glRadar3D.GetPitch = () => camPitchDeg;
+        glRadar3D.GetRoll = () => 0.0;
+        glRadar3D.GetShowTerrain = () => showTerrain;
+        glRadar3D.GetShowBeams = () => showBeams;
+        glRadar3D.GetShowAllies = () => showAllies;
+        glRadar3D.GetFollowId = () => followEntityId;
+        glRadar3D.GetIsPlaying = () => isPlaying;
+        glRadar3D.MouseDown += (s, e) => { glRadar3D.Focus(); isPanning = true; lastPanMouse = e.Location; };
+        glRadar3D.MouseUp += (s, e) => { isPanning = false; };
+        glRadar3D.MouseMove += (s, e) =>
+        {
+            if (!glRadar3D.Focused) glRadar3D.Focus();
+            if (!isPanning) return;
+            double dx = e.X - lastPanMouse.X;
+            double dy = e.Y - lastPanMouse.Y;
+            if ((e.Button & MouseButtons.Left) == MouseButtons.Left)
+            {
+                camYawDeg = (camYawDeg + dx * 0.45 + 360.0) % 360.0;
+                camPitchDeg = Math.Max(3.0, Math.Min(89.0, camPitchDeg + dy * 0.40));
+            }
+            else if ((e.Button & MouseButtons.Right) == MouseButtons.Right)
+            {
+                hasSmoothCamTarget = false;
+                if (followPlayer) { followPlayer = false; chkFollowPlayer.Checked = false; }
+                double yawRad = camYawDeg * Math.PI / 180.0;
+                double distKm = Math.Max(1.0, Math.Min(350.0, 9.5 / Math.Max(0.00003, pixelsPerMeter)));
+                double metersPerPx = (distKm * 1000.0) / Math.Max(300.0, glRadar3D.Height * 0.85);
+                double sinP = Math.Max(0.32, Math.Sin(camPitchDeg * Math.PI / 180.0));
+                double wdx = (dx * Math.Cos(yawRad) - (dy / sinP) * Math.Sin(yawRad)) * metersPerPx;
+                double wdy = (dx * Math.Sin(yawRad) + (dy / sinP) * Math.Cos(yawRad)) * metersPerPx;
+                camCenterX -= wdx;
+                camCenterY += wdy;
+            }
+            lastPanMouse = e.Location;
+            glRadar3D.Invalidate();
+        };
+        glRadar3D.MouseWheel += (s, e) =>
+        {
+            double factor = e.Delta > 0 ? 1.28 : 0.78;
+            pixelsPerMeter = Math.Max(0.00003, Math.Min(0.35, pixelsPerMeter * factor));
+            glRadar3D.Invalidate();
+        };
+        this.Controls.Add(glRadar3D);
 
         // Правая панель: HUD телеметрии + Разбор ошибок пилота
         Panel pnlRight = new Panel();
-        pnlRight.Location = new Point(762, 56);
-        pnlRight.Size = new Size(368, 540);
+        pnlRight.Location = new Point(832, 56);
+        pnlRight.Size = new Size(378, 565);
         pnlRight.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Right;
         pnlRight.BackColor = Color.FromArgb(20, 25, 23);
         pnlRight.BorderStyle = BorderStyle.FixedSingle;
         this.Controls.Add(pnlRight);
 
-        Label lblTelTitle = new Label() { Text = "/// ТЕЛЕМЕТРИЯ БОРТА ///", Left = 10, Top = 8, AutoSize = true, Font = new Font("Consolas", 9.5f, FontStyle.Bold), ForeColor = Color.Cyan };
+        Label lblTelTitle = new Label() { Text = "/// ТЕЛЕМЕТРИЯ И СВОДКА БОЯ ///", Left = 10, Top = 8, AutoSize = true, Font = new Font("Consolas", 9.5f, FontStyle.Bold), ForeColor = Color.Cyan };
         pnlRight.Controls.Add(lblTelTitle);
 
         lblTelemetryHud = new Label()
         {
             Left = 10,
             Top = 28,
-            Width = 346,
-            Height = 64,
+            Width = 356,
+            Height = 84,
             BackColor = Color.FromArgb(15, 20, 18),
             ForeColor = Color.FromArgb(0, 255, 102),
             BorderStyle = BorderStyle.FixedSingle,
@@ -140,12 +337,12 @@ public class DebriefRadarForm : Form
         };
         pnlRight.Controls.Add(lblTelemetryHud);
 
-        Label lblErrTitle = new Label() { Text = "/// РАЗБОР ОШИБОК И СОБЫТИЙ ///", Left = 10, Top = 102, AutoSize = true, Font = new Font("Consolas", 9.5f, FontStyle.Bold), ForeColor = Color.Gold };
+        Label lblErrTitle = new Label() { Text = "/// ХРОНОЛОГИЯ И ОШИБКИ ПИЛОТА ///", Left = 10, Top = 120, AutoSize = true, Font = new Font("Consolas", 9.5f, FontStyle.Bold), ForeColor = Color.Gold };
         pnlRight.Controls.Add(lblErrTitle);
 
         lstMistakes = new ListBox();
-        lstMistakes.Location = new Point(10, 124);
-        lstMistakes.Size = new Size(346, 235);
+        lstMistakes.Location = new Point(10, 142);
+        lstMistakes.Size = new Size(356, 241);
         lstMistakes.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         lstMistakes.BackColor = Color.FromArgb(16, 20, 18);
         lstMistakes.ForeColor = Color.White;
@@ -156,15 +353,15 @@ public class DebriefRadarForm : Form
         lstMistakes.SelectedIndexChanged += LstMistakes_SelectedIndexChanged;
         pnlRight.Controls.Add(lstMistakes);
 
-        Label lblAdvTitle = new Label() { Text = "РЕКОМЕНДАЦИЯ ИНСТРУКТОРА:", Left = 10, Top = 366, AutoSize = true, Font = new Font("Consolas", 9f, FontStyle.Bold), ForeColor = Color.FromArgb(0, 255, 102) };
+        Label lblAdvTitle = new Label() { Text = "РАЗБОР МОМЕНТА И СОВЕТ:", Left = 10, Top = 391, AutoSize = true, Font = new Font("Consolas", 9f, FontStyle.Bold), ForeColor = Color.FromArgb(0, 255, 102) };
         lblAdvTitle.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         pnlRight.Controls.Add(lblAdvTitle);
 
         txtCoachAdvice = new TextBox()
         {
             Left = 10,
-            Top = 386,
-            Width = 346,
+            Top = 411,
+            Width = 356,
             Height = 142,
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
             Multiline = true,
@@ -173,35 +370,31 @@ public class DebriefRadarForm : Form
             BackColor = Color.FromArgb(15, 20, 18),
             ForeColor = Color.FromArgb(225, 245, 230),
             BorderStyle = BorderStyle.FixedSingle,
-            Text = "Выберите событие или ошибку в списке выше, чтобы перейти к моменту боя и увидеть тактический разбор."
+            Text = "Выберите событие или ошибку в списке выше, чтобы перейти к моменту боя на карте и увидеть тактический разбор."
         };
         pnlRight.Controls.Add(txtCoachAdvice);
-
-        // Нижняя панель плеера (таймлайн + управление временем)
-        Panel pnlBottom = new Panel() { Left = 14, Top = 604, Width = 1116, Height = 64, BackColor = Color.FromArgb(24, 30, 27), BorderStyle = BorderStyle.FixedSingle };
+        // Нижняя панель плеера
+        Panel pnlBottom = new Panel() { Left = 14, Top = 629, Width = 1196, Height = 64, BackColor = Color.FromArgb(24, 30, 27), BorderStyle = BorderStyle.FixedSingle };
         pnlBottom.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         this.Controls.Add(pnlBottom);
-
         btnPlayPause = new Button() { Text = "▶ ПУСК", Left = 10, Top = 16, Width = 92, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 130, 65), ForeColor = Color.White, Font = new Font("Consolas", 9.5f, FontStyle.Bold) };
         btnPlayPause.Click += (s, e) => TogglePlay();
         pnlBottom.Controls.Add(btnPlayPause);
-
         cmbSpeed = new ComboBox() { Left = 110, Top = 19, Width = 68, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(30, 38, 34), ForeColor = Color.Cyan };
         cmbSpeed.Items.AddRange(new object[] { "1x", "2x", "5x", "10x", "20x" });
         cmbSpeed.SelectedIndex = 1;
-        cmbSpeed.SelectedIndexChanged += (s, e) => {
+        cmbSpeed.SelectedIndexChanged += (s, e) =>
+        {
             string sVal = cmbSpeed.SelectedItem.ToString().Replace("x", "");
             double sp;
             if (double.TryParse(sVal, out sp)) playSpeed = sp;
         };
         pnlBottom.Controls.Add(cmbSpeed);
-
         lblTimeHud = new Label() { Left = 186, Top = 22, Width = 135, Height = 20, ForeColor = Color.Cyan, Font = new Font("Consolas", 9.5f, FontStyle.Bold), Text = "00:00 / 00:00" };
         pnlBottom.Controls.Add(lblTimeHud);
-
         pnlTimeline = new DoubleBufferedPanel();
         pnlTimeline.Location = new Point(328, 12);
-        pnlTimeline.Size = new Size(774, 40);
+        pnlTimeline.Size = new Size(854, 40);
         pnlTimeline.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         pnlTimeline.BackColor = Color.FromArgb(14, 18, 16);
         pnlTimeline.BorderStyle = BorderStyle.FixedSingle;
@@ -211,10 +404,35 @@ public class DebriefRadarForm : Form
         pnlTimeline.MouseMove += (s, e) => { if (e.Button == MouseButtons.Left) SeekTimelineByX(e.X); };
         pnlBottom.Controls.Add(pnlTimeline);
         playTimer = new System.Windows.Forms.Timer();
-        playTimer.Interval = 40;
-        playTimer.Tick += (s, e) => {
+        playTimer.Interval = 16; // 60 FPS
+        playTimer.Tick += (s, e) =>
+        {
+            double nowSec = frameSw.Elapsed.TotalSeconds;
+            double dt = nowSec - lastTickSec;
+            lastTickSec = nowSec;
+            if (dt <= 0 || dt > 0.25) dt = 0.016;
+
+            if (session != null && hasSmoothCamTarget && !isPanning)
+            {
+                double dx = targetCamX - camCenterX;
+                double dy = targetCamY - camCenterY;
+                if (Math.Abs(dx) < 1.5 && Math.Abs(dy) < 1.5)
+                {
+                    camCenterX = targetCamX;
+                    camCenterY = targetCamY;
+                    if (!followPlayer) hasSmoothCamTarget = false;
+                }
+                else
+                {
+                    camCenterX += dx * 0.20;
+                    camCenterY += dy * 0.20;
+                }
+                if (!isPlaying) pnlRadar.Invalidate();
+            }
+
             if (!isPlaying || session == null) return;
-            currentTime += 0.04 * playSpeed;
+            currentTime += dt * playSpeed;
+            beamDashPhase = (beamDashPhase - (float)(dt * 30.0) + 100f) % 100f;
             if (currentTime >= session.Duration)
             {
                 currentTime = session.Duration;
@@ -224,8 +442,23 @@ public class DebriefRadarForm : Form
             UpdateFrame();
         };
         playTimer.Start();
-        this.FormClosing += (s, e) => { if (playTimer != null) { playTimer.Stop(); playTimer.Dispose(); } };
+        this.FormClosing += (s, e) =>
+        {
+            if (playTimer != null) { playTimer.Stop(); playTimer.Dispose(); }
+            if (session != null && session.TerrainBitmap != null) { session.TerrainBitmap.Dispose(); session.TerrainBitmap = null; }
+        };
         RefreshReplayList();
+    }
+    private void FitCameraToBattle()
+    {
+        if (session == null) return;
+        camCenterX = (session.BoundsMinX + session.BoundsMaxX) * 0.5;
+        camCenterY = (session.BoundsMinY + session.BoundsMaxY) * 0.5;
+        double spanX = Math.Max(15000.0, session.BoundsMaxX - session.BoundsMinX);
+        double spanY = Math.Max(15000.0, session.BoundsMaxY - session.BoundsMinY);
+        double ppmX = (pnlRadar.Width * 0.80) / spanX;
+        double ppmY = (pnlRadar.Height * 0.80) / spanY;
+        pixelsPerMeter = Math.Max(0.00008, Math.Min(0.06, Math.Min(ppmX, ppmY)));
     }
     private void TogglePlay()
     {
@@ -247,17 +480,23 @@ public class DebriefRadarForm : Form
         replayFiles = DebriefEngine.FindAvailableReplays();
         foreach (string f in replayFiles)
         {
-            string tag = f.EndsWith(".acmi", StringComparison.OrdinalIgnoreCase) ? "[ACMI 3D]" : "[LOG]";
-            cmbReplays.Items.Add(string.Format("{0} {1} ({2})", tag, Path.GetFileName(f), File.GetLastWriteTime(f).ToString("dd.MM HH:mm")));
+            bool isNativeSave = f.EndsWith(".vtr", StringComparison.OrdinalIgnoreCase) || Path.GetFileName(f).Equals("info.vts", StringComparison.OrdinalIgnoreCase);
+            string tag = isNativeSave ? "[VTOL-SAVE]" : (f.EndsWith(".acmi", StringComparison.OrdinalIgnoreCase) ? "[ACMI]" : "[КАРТА+ЛОГ]");
+            string dispName = Path.GetFileName(f).Equals("info.vts", StringComparison.OrdinalIgnoreCase) ? Path.GetFileName(Path.GetDirectoryName(f)) : Path.GetFileName(f);
+            cmbReplays.Items.Add(string.Format("{0} {1} ({2})", tag, dispName, File.GetLastWriteTime(f).ToString("dd.MM HH:mm")));
         }
         if (cmbReplays.Items.Count > 0)
             cmbReplays.SelectedIndex = 0;
         else
-            lblTelemetryHud.Text = "Повторы пока не найдены.\nПолетайте с включённым VTOL QoL или откройте любой файл Tacview (.acmi).";
+            lblTelemetryHud.Text = "Повторы пока не найдены.\nНажмите «📥 Из Player.log» или полетайте с включённым VTOL QoL.";
     }
     private void BtnBrowseFile_Click(object sender, EventArgs e)
     {
-        using (OpenFileDialog ofd = new OpenFileDialog() { Filter = "Файлы повторов (*.acmi;*.zip.acmi;*.vtolrep)|*.acmi;*.vtolrep|Все файлы (*.*)|*.*" })
+        OpenFileDialog ofd = new OpenFileDialog();
+        string defRep = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"Boundless Dynamics, LLC\VTOLVR\SaveData\Replays");
+        if (System.IO.Directory.Exists(defRep)) ofd.InitialDirectory = defRep;
+        ofd.Filter = "Все повторы VTOL (info.vts;*.vtr;*.vtolrep;*.acmi)|info.vts;*.vtr;*.vtolrep;*.acmi|Все файлы (*.*)|*.*";
+        using (ofd)
         {
             if (ofd.ShowDialog(this) == DialogResult.OK)
             {
@@ -267,25 +506,74 @@ public class DebriefRadarForm : Form
             }
         }
     }
+
+    private void BtnImportLog_Click(object sender, EventArgs e)
+    {
+        try
+        {
+            string logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "Low", @"Boundless Dynamics, LLC\VTOLVR\Player.log");
+            if (!File.Exists(logPath))
+            {
+                using (OpenFileDialog ofd = new OpenFileDialog() { Title = "Укажите файл Player.log", Filter = "Player.log (*.log;*.txt)|*.log;*.txt|Все файлы (*.*)|*.*" })
+                {
+                    if (ofd.ShowDialog(this) != DialogResult.OK) return;
+                    logPath = ofd.FileName;
+                }
+            }
+            string myNick = SettingsManager.Get("LastPilotNick", "");
+            string importedRep = DebriefEngine.ImportFromPlayerLog(logPath, myNick);
+            RefreshReplayList();
+            int idx = replayFiles.IndexOf(importedRep);
+            if (idx >= 0) cmbReplays.SelectedIndex = idx;
+            MessageBox.Show(this, "Вылет успешно восстановлен из Player.log!\nФайл: " + Path.GetFileName(importedRep), "Импорт завершён", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Ошибка импорта лога: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     private void LoadSelectedReplay()
     {
         int idx = cmbReplays.SelectedIndex;
         if (idx < 0 || idx >= replayFiles.Count) return;
         isPlaying = false;
         btnPlayPause.Text = "▶ ПУСК";
+        if (session != null && session.TerrainBitmap != null)
+        {
+            session.TerrainBitmap.Dispose();
+            session.TerrainBitmap = null;
+        }
         try
         {
             string myNick = SettingsManager.Get("LastPilotNick", "");
             session = DebriefEngine.LoadSession(replayFiles[idx], myNick);
             currentTime = 0;
-            followPlayer = true;
-            chkFollowPlayer.Checked = true;
+            smoothBadgeOffsets.Clear();
+            triggeredJamEvents.Clear();
+            lastJamSurgeTime = -99.0;
+            lastJamBannerActor = "";
+            followEntityId = "";
+            followPlayer = false;
+            chkFollowPlayer.Checked = false;
+            cmbFollowTarget.Items.Clear();
+            cmbFollowTarget.Items.Add("Мой борт (авто)");
+            foreach (DebriefEntity ent in session.Entities)
+            {
+                if (ent.Type == "Air")
+                {
+                    string side = ent.IsPlayer ? "ВЫ" : (ent.Coalition == "Allies" ? "СОЮЗ" : "ВРАГ");
+                    cmbFollowTarget.Items.Add(string.Format("[{0}] {1} [{2}]", side, ent.Name, ent.Id));
+                }
+            }
+            cmbFollowTarget.SelectedIndex = 0;
+            FitCameraToBattle();
             lstMistakes.Items.Clear();
             foreach (TacticalEvent ev in session.Events)
                 lstMistakes.Items.Add(ev);
             if (session.Mistakes.Count > 0)
             {
-                txtCoachAdvice.Text = string.Format("Обнаружено тактических ошибок: {0}.\r\nВыберите любую запись с пометкой [ОШИБКА], чтобы увидеть разбор и рекомендацию.", session.Mistakes.Count);
+                txtCoachAdvice.Text = string.Format("Обнаружено тактических ошибок и угроз: {0}.\r\nВыберите любую запись в списке выше, чтобы перейти к моменту боя на карте.", session.Mistakes.Count);
             }
             else
             {
@@ -306,10 +594,14 @@ public class DebriefRadarForm : Form
         Color bg = sel ? Color.FromArgb(35, 65, 52) : Color.FromArgb(16, 20, 18);
         Color fg = Color.LightGray;
         string badge = "•";
-        if (ev.Severity == "CRITICAL") { fg = Color.OrangeRed; badge = "✖ [ОШИБКА]"; }
+        if (ev.Severity == "CRITICAL") { fg = Color.OrangeRed; badge = "✖ [КРИТ]"; }
+        else if (ev.Kind == "RWR" || ev.Kind == "THREAT") { fg = Color.Orange; badge = "📡 [RWR]"; }
+        else if (ev.Kind == "RADAR") { fg = Color.DeepSkyBlue; badge = "🎯 [БРЛС]"; }
+        else if (ev.Kind == "DAMAGE") { fg = Color.Gold; badge = "💥 [ПОВР]"; }
         else if (ev.Severity == "WARNING") { fg = Color.Gold; badge = "⚠ [ОШИБКА]"; }
-        else if (ev.Severity == "GOOD") { fg = Color.FromArgb(0, 255, 102); badge = "★ [СБИТИЕ]"; }
+        else if (ev.Severity == "GOOD") { fg = Color.FromArgb(0, 255, 102); badge = "★ [УСПЕХ]"; }
         else if (ev.Kind == "LAUNCH") { fg = Color.Cyan; badge = "🚀 [ПУСК]"; }
+        else if (ev.Kind == "JAMMER") { fg = Color.FromArgb(215, 140, 255); badge = "⚡ [РЭБ]"; }
         using (SolidBrush br = new SolidBrush(bg)) e.Graphics.FillRectangle(br, e.Bounds);
         string line = string.Format("[{0}] {1} {2}", FormatSec(ev.Time), badge, ev.Title);
         using (SolidBrush fbr = new SolidBrush(fg))
@@ -332,7 +624,7 @@ public class DebriefRadarForm : Form
         if (!string.IsNullOrEmpty(ev.Advice))
         {
             sb.AppendLine();
-            sb.AppendLine("💡 КАК ИСПРАВИТЬ:");
+            sb.AppendLine("💡 ТАКТИЧЕСКИЙ РАЗБОР:");
             sb.AppendLine(ev.Advice);
         }
         txtCoachAdvice.Text = sb.ToString();
@@ -342,147 +634,1222 @@ public class DebriefRadarForm : Form
     {
         if (session == null) return;
         lblTimeHud.Text = string.Format("{0} / {1}", FormatSec(currentTime), FormatSec(session.Duration));
-        DebriefEntity player = null;
-        foreach (DebriefEntity ent in session.Entities)
-            if (ent.IsPlayer) { player = ent; break; }
-        if (player != null)
+
+        DebriefEntity trackedEnt = null;
+        if (!string.IsNullOrEmpty(followEntityId))
         {
-            DebriefSample st = player.GetStateAt(currentTime);
+            foreach (DebriefEntity ent in session.Entities)
+                if (ent.Id == followEntityId) { trackedEnt = ent; break; }
+        }
+        if (trackedEnt == null)
+        {
+            foreach (DebriefEntity ent in session.Entities)
+                if (ent.IsPlayer && ent.GetStateAt(currentTime) != null) { trackedEnt = ent; break; }
+        }
+        if (trackedEnt == null)
+        {
+            foreach (DebriefEntity ent in session.Entities)
+                if (ent.IsPlayer) { trackedEnt = ent; break; }
+        }
+
+        if (trackedEnt != null)
+        {
+            DebriefSample st = trackedEnt.GetStateAt(currentTime);
             if (st != null)
             {
-                if (followPlayer && session.HasFullRadarCoords)
+                if (followPlayer)
                 {
                     camCenterX = st.X;
                     camCenterY = st.Y;
                 }
+                string modeTag = session.HasExactTelemetry ? "[3D-ТРЕК]" : "[ЛОГ+КАРТА]";
                 lblTelemetryHud.Text = string.Format(
-                "Борт: {0} ({1})\nALT: {2:F0} м  |  SPD: {3:F0} км/ч\nHDG: {4:F0}°  |  Ошибок в бою: {5}",
-                player.Name, player.Pilot, st.Alt, st.Speed * 3.6, st.Heading, session.Mistakes.Count);
-            }
-            else
-            {
-                lblTelemetryHud.Text = string.Format("Пилот: {0} | Ошибок в бою: {1}\n(Повтор записан из Player.log без 2D-координат)",
-                session.PilotName, session.Mistakes.Count);
+                "Борт: {0} {1}\nALT: {2:F0} м | SPD: {3:F0} км/ч | HDG: {4:F0}°\nФраги: {5} (союзн: {6}) | Пусков: {7} | RWR: {8}",
+                trackedEnt.Name, modeTag,
+                st.Alt, st.Speed * 3.6, st.Heading,
+                session.PlayerKills, session.AlliedKills, session.PlayerLaunches, session.RwrSpikesCount);
             }
         }
-        pnlRadar.Invalidate();
+
+        if (is3DMode && glRadar3D != null) glRadar3D.Invalidate();
+        else pnlRadar.Invalidate();
         pnlTimeline.Invalidate();
     }
     private PointF WorldToScreen(double wx, double wy, int w, int h)
     {
-        float sx = (float)(w * 0.5 + (wx - camCenterX) * pixelsPerMeter);
-        float sy = (float)(h * 0.5 - (wy - camCenterY) * pixelsPerMeter);
-        return new PointF(sx, sy);
+        return WorldToScreen3D(wx, wy, 0.0, w, h);
+    }
+
+    private PointF WorldToScreen3D(double wx, double wy, double alt, int w, int h)
+    {
+        double sx, sy;
+        if (!is3DMode)
+        {
+            sx = w * 0.5 + (wx - camCenterX) * pixelsPerMeter;
+            sy = h * 0.5 - (wy - camCenterY) * pixelsPerMeter;
+        }
+        else
+        {
+            double dx = wx - camCenterX;
+            double dy = wy - camCenterY;
+            double yawRad = camYawDeg * Math.PI / 180.0;
+            double pitchRad = camPitchDeg * Math.PI / 180.0;
+
+            double rx = dx * Math.Cos(yawRad) - dy * Math.Sin(yawRad);
+            double ry = dx * Math.Sin(yawRad) + dy * Math.Cos(yawRad);
+
+            double altScale = 1.0; // Строгие пропорции 1:1 (метры высоты == метры по горизонтали)
+            sx = w * 0.5 + rx * pixelsPerMeter;
+            sy = h * 0.52 - (ry * Math.Sin(pitchRad) + alt * altScale * Math.Cos(pitchRad)) * pixelsPerMeter;
+        }
+
+        if (double.IsNaN(sx) || double.IsInfinity(sx)) sx = 0;
+        if (double.IsNaN(sy) || double.IsInfinity(sy)) sy = 0;
+        float fx = (float)Math.Max(-15000.0, Math.Min(15000.0, sx));
+        float fy = (float)Math.Max(-15000.0, Math.Min(15000.0, sy));
+        return new PointF(fx, fy);
     }
     private void PnlRadar_Paint(object sender, PaintEventArgs e)
     {
-        Graphics g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
         int w = pnlRadar.Width;
         int h = pnlRadar.Height;
-        // 1. Тактическая координатная сетка (шаг 10 км)
-        double gridStepMeters = 10000.0;
-        if (pixelsPerMeter > 0.04) gridStepMeters = 2000.0;
-        else if (pixelsPerMeter < 0.004) gridStepMeters = 25000.0;
-        double leftWorld = camCenterX - (w * 0.5) / pixelsPerMeter;
-        double rightWorld = camCenterX + (w * 0.5) / pixelsPerMeter;
-        double bottomWorld = camCenterY - (h * 0.5) / pixelsPerMeter;
-        double topWorld = camCenterY + (h * 0.5) / pixelsPerMeter;
-        double startX = Math.Floor(leftWorld / gridStepMeters) * gridStepMeters;
-        double startY = Math.Floor(bottomWorld / gridStepMeters) * gridStepMeters;
-        using (Pen gridPen = new Pen(Color.FromArgb(24, 38, 32), 1))
-        using (SolidBrush scaleBrush = new SolidBrush(Color.FromArgb(80, 140, 110)))
+        if (w <= 10 || h <= 10 || double.IsNaN(camCenterX) || double.IsNaN(camCenterY) || pixelsPerMeter <= 0) return;
+        try
         {
-            for (double gx = startX; gx <= rightWorld; gx += gridStepMeters)
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.InterpolationMode = InterpolationMode.Bilinear;
+            // 0. Отрисовка 2D-карты рельефа или 3D-каркаса гор
+            if (!is3DMode && session != null && showTerrain && session.TerrainBitmap != null && session.MapSizeMeters > 100)
             {
-                PointF p = WorldToScreen(gx, camCenterY, w, h);
-                g.DrawLine(gridPen, p.X, 0, p.X, h);
-            }
-            for (double gy = startY; gy <= topWorld; gy += gridStepMeters)
-            {
-                PointF p = WorldToScreen(camCenterX, gy, w, h);
-                g.DrawLine(gridPen, 0, p.Y, w, p.Y);
-            }
-            g.DrawString(string.Format("Сетка: {0:F0} км | Колесо мыши — зум, ЛКМ — сдвиг", gridStepMeters / 1000.0),
-            this.Font, scaleBrush, 10, h - 22);
-        }
-        if (session == null) return;
-        if (!session.HasFullRadarCoords)
-        {
-            using (SolidBrush br = new SolidBrush(Color.Cyan))
-                g.DrawString("Режим хронологии вылета (.vtolrep) — кликайте по событиям справа или на таймлайне.\nДля отображения 2D-радара траекторий откройте любой файл Tacview (.acmi).",
-                this.Font, br, 20, 20);
-            return;
-        }
-        // 2. Отрисовка траекторий (шлейфов) и тактических символов
-        foreach (DebriefEntity ent in session.Entities)
-        {
-            DebriefSample cur = ent.GetStateAt(currentTime);
-            if (cur == null) continue;
-            Color col = ent.IsPlayer
-            ? Color.FromArgb(0, 255, 102)
-            : (ent.Type == "Missile"
-            ? Color.Orange
-            : (ent.Coalition == "Enemies" ? Color.OrangeRed : Color.DeepSkyBlue));
-            // Шлейф за последние 45 секунд
-            List<PointF> trail = new List<PointF>();
-            double minTrailT = Math.Max(ent.FirstTime, currentTime - 45.0);
-            for (int i = 0; i < ent.Track.Count; i++)
-            {
-                DebriefSample s = ent.Track[i];
-                if (s.Time < minTrailT) continue;
-                if (s.Time > currentTime) break;
-                trail.Add(WorldToScreen(s.X, s.Y, w, h));
-            }
-            trail.Add(WorldToScreen(cur.X, cur.Y, w, h));
-            if (trail.Count >= 2)
-            {
-                using (Pen trailPen = new Pen(Color.FromArgb(145, col), ent.Type == "Missile" ? 1.3f : 2.0f))
+                PointF topLeft = WorldToScreen(session.MapMinX, session.MapMinY + session.MapSizeMeters, w, h);
+                PointF botRight = WorldToScreen(session.MapMinX + session.MapSizeMeters, session.MapMinY, w, h);
+                float mapW = botRight.X - topLeft.X;
+                float mapH = botRight.Y - topLeft.Y;
+                if (mapW > 10 && mapH > 10)
                 {
-                    if (ent.Type == "Missile") trailPen.DashStyle = DashStyle.Dash;
-                    g.DrawLines(trailPen, trail.ToArray());
+                    g.DrawImage(session.TerrainBitmap, topLeft.X, topLeft.Y, mapW, mapH);
+                    using (Pen borderPen = new Pen(Color.FromArgb(65, 0, 255, 140), 1f))
+                        g.DrawRectangle(borderPen, topLeft.X, topLeft.Y, mapW, mapH);
                 }
             }
-            PointF pos = WorldToScreen(cur.X, cur.Y, w, h);
-            if (pos.X < -40 || pos.X > w + 40 || pos.Y < -40 || pos.Y > h + 40) continue;
-            // Символ цели
-            double rad = cur.Heading * Math.PI / 180.0;
-            float dx = (float)Math.Sin(rad);
-            float dy = -(float)Math.Cos(rad);
-            if (ent.Type == "Missile")
+            else if (is3DMode && session != null && showTerrain && session.TerrainHeights != null && session.MapSizeMeters > 100)
             {
-                using (SolidBrush mBr = new SolidBrush(Color.Orange))
-                    g.FillEllipse(mBr, pos.X - 3, pos.Y - 3, 6, 6);
+                // Высокодетальный 3D-ландшафт (130x130 полигонов по видимой области карты) с отсечением за границами экрана
+                double viewSpan = Math.Min(session.MapSizeMeters, Math.Max(14000.0, Math.Max(w, h) * 1.35 / Math.Max(0.0008, pixelsPerMeter)));
+                int meshN = 130;
+                double stepM = viewSpan / meshN;
+                double baseX = Math.Floor((camCenterX - viewSpan * 0.5) / stepM) * stepM;
+                double baseY = Math.Floor((camCenterY - viewSpan * 0.5) / stepM) * stepM;
+
+                PointF[,] pts = new PointF[meshN + 1, meshN + 1];
+                double[,] alts = new double[meshN + 1, meshN + 1];
+                for (int iy = 0; iy <= meshN; iy++)
+                {
+                    double wy = baseY + iy * stepM;
+                    for (int ix = 0; ix <= meshN; ix++)
+                    {
+                        double wx = baseX + ix * stepM;
+                        double gz = session.GetGroundAltitudeAt(wx, wy);
+                        alts[ix, iy] = gz;
+                        pts[ix, iy] = WorldToScreen3D(wx, wy, gz, w, h);
+                    }
+                }
+
+                double yawRad = camYawDeg * Math.PI / 180.0;
+                bool revX = Math.Sin(yawRad) < 0;
+                bool revY = Math.Cos(yawRad) > 0;
+
+                using (Pen contourPen = new Pen(Color.FromArgb(40, 95, 225, 160), 1.0f))
+                {
+                    for (int sy = 0; sy < meshN; sy++)
+                    {
+                        int iy = revY ? (meshN - 1 - sy) : sy;
+                        for (int sx = 0; sx < meshN; sx++)
+                        {
+                            int ix = revX ? (meshN - 1 - sx) : sx;
+
+                            PointF p00 = pts[ix, iy];
+                            PointF p10 = pts[ix + 1, iy];
+                            PointF p11 = pts[ix + 1, iy + 1];
+                            PointF p01 = pts[ix, iy + 1];
+
+                            if ((p00.X < -60 && p10.X < -60 && p11.X < -60 && p01.X < -60) ||
+                                (p00.X > w + 60 && p10.X > w + 60 && p11.X > w + 60 && p01.X > w + 60) ||
+                                (p00.Y < -60 && p10.Y < -60 && p11.Y < -60 && p01.Y < -60) ||
+                                (p00.Y > h + 60 && p10.Y > h + 60 && p11.Y > h + 60 && p01.Y > h + 60))
+                                continue;
+
+                            double h00 = alts[ix, iy];
+                            double h10 = alts[ix + 1, iy];
+                            double h11 = alts[ix + 1, iy + 1];
+                            double h01 = alts[ix, iy + 1];
+                            double hAvg = (h00 + h10 + h11 + h01) * 0.25;
+
+                            PointF[] quad = new PointF[] { p00, p10, p11, p01 };
+
+                            Color fillCol;
+                            if (hAvg <= 2.0)
+                            {
+                                fillCol = Color.FromArgb(245, 11, 25, 39);
+                            }
+                            else
+                            {
+                                double slopeX = (h10 - h00) / stepM;
+                                double slopeY = (h01 - h00) / stepM;
+                                double shade = Math.Max(-0.42, Math.Min(0.55, (-slopeX * 0.72 + slopeY * 0.72) * 2.1));
+
+                                double norm = Math.Min(1.0, hAvg / 2000.0);
+                                int r = (int)((22 + norm * 86) * (1.0 + shade));
+                                int gr = (int)((52 + norm * 88) * (1.0 + shade));
+                                int b = (int)((34 + norm * 62) * (1.0 + shade));
+
+                                if (hAvg < 38.0) { r += 10; gr += 24; b += 20; }
+                                if (hAvg > 1450.0) { r += 26; gr += 26; b += 30; }
+
+                                r = Math.Max(8, Math.Min(230, r));
+                                gr = Math.Max(16, Math.Min(240, gr));
+                                b = Math.Max(14, Math.Min(225, b));
+                                fillCol = Color.FromArgb(245, r, gr, b);
+                            }
+
+                            using (SolidBrush polyBr = new SolidBrush(fillCol))
+                            using (Pen matchPen = new Pen(fillCol, 1.0f))
+                            {
+                                g.FillPolygon(polyBr, quad);
+                                g.DrawPolygon(matchPen, quad);
+                            }
+
+                            int bandA = (int)(h00 / 250.0);
+                            int bandB = (int)(h10 / 250.0);
+                            int bandC = (int)(h01 / 250.0);
+                            if (bandA != bandB) g.DrawLine(contourPen, p00, p10);
+                            if (bandA != bandC) g.DrawLine(contourPen, p00, p01);
+                        }
+                    }
+                }
+            }
+
+
+            // 1. Координатная сетка (уровень моря Z=0)
+            double gridStepMeters = 10000.0;
+            if (pixelsPerMeter > 0.04) gridStepMeters = 2000.0;
+            else if (pixelsPerMeter < 0.004) gridStepMeters = 25000.0;
+            double spanGrid = is3DMode ? Math.Max(w, h) * 1.1 / pixelsPerMeter : (w * 0.5) / pixelsPerMeter;
+            double leftWorld = camCenterX - spanGrid;
+            double rightWorld = camCenterX + spanGrid;
+            double bottomWorld = camCenterY - spanGrid;
+            double topWorld = camCenterY + spanGrid;
+            double startX = Math.Floor(leftWorld / gridStepMeters) * gridStepMeters;
+            double startY = Math.Floor(bottomWorld / gridStepMeters) * gridStepMeters;
+            using (Pen gridPen = new Pen(Color.FromArgb(is3DMode ? 24 : 38, 0, 220, 120), 1))
+            using (SolidBrush scaleBrush = new SolidBrush(Color.FromArgb(145, 205, 180)))
+            {
+                for (double gx = startX; gx <= rightWorld; gx += gridStepMeters)
+                {
+                    PointF p1 = WorldToScreen3D(gx, bottomWorld, 0, w, h);
+                    PointF p2 = WorldToScreen3D(gx, topWorld, 0, w, h);
+                    g.DrawLine(gridPen, p1, p2);
+                }
+                for (double gy = startY; gy <= topWorld; gy += gridStepMeters)
+                {
+                    PointF p1 = WorldToScreen3D(leftWorld, gy, 0, w, h);
+                    PointF p2 = WorldToScreen3D(rightWorld, gy, 0, w, h);
+                    g.DrawLine(gridPen, p1, p2);
+                }
+                string hint = is3DMode
+                    ? string.Format("3D-РЕЖИМ (Yaw {0:F0}° / Pitch {1:F0}°) | ПКМ — вращение, ЛКМ — сдвиг | {2}", camYawDeg, camPitchDeg, session != null ? (session.MapTitle ?? "") : "")
+                    : string.Format("Сетка: {0:F0} км | Колесо — зум, ЛКМ — сдвиг | {1}", gridStepMeters / 1000.0, session != null ? (session.MapTitle ?? "") : "");
+                g.DrawString(hint, this.Font, scaleBrush, 10, h - 22);
+            }
+            if (session == null) return;
+        if (!session.HasFullRadarCoords && !session.HasExactTelemetry)
+        {
+            string msg = "3D-КООРДИНАТЫ В ЭТОМ ФАЙЛЕ ОТСУТСТВУЮТ (ИМПОРТ ИЗ PLAYER.LOG)\n\n" +
+                         "В текстовом логе игры нет координат юнитов (X, Y, Z).\n" +
+                         "• Справа доступен полный разбор событий, пусков, RWR и ошибок пилота.\n" +
+                         "• Для отображения 2D-карты загрузите файл Tacview (.acmi) или сохранённый в игре повтор (.vtr).";
+            using (SolidBrush warnBr = new SolidBrush(Color.FromArgb(200, 255, 210, 90)))
+                g.DrawString(msg, new Font("Consolas", 10.5f, FontStyle.Bold), warnBr, 36, h * 0.42f);
+            return;
+        }
+        // Плавное инерционное размещение тактических HUD-плашек без рывков + плавное затухание (alpha)
+        List<RectangleF> occupiedRects = new List<RectangleF>();
+        Action<string, string, Font, Color, Color, float, float, bool, float> drawSmartBadge = (key, text, fnt, fgCol, borderCol, anchorX, anchorY, drawLeader, alphaFactor) =>
+        {
+            int aText = Math.Max(0, Math.Min(255, (int)(255 * alphaFactor)));
+            int aBg = Math.Max(0, Math.Min(255, (int)(195 * alphaFactor)));
+            int aBox = Math.Max(0, Math.Min(255, (int)(120 * alphaFactor)));
+            if (aText < 12) return;
+
+            SizeF sz = g.MeasureString(text, fnt);
+            float padX = 5f, padY = 2f;
+            float bw = sz.Width + padX * 2f;
+            float bh = sz.Height + padY * 2f;
+
+            // Компактные слоты вокруг объекта (справа, сверху, снизу, слева) — чтобы выносная линия всегда была короткой
+            float[] dxOffsets = new float[] { 14f, -bw * 0.5f, -bw * 0.5f, -bw - 14f, 14f, 14f, -bw - 14f, -bw - 14f };
+            float[] dyOffsets = new float[] { -bh * 0.5f, -bh - 14f, 14f, -bh * 0.5f, bh + 6f, -bh - 8f, bh + 6f, -bh - 8f };
+
+            float targetDx = 14f;
+            float targetDy = -bh * 0.5f;
+
+            // Сначала проверяем прошлое смещение объекта (гистерезис — не меняем слот, пока старый не занят!)
+            PointF prevOff;
+            bool hasPrev = smoothBadgeOffsets.TryGetValue(key, out prevOff);
+            bool prevValid = false;
+            if (hasPrev)
+            {
+                RectangleF prevRect = new RectangleF(anchorX + prevOff.X, anchorY + prevOff.Y, bw, bh);
+                if (prevRect.Left >= 4 && prevRect.Right <= w - 4 && prevRect.Top >= 4 && prevRect.Bottom <= h - 26)
+                {
+                    bool hit = false;
+                    for (int r = 0; r < occupiedRects.Count; r++)
+                    {
+                        RectangleF ex = occupiedRects[r];
+                        ex.Inflate(2f, 1f);
+                        if (prevRect.IntersectsWith(ex)) { hit = true; break; }
+                    }
+                    if (!hit)
+                    {
+                        targetDx = prevOff.X;
+                        targetDy = prevOff.Y;
+                        prevValid = true;
+                    }
+                }
+            }
+
+            if (!prevValid)
+            {
+                for (int c = 0; c < dxOffsets.Length; c++)
+                {
+                    RectangleF cand = new RectangleF(anchorX + dxOffsets[c], anchorY + dyOffsets[c], bw, bh);
+                    if (cand.Left < 4 || cand.Right > w - 4 || cand.Top < 4 || cand.Bottom > h - 26) continue;
+                    bool hit = false;
+                    for (int r = 0; r < occupiedRects.Count; r++)
+                    {
+                        RectangleF ex = occupiedRects[r];
+                        ex.Inflate(3f, 2f);
+                        if (cand.IntersectsWith(ex)) { hit = true; break; }
+                    }
+                    if (!hit)
+                    {
+                        targetDx = dxOffsets[c];
+                        targetDy = dyOffsets[c];
+                        break;
+                    }
+                }
+            }
+
+            // Плавная интерполяция смещения (Lerp) против резких скачков
+            float curDx = targetDx;
+            float curDy = targetDy;
+            if (hasPrev)
+            {
+                curDx = prevOff.X + (targetDx - prevOff.X) * 0.25f;
+                curDy = prevOff.Y + (targetDy - prevOff.Y) * 0.25f;
+            }
+            smoothBadgeOffsets[key] = new PointF(curDx, curDy);
+
+            RectangleF chosen = new RectangleF(anchorX + curDx, anchorY + curDy, bw, bh);
+            occupiedRects.Add(chosen);
+
+            float distFromAnchor = Math.Abs((chosen.Left + chosen.Width * 0.5f) - anchorX) + Math.Abs((chosen.Top + chosen.Height * 0.5f) - anchorY);
+            if (drawLeader || distFromAnchor > bw * 0.65f + 24f)
+            {
+                float targetX = chosen.Left > anchorX ? chosen.Left : chosen.Right;
+                float targetY = chosen.Top + chosen.Height * 0.5f;
+                using (Pen leadPen = new Pen(Color.FromArgb((int)(145 * alphaFactor), borderCol), 1.0f))
+                    g.DrawLine(leadPen, anchorX, anchorY, targetX, targetY);
+            }
+
+            bool isWeaponTag = key.StartsWith("msl_");
+            if (isWeaponTag)
+            {
+                // Компактный лёгкий бейдж для вооружения (без рамки и акцентной полосы)
+                using (SolidBrush wBg = new SolidBrush(Color.FromArgb((int)(145 * alphaFactor), 8, 12, 11)))
+                    g.FillRectangle(wBg, chosen.X + 1f, chosen.Y + 1f, chosen.Width - 2f, chosen.Height - 2f);
+                using (SolidBrush txtBr = new SolidBrush(Color.FromArgb((int)(230 * alphaFactor), fgCol)))
+                    g.DrawString(text, fnt, txtBr, chosen.X + padX, chosen.Y + padY);
             }
             else
             {
-                PointF nose = new PointF(pos.X + dx * 11, pos.Y + dy * 11);
-                PointF leftWing = new PointF(pos.X - dx * 7 - dy * 7, pos.Y - dy * 7 + dx * 7);
-                PointF rightWing = new PointF(pos.X - dx * 7 + dy * 7, pos.Y - dy * 7 - dx * 7);
-                using (SolidBrush acBr = new SolidBrush(col))
-                    g.FillPolygon(acBr, new PointF[] { nose, leftWing, rightWing });
-                // Вектор скорости
-                using (Pen vecPen = new Pen(col, 1.5f))
-                    g.DrawLine(vecPen, pos.X, pos.Y, pos.X + dx * 22, pos.Y + dy * 22);
-                string label = string.Format("{0}\n{1:F0}m | {2:F0}km/h",
-                !string.IsNullOrEmpty(ent.Pilot) ? ent.Pilot : ent.Name, cur.Alt, cur.Speed * 3.6);
-                using (SolidBrush txtBr = new SolidBrush(col))
-                    g.DrawString(label, new Font("Consolas", 8f, FontStyle.Bold), txtBr, pos.X + 12, pos.Y - 10);
+                // Полная тактическая карточка для самолётов, ЗРК, кораблей и боевых событий
+                using (SolidBrush bgBr = new SolidBrush(Color.FromArgb(aBg, 11, 16, 15)))
+                    g.FillRectangle(bgBr, chosen);
+                using (Pen boxPen = new Pen(Color.FromArgb(aBox, borderCol), 1.0f))
+                    g.DrawRectangle(boxPen, chosen.X, chosen.Y, chosen.Width, chosen.Height);
+                using (SolidBrush accentBr = new SolidBrush(Color.FromArgb(aText, borderCol)))
+                    g.FillRectangle(accentBr, chosen.X, chosen.Y, 2.5f, chosen.Height);
+                using (SolidBrush txtBr = new SolidBrush(Color.FromArgb(aText, fgCol)))
+                    g.DrawString(text, fnt, txtBr, chosen.X + padX, chosen.Y + padY);
             }
-        }
-        // 3. Маркеры тактических ошибок прямо на карте
-        foreach (TacticalEvent err in session.Mistakes)
+        };
+
+        // 1.5 Базы, авианосцы, зоны ПВО и Bullseye
+        using (Font poiFont = new Font("Consolas", 7.5f, FontStyle.Bold))
         {
-            if (Math.Abs(err.Time - currentTime) <= 12.0 && (Math.Abs(err.WorldX) > 1.0 || Math.Abs(err.WorldY) > 1.0))
+            int poiIdx = 0;
+            foreach (MapPoiMarker poi in session.MapMarkers)
             {
-                PointF ep = WorldToScreen(err.WorldX, err.WorldY, w, h);
-                Color ec = err.Severity == "CRITICAL" ? Color.OrangeRed : Color.Gold;
-                using (Pen ringPen = new Pen(ec, 2f))
-                    g.DrawEllipse(ringPen, ep.X - 16, ep.Y - 16, 32, 32);
-                using (SolidBrush eBr = new SolidBrush(ec))
-                    g.DrawString("⚠ " + err.Title, new Font("Consolas", 8.5f, FontStyle.Bold), eBr, ep.X + 18, ep.Y - 8);
+                poiIdx++;
+                if (poi.RadiusMeters < 0 && currentTime > -poi.RadiusMeters) continue;
+                if (!showAllies && poi.Coalition == "Allies" && poi.Kind != "Base") continue;
+                    double poiZ = is3DMode ? session.GetGroundAltitudeAt(poi.X, poi.Y) : 0.0;
+                    PointF pt = WorldToScreen3D(poi.X, poi.Y, poiZ, w, h);
+                    if (poi.RadiusMeters > 100 && poi.Coalition == "Enemies")
+                    {
+                        using (Pen zPen = new Pen(Color.FromArgb(75, 255, 155, 35), 1.1f) { DashStyle = DashStyle.Dot })
+                        {
+                            if (!is3DMode)
+                            {
+                                float rPx = (float)(poi.RadiusMeters * pixelsPerMeter);
+                                g.DrawEllipse(zPen, pt.X - rPx, pt.Y - rPx, rPx * 2, rPx * 2);
+                            }
+                            else
+                            {
+                                PointF[] ringPts = new PointF[36];
+                                for (int k = 0; k < 36; k++)
+                                {
+                                    double ang = k * (Math.PI * 2.0 / 36.0);
+                                    double rx = poi.X + Math.Cos(ang) * poi.RadiusMeters;
+                                    double ry = poi.Y + Math.Sin(ang) * poi.RadiusMeters;
+                                    ringPts[k] = WorldToScreen3D(rx, ry, poiZ, w, h);
+                                }
+                                g.DrawPolygon(zPen, ringPts);
+                            }
+                        }
+                    }
+
+                    if (pt.X < -60 || pt.X > w + 60 || pt.Y < -60 || pt.Y > h + 60) continue;
+
+                if (poi.Kind == "Bullseye")
+                {
+                    using (Pen bPen = new Pen(Color.FromArgb(165, 255, 215, 0), 1.4f))
+                    {
+                        g.DrawEllipse(bPen, pt.X - 8, pt.Y - 8, 16, 16);
+                        g.DrawLine(bPen, pt.X - 12, pt.Y, pt.X + 12, pt.Y);
+                        g.DrawLine(bPen, pt.X, pt.Y - 12, pt.X, pt.Y + 12);
+                    }
+                    drawSmartBadge("poi_" + poiIdx, poi.Label, poiFont, Color.Gold, Color.Gold, pt.X, pt.Y, false, 1.0f);
+                }
+                else if (poi.Kind == "SAM")
+                {
+                    Color sc = poi.Coalition == "Enemies" ? Color.FromArgb(255, 155, 35) : Color.DeepSkyBlue;
+                    using (Pen sPen = new Pen(sc, 1.5f))
+                        g.DrawPolygon(sPen, new PointF[] { new PointF(pt.X, pt.Y - 6), new PointF(pt.X - 6, pt.Y + 5), new PointF(pt.X + 6, pt.Y + 5) });
+                    if (pixelsPerMeter > 0.015)
+                        drawSmartBadge("poi_" + poiIdx, poi.Label, poiFont, Color.FromArgb(220, sc), sc, pt.X, pt.Y, false, 1.0f);
+                }
             }
         }
+
+        // 1.8 Анимированные лучи радаров, захватов АРЛ-ракет с индикатором дистанции (km) и подлётного времени (TTI)
+        float pulse01 = (float)(0.5 + 0.5 * Math.Sin(currentTime * 6.5));
+            Dictionary<string, string> jammedTargets = new Dictionary<string, string>(); // EntityId -> Режим (DRFM / SAS)
+            if (showBeams)
+            {
+                using (Font beamTagFont = new Font("Consolas", 6.6f, FontStyle.Bold))
+                {
+                    Dictionary<string, DebriefSample> liveById = new Dictionary<string, DebriefSample>();
+                    foreach (DebriefEntity ent in session.Entities)
+                    {
+                        DebriefSample st = ent.GetStateAt(currentTime);
+                        if (st != null) liveById[ent.Id] = st;
+                    }
+
+                    foreach (TacticalBeam bm in session.Beams)
+                    {
+                        if (currentTime < bm.StartTime || currentTime > bm.EndTime) continue;
+
+                        double fx = bm.FromX, fy = bm.FromY;
+                        double tx = bm.ToX, ty = bm.ToY;
+
+                        DebriefSample sFrom = null, sTo = null;
+                        if (!string.IsNullOrEmpty(bm.FromId) && liveById.TryGetValue(bm.FromId, out sFrom))
+                        {
+                            fx = sFrom.X;
+                            fy = sFrom.Y;
+                        }
+                        if (bm.Kind == "JAMMER")
+                        {
+                            foreach (TacticalEvent ev in session.Events)
+                            {
+                                if (ev.Kind != "JAMMER") continue;
+                                double evAge = currentTime - ev.Time;
+                                string evId = ev.Time.ToString("F1") + "_" + ev.Title;
+                                if (isPlaying && evAge >= 0.0 && evAge <= 0.6 && !triggeredJamEvents.Contains(evId))
+                                {
+                                    triggeredJamEvents.Add(evId);
+                                    lastJamSurgeTime = currentTime;
+                                    lastJamBannerActor = ev.Title;
+                                }
+                            }
+                            double horizLen = Math.Sqrt(bm.DirX * bm.DirX + bm.DirY * bm.DirY);
+                            double ux2d = horizLen > 1e-4 ? (bm.DirX / horizLen) : 0.0;
+                            double uy2d = horizLen > 1e-4 ? (bm.DirY / horizLen) : 0.0;
+
+                            // Обрезаем луч по границам карты, а для DRFM/SAS — останавливаем на подавляемой цели по оси луча
+                            double maxRay = 95000.0;
+                            if (session.MapSizeMeters > 100.0)
+                            {
+                                double minX = session.MapMinX;
+                                double maxX = session.MapMinX + session.MapSizeMeters;
+                                double minY = session.MapMinY;
+                                double maxY = session.MapMinY + session.MapSizeMeters;
+
+                                if (Math.Abs(ux2d) > 1e-5)
+                                {
+                                    double tX = ux2d > 0 ? (maxX - fx) / ux2d : (minX - fx) / ux2d;
+                                    if (tX > 0 && tX < maxRay) maxRay = tX;
+                                }
+                                if (Math.Abs(uy2d) > 1e-5)
+                                {
+                                    double tY = uy2d > 0 ? (maxY - fy) / uy2d : (minY - fy) / uy2d;
+                                    if (tY > 0 && tY < maxRay) maxRay = tY;
+                                }
+                            }
+
+                            string jMode = bm.ToName ?? "";
+                            bool clipOnTarget = jMode.IndexOf("DRFM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                jMode.IndexOf("SAS", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                            string srcCoalition = "Allies";
+                            foreach (DebriefEntity se in session.Entities)
+                                if (se.Id == bm.FromId) { srcCoalition = se.Coalition; break; }
+
+                            Func<DebriefEntity, bool> hasRadarSystem = (ent) =>
+                            {
+                                if (ent.Type == "Air") return true;
+                                if (ent.Type != "Ground") return false;
+                                string nm = ent.Name ?? "";
+                                if (nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("Infantry", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    return false;
+                                return ent.RoleTag == "SAM" ||
+                                       nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0;
+                            };
+
+                            double hitTargetAlt = double.NaN;
+                            if (clipOnTarget)
+                            {
+                                string hitEntityId = "";
+                                foreach (DebriefEntity cand in session.Entities)
+                                {
+                                    if (cand.Id == bm.FromId || cand.Coalition == srcCoalition || !hasRadarSystem(cand)) continue;
+                                    DebriefSample cs;
+                                    if (!liveById.TryGetValue(cand.Id, out cs)) continue;
+
+                                    double dx = cs.X - fx;
+                                    double dy = cs.Y - fy;
+                                    double proj = dx * ux2d + dy * uy2d;
+                                    if (proj <= 500.0 || proj >= maxRay) continue;
+
+                                    double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
+                                    double hitRadius = Math.Max(1800.0, proj * 0.06);
+                                    if (perp <= hitRadius)
+                                    {
+                                        maxRay = proj;
+                                        hitEntityId = cand.Id;
+                                        hitTargetAlt = cs.Alt;
+                                    }
+                                }
+                                if (!string.IsNullOrEmpty(hitEntityId))
+                                    jammedTargets[hitEntityId] = jMode.ToUpperInvariant();
+                            }
+                            else
+                            {
+                                double tanHalfSector = Math.Tan(5.0 * Math.PI / 180.0);
+                                foreach (DebriefEntity cand in session.Entities)
+                                {
+                                    if (cand.Id == bm.FromId || cand.Coalition == srcCoalition || !hasRadarSystem(cand)) continue;
+                                    DebriefSample cs;
+                                    if (!liveById.TryGetValue(cand.Id, out cs)) continue;
+
+                                    double dx = cs.X - fx;
+                                    double dy = cs.Y - fy;
+                                    double proj = dx * ux2d + dy * uy2d;
+                                    if (proj <= 500.0 || proj >= maxRay) continue;
+
+                                    double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
+                                    double sectorHalfW = Math.Max(1800.0, proj * tanHalfSector);
+                                    if (perp <= sectorHalfW && !jammedTargets.ContainsKey(cand.Id))
+                                        jammedTargets[cand.Id] = jMode.ToUpperInvariant();
+                                }
+                            }
+
+                            tx = fx + ux2d * maxRay;
+                            ty = fy + uy2d * maxRay;
+                        }
+                        else if (!string.IsNullOrEmpty(bm.ToId) && liveById.TryGetValue(bm.ToId, out sTo))
+                        {
+                            tx = sTo.X;
+                            ty = sTo.Y;
+                        }
+
+                        double fz = sFrom != null ? sFrom.Alt : session.GetGroundAltitudeAt(fx, fy);
+                        double tz = fz;
+                        if (bm.Kind == "JAMMER")
+                        {
+                            double horizLen = Math.Sqrt(bm.DirX * bm.DirX + bm.DirY * bm.DirY);
+                            double rayDist2d = Math.Sqrt(Math.Pow(tx - fx, 2) + Math.Pow(ty - fy, 2));
+                            double ray3dLen = horizLen > 0.05 ? (rayDist2d / horizLen) : rayDist2d;
+                            tz = Math.Max(session.GetGroundAltitudeAt(tx, ty), fz + bm.DirZ * ray3dLen);
+                        }
+                        else if (!string.IsNullOrEmpty(bm.ToId) && sTo != null)
+                        {
+                            tz = sTo.Alt;
+                        }
+                        
+                        PointF p1 = WorldToScreen3D(fx, fy, fz, w, h);
+                        PointF p2 = WorldToScreen3D(tx, ty, tz, w, h);
+
+                        Color tagColor = Color.Empty;
+                        if (bm.Kind == "RWR_SPIKE")
+                        {
+                            using (Pen rwrPen = new Pen(Color.FromArgb(215, 255, 50, 50), 1.7f) { DashStyle = DashStyle.Custom, DashPattern = new float[] { 6f, 4f }, DashOffset = beamDashPhase })
+                                g.DrawLine(rwrPen, p1, p2);
+                            float ringR = 14f + pulse01 * 9f;
+                            int ringAlpha = (int)(220 - pulse01 * 90);
+                            using (Pen ringPen = new Pen(Color.FromArgb(ringAlpha, 255, 50, 50), 2f))
+                                g.DrawEllipse(ringPen, p2.X - ringR, p2.Y - ringR, ringR * 2f, ringR * 2f);
+                            tagColor = Color.FromArgb(255, 85, 85);
+                        }
+                        else if (bm.Kind == "MY_LOCK" || bm.Kind == "PLAYER_LOCK")
+                        {
+                            using (Pen lockPen = new Pen(Color.FromArgb(220, 55, 255, 85), 1.9f) { DashStyle = DashStyle.Custom, DashPattern = new float[] { 8f, 3f }, DashOffset = beamDashPhase })
+                                g.DrawLine(lockPen, p1, p2);
+                            tagColor = Color.FromArgb(75, 255, 105);
+                        }
+                        else if (bm.Kind == "ALLY_LOCK")
+                        {
+                            using (Pen allyPen = new Pen(Color.FromArgb(205, 0, 215, 255), 1.7f) { DashStyle = DashStyle.Custom, DashPattern = new float[] { 8f, 3f }, DashOffset = beamDashPhase })
+                                g.DrawLine(allyPen, p1, p2);
+                            tagColor = Color.FromArgb(40, 220, 255);
+                        }
+                        else if (bm.Kind == "JAMMER")
+                        {
+                            float vx = p2.X - p1.X;
+                            float vy = p2.Y - p1.Y;
+                            float screenLen = (float)Math.Sqrt(vx * vx + vy * vy);
+                            if (screenLen > 10f)
+                            {
+                                float ux = vx / screenLen;
+                                float uy = vy / screenLen;
+                                float px = -uy;
+                                float py = ux;
+
+                                string jamModeName = bm.ToName ?? "";
+                                bool isDrfm = jamModeName.IndexOf("DRFM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                              jamModeName.IndexOf("SAS", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                                if (isDrfm)
+                                {
+                                    using (Pen glowPen = new Pen(Color.FromArgb(55, 215, 100, 255), 5.0f))
+                                        g.DrawLine(glowPen, p1, p2);
+                                    using (Pen corePen = new Pen(Color.FromArgb(230, 225, 130, 255), 1.8f) { DashStyle = DashStyle.Custom, DashPattern = new float[] { 10f, 4f, 2f, 4f }, DashOffset = beamDashPhase })
+                                        g.DrawLine(corePen, p1, p2);
+                                }
+                                else
+                                {
+                                    float halfAngleRad = 5.0f * (float)Math.PI / 180f;
+                                    float tanHalf = (float)Math.Tan(halfAngleRad);
+                                    float endHalfW = screenLen * tanHalf;
+
+                                    using (Pen edgePen = new Pen(Color.FromArgb(75, 200, 110, 255), 1.0f))
+                                    {
+                                        g.DrawLine(edgePen, p1.X, p1.Y, p2.X + px * endHalfW, p2.Y + py * endHalfW);
+                                        g.DrawLine(edgePen, p1.X, p1.Y, p2.X - px * endHalfW, p2.Y - py * endHalfW);
+                                    }
+
+                                    // Плавная, не мельтешащая скорость обновления засветков (4.5 Гц)
+                                    int tick = (int)(currentTime * 4.5);
+                                    int barsCount = Math.Min(36, Math.Max(10, (int)(screenLen / 22f)));
+                                    for (int i = 0; i < barsCount; i++)
+                                    {
+                                        int hash = ((i * 73856093) ^ (tick * 19349663)) & 0x7FFFFFFF;
+                                        float dist = 20f + ((hash % 1000) / 1000.0f) * (screenLen - 24f);
+                                        float latNorm = (((hash / 1000) % 200) - 100) / 100.0f;
+                                        float latOffset = latNorm * (dist * tanHalf * 0.85f);
+
+                                        float bx = p1.X + ux * dist + px * latOffset;
+                                        float by = p1.Y + uy * dist + py * latOffset;
+                                        int alpha = 90 + ((hash / 200000) % 130);
+                                        float barHalfW = Math.Max(3.0f, Math.Min(8.0f, dist * tanHalf * 0.35f));
+
+                                        PointF[] bar = new PointF[]
+                                        {
+                                            new PointF(bx - px * barHalfW - ux * 1.8f, by - py * barHalfW - uy * 1.8f),
+                                            new PointF(bx + px * barHalfW - ux * 1.8f, by + py * barHalfW - uy * 1.8f),
+                                            new PointF(bx + px * barHalfW + ux * 1.8f, by + py * barHalfW + uy * 1.8f),
+                                            new PointF(bx - px * barHalfW + ux * 1.8f, by - py * barHalfW + uy * 1.8f)
+                                        };
+                                        using (SolidBrush br = new SolidBrush(Color.FromArgb(alpha, 210, 115, 255)))
+                                            g.FillPolygon(br, bar);
+                                    }
+                                }
+                            }
+                        }
+                        else if (bm.Kind == "AWACS_LINK")
+                        {
+                            using (Pen awPen = new Pen(Color.FromArgb(115, 175, 130, 255), 1.1f) { DashStyle = DashStyle.Dot })
+                                g.DrawLine(awPen, p1, p2);
+                        }
+                        else
+                        {
+                            using (Pen scPen = new Pen(Color.FromArgb(100, 0, 255, 140), 1.1f) { DashStyle = DashStyle.Dot })
+                                g.DrawLine(scPen, p1, p2);
+                        }
+
+                        // На лучах ракет ([АРЛ]) рисуем компактный индикатор дистанции (km) и подлётного времени (TTI)
+                        if (!tagColor.IsEmpty && bm.FromName.StartsWith("[АРЛ]") && pixelsPerMeter > 0.005)
+                        {
+                            double distMeters = Math.Sqrt(Math.Pow(tx - fx, 2) + Math.Pow(ty - fy, 2));
+                            double distKm = distMeters / 1000.0;
+                        int ttiSec = Math.Max(1, (int)Math.Round(distMeters / 850.0)); // Оценка времени подлёта при средней скорости сближения ~850 м/с
+
+                        float mx = (p1.X + p2.X) * 0.5f;
+                        float my = (p1.Y + p2.Y) * 0.5f;
+                        if (mx >= 10 && mx <= w - 10 && my >= 10 && my <= h - 25)
+                        {
+                            string ttiLabel = string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0:F1}km · {1}s", distKm, ttiSec);
+                            SizeF tSz = g.MeasureString(ttiLabel, beamTagFont);
+                            RectangleF tRect = new RectangleF(mx - tSz.Width * 0.5f - 3f, my - tSz.Height * 0.5f - 1f, tSz.Width + 6f, tSz.Height + 2f);
+
+                            using (SolidBrush tBg = new SolidBrush(Color.FromArgb(185, 10, 15, 14)))
+                                g.FillRectangle(tBg, tRect);
+                            using (Pen tPen = new Pen(Color.FromArgb(110, tagColor), 1f))
+                                g.DrawRectangle(tPen, tRect.X, tRect.Y, tRect.Width, tRect.Height);
+                            using (SolidBrush tFg = new SolidBrush(tagColor))
+                                g.DrawString(ttiLabel, beamTagFont, tFg, tRect.X + 3f, tRect.Y + 1f);
+                        }
+                    }
+                }
+            }
+        }
+
+
+            // 2. Отрисовка траекторий, иконок, реального сектора БРЛС и одиночных непересекающихся плашек
+            using (Font acFont = new Font("Consolas", 7.8f, FontStyle.Bold))
+            using (Font wpnFont = new Font("Consolas", 6.8f, FontStyle.Italic))
+            using (Font wpnBoldFont = new Font("Consolas", 6.8f, FontStyle.Bold | FontStyle.Italic))
+            using (Font jamTagFont = new Font("Consolas", 6.8f, FontStyle.Bold))
+            {
+                Action<PointF, string> drawJamBadge = (pt, mode) =>
+                {
+                    float pulse = (float)(0.5 + 0.5 * Math.Sin(currentTime * 10.0));
+                    int alpha = 185 + (int)(65 * pulse);
+                    float ringR = 12f + pulse * 3f;
+
+                    using (Pen ringPen = new Pen(Color.FromArgb(alpha, 210, 110, 255), 1.3f) { DashStyle = DashStyle.Dot })
+                        g.DrawEllipse(ringPen, pt.X - ringR, pt.Y - ringR, ringR * 2f, ringR * 2f);
+
+                    string txt = "⚡ JAMMED (" + mode + ")";
+                    SizeF sz = g.MeasureString(txt, jamTagFont);
+                    float bx = pt.X - sz.Width * 0.5f;
+                    float by = pt.Y - 26f;
+                    using (SolidBrush bg = new SolidBrush(Color.FromArgb(195, 22, 10, 36)))
+                        g.FillRectangle(bg, bx - 4f, by - 1f, sz.Width + 8f, sz.Height + 2f);
+                    using (SolidBrush bar = new SolidBrush(Color.FromArgb(alpha, 215, 115, 255)))
+                        g.FillRectangle(bar, bx - 4f, by - 1f, 2.5f, sz.Height + 2f);
+                    using (Pen bd = new Pen(Color.FromArgb(alpha / 2, 215, 115, 255), 1f))
+                        g.DrawRectangle(bd, bx - 4f, by - 1f, sz.Width + 8f, sz.Height + 2f);
+                    using (SolidBrush fg = new SolidBrush(Color.FromArgb(alpha, 238, 180, 255)))
+                        g.DrawString(txt, jamTagFont, fg, bx, by);
+                };
+
+                foreach (DebriefEntity ent in session.Entities)
+                {
+                    if (!showAllies && !ent.IsPlayer && ent.Coalition == "Allies") continue;
+                DebriefSample cur = ent.GetStateAt(currentTime);
+                if (cur == null) continue;
+                bool isMyMissile = (ent.Type == "Missile" && ent.Pilot != null && ent.Pilot.StartsWith("MY_MISSILE:"));
+                Color col = ent.IsPlayer || isMyMissile
+                    ? Color.FromArgb(55, 255, 85)
+                    : (ent.Type == "Missile"
+                        ? (ent.Coalition == "Enemies" ? Color.FromArgb(255, 175, 50) : Color.FromArgb(0, 215, 255))
+                        : (ent.Coalition == "Enemies" ? Color.FromArgb(255, 155, 35) : Color.DeepSkyBlue));
+
+                if (ent.Type == "Ground")
+                {
+                        PointF gp = WorldToScreen3D(cur.X, cur.Y, cur.Alt, w, h);
+                        if (gp.X >= -30 && gp.X <= w + 30 && gp.Y >= -30 && gp.Y <= h + 30)
+                    {
+                        string uName = ent.Name ?? "";
+                        bool isRadar = uName.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       uName.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool isSam = !isRadar && (ent.RoleTag == "SAM" ||
+                                     uName.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     uName.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     uName.IndexOf("SLAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     uName.IndexOf("SRAD", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     uName.IndexOf("CIWS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     uName.IndexOf("Anti-Air", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     uName.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0);
+                        bool isShip = uName.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      uName.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      uName.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      uName.IndexOf("Boat", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool isArmor = uName.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       uName.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       uName.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       uName.IndexOf("Truck", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                        using (SolidBrush bgFill = new SolidBrush(Color.FromArgb(180, 12, 18, 16)))
+                        using (SolidBrush mainBr = new SolidBrush(col))
+                        using (Pen mainPen = new Pen(col, 1.5f))
+                        {
+                            if (isShip)
+                            {
+                                PointF[] hull = new PointF[]
+                                {
+                                    new PointF(gp.X - 8f, gp.Y - 1f),
+                                    new PointF(gp.X + 8f, gp.Y - 1f),
+                                    new PointF(gp.X + 5f, gp.Y + 4f),
+                                    new PointF(gp.X - 5f, gp.Y + 4f)
+                                };
+                                g.FillPolygon(bgFill, hull);
+                                g.DrawPolygon(mainPen, hull);
+                                g.FillRectangle(mainBr, gp.X - 2.5f, gp.Y - 4.5f, 5f, 3.5f);
+                            }
+                            else if (isRadar)
+                            {
+                                g.DrawArc(mainPen, gp.X - 6f, gp.Y - 6f, 12f, 12f, 200f, 140f);
+                                g.DrawArc(mainPen, gp.X - 9f, gp.Y - 9f, 18f, 18f, 215f, 110f);
+                                g.FillEllipse(mainBr, gp.X - 2.5f, gp.Y - 1f, 5f, 5f);
+                            }
+                            else if (isSam)
+                            {
+                                PointF[] tri = new PointF[]
+                                {
+                                    new PointF(gp.X, gp.Y - 7f),
+                                    new PointF(gp.X - 6.5f, gp.Y + 5f),
+                                    new PointF(gp.X + 6.5f, gp.Y + 5f)
+                                };
+                                g.FillPolygon(bgFill, tri);
+                                g.DrawPolygon(mainPen, tri);
+                                g.DrawLine(mainPen, gp.X, gp.Y - 4f, gp.X, gp.Y + 3f);
+                            }
+                            else if (isArmor)
+                            {
+                                g.FillRectangle(bgFill, gp.X - 6f, gp.Y - 4f, 12f, 8f);
+                                g.DrawRectangle(mainPen, gp.X - 6f, gp.Y - 4f, 12f, 8f);
+                                g.DrawEllipse(mainPen, gp.X - 3f, gp.Y - 2f, 6f, 4f);
+                            }
+                            else
+                            {
+                                PointF[] dia = new PointF[]
+                                {
+                                    new PointF(gp.X, gp.Y - 5.5f),
+                                    new PointF(gp.X + 5.5f, gp.Y),
+                                    new PointF(gp.X, gp.Y + 5.5f),
+                                    new PointF(gp.X - 5.5f, gp.Y)
+                                };
+                                g.FillPolygon(bgFill, dia);
+                                g.DrawPolygon(mainPen, dia);
+                            }
+                        }
+                            string jModeTag;
+                            if (jammedTargets.TryGetValue(ent.Id, out jModeTag))
+                                drawJamBadge(gp, jModeTag);
+
+                            if (pixelsPerMeter > 0.012 && !isSam)
+                        {
+                            using (Font gFont = new Font("Consolas", 7f, FontStyle.Regular))
+                                drawSmartBadge(ent.Id, uName, gFont, Color.FromArgb(220, col), col, gp.X, gp.Y, false, 0.9f);
+                        }
+                    }
+                    continue;
+                }
+
+                bool isSelectedUnit = (!string.IsNullOrEmpty(followEntityId) && ent.Id == followEntityId) ||
+                      (string.IsNullOrEmpty(followEntityId) && ent.IsPlayer);
+                List<PointF> trail = new List<PointF>();
+                List<PointF> hotTrail = new List<PointF>();
+                double minTrailT = (isSelectedUnit || ent.IsPlayer || isMyMissile) ? ent.FirstTime : Math.Max(ent.FirstTime, currentTime - 65.0);
+                double hotWindow = ent.Type == "Missile" ? 4.0 : (isSelectedUnit ? 22.0 : 14.0);
+
+
+                    for (int i = 0; i < ent.Track.Count; i++)
+                    {
+                        DebriefSample s = ent.Track[i];
+                        if (s.Time < minTrailT) continue;
+                        if (s.Time > currentTime) break;
+                        PointF pt = WorldToScreen3D(s.X, s.Y, s.Alt, w, h);
+                        trail.Add(pt);
+                        if (currentTime - s.Time <= hotWindow)
+                            hotTrail.Add(pt);
+                    }
+                    PointF curPt = WorldToScreen3D(cur.X, cur.Y, cur.Alt, w, h);
+
+
+                    trail.Add(curPt);
+                hotTrail.Add(curPt);
+
+                if (trail.Count >= 2)
+                {
+                    using (Pen trailPen = new Pen(Color.FromArgb(ent.Type == "Missile" ? 95 : 110, col), ent.Type == "Missile" ? 1.2f : 1.7f))
+                    {
+                        if (ent.Type == "Missile") trailPen.DashStyle = DashStyle.Dash;
+                        g.DrawLines(trailPen, trail.ToArray());
+                    }
+                }
+                if (hotTrail.Count >= 2)
+                {
+                    using (Pen hotPen = new Pen(Color.FromArgb(225, col), ent.Type == "Missile" ? 1.9f : 2.5f))
+                        g.DrawLines(hotPen, hotTrail.ToArray());
+                }
+            }
+
+            for (int pass = 0; pass < 2; pass++)
+            {
+                foreach (DebriefEntity ent in session.Entities)
+                {
+                    if (ent.Type == "Ground") continue;
+                    if (pass == 0 && ent.Type == "Missile") continue;
+                    if (pass == 1 && ent.Type != "Missile") continue;
+                    if (!showAllies && !ent.IsPlayer && ent.Coalition == "Allies") continue;
+
+                        DebriefSample cur = ent.GetStateAt(currentTime);
+                        if (cur == null) continue;
+                        PointF pos = WorldToScreen3D(cur.X, cur.Y, cur.Alt, w, h);
+                        if (pos.X < -40 || pos.X > w + 40 || pos.Y < -40 || pos.Y > h + 40) continue;
+
+                        if (is3DMode)
+                        {
+                            Color stemCol = (ent.IsPlayer || (ent.Type == "Missile" && ent.Pilot != null && ent.Pilot.StartsWith("MY_MISSILE:")))
+                                ? Color.FromArgb(55, 255, 85)
+                                : (ent.Coalition == "Enemies" ? Color.FromArgb(255, 155, 35) : Color.DeepSkyBlue);
+                            double groundZ = session.GetGroundAltitudeAt(cur.X, cur.Y);
+                            PointF gndPt = WorldToScreen3D(cur.X, cur.Y, groundZ, w, h);
+                            using (Pen dropPen = new Pen(Color.FromArgb(ent.Type == "Missile" ? 55 : 95, stemCol), 1.0f) { DashStyle = DashStyle.Dot })
+                                g.DrawLine(dropPen, pos, gndPt);
+                            using (SolidBrush dotBr = new SolidBrush(Color.FromArgb(130, stemCol)))
+                                g.FillEllipse(dotBr, gndPt.X - 2f, gndPt.Y - 2f, 4f, 4f);
+                        }
+
+                        bool isMyMissile = (ent.Type == "Missile" && ent.Pilot != null && ent.Pilot.StartsWith("MY_MISSILE:"));
+                    Color col = ent.IsPlayer || isMyMissile
+                        ? Color.FromArgb(55, 255, 85)
+                        : (ent.Type == "Missile"
+                            ? (ent.Coalition == "Enemies" ? Color.FromArgb(255, 175, 50) : Color.FromArgb(0, 215, 255))
+                            : (ent.Coalition == "Enemies" ? Color.FromArgb(255, 155, 35) : Color.DeepSkyBlue));
+
+                    if (ent.Type == "Missile")
+                    {
+                        using (SolidBrush glowBr = new SolidBrush(Color.FromArgb(80, col)))
+                            g.FillEllipse(glowBr, pos.X - 6.5f, pos.Y - 6.5f, 13f, 13f);
+                        using (SolidBrush mBr = new SolidBrush(col))
+                            g.FillEllipse(mBr, pos.X - 3.5f, pos.Y - 3.5f, 7f, 7f);
+                        double tLeft = ent.LastTime - currentTime;
+                        if (tLeft >= 0 && tLeft <= 2.5 && ent.LastTime < session.Duration - 1.5)
+                        {
+                            float rSize = 7f + (float)((2.5 - tLeft) * 3.0);
+                            using (Pen termPen = new Pen(Color.FromArgb(210, col), 1.4f))
+                            {
+                                g.DrawPolygon(termPen, new PointF[]
+                                {
+new PointF(pos.X, pos.Y - rSize),
+new PointF(pos.X + rSize, pos.Y),
+new PointF(pos.X, pos.Y + rSize),
+new PointF(pos.X - rSize, pos.Y)
+                                });
+                            }
+                        }
+                        drawSmartBadge("msl_" + ent.Id, ent.Name, isMyMissile ? wpnBoldFont : wpnFont, col, col, pos.X, pos.Y, false, 1.0f);
+                    }
+                    else
+                    {
+                        bool isSelectedUnit = (!string.IsNullOrEmpty(followEntityId) && ent.Id == followEntityId) ||
+                                              (string.IsNullOrEmpty(followEntityId) && ent.IsPlayer);
+
+                            double rad = cur.Heading * Math.PI / 180.0;
+                            float dx = (float)Math.Sin(rad);
+                            float dy = -(float)Math.Cos(rad);
+                            if (is3DMode)
+                            {
+                                double aheadX = cur.X + Math.Sin(rad) * 600.0;
+                                double aheadY = cur.Y + Math.Cos(rad) * 600.0;
+                                PointF pAhead = WorldToScreen3D(aheadX, aheadY, cur.Alt, w, h);
+                                float vx = pAhead.X - pos.X;
+                                float vy = pAhead.Y - pos.Y;
+                                float vLen = (float)Math.Sqrt(vx * vx + vy * vy);
+                                if (vLen > 0.5f)
+                                {
+                                    dx = vx / vLen;
+                                    dy = vy / vLen;
+                                }
+                            }
+
+
+                            if (isSelectedUnit)
+                        {
+                            // Строгая уголковая рамка фокуса выбранного борта (в стиле MFD / AWACS)
+                            Color selCol = Color.FromArgb(220, 245, 250, 248);
+                            float box = 16f;
+                            float arm = 5f;
+                            using (Pen selPen = new Pen(selCol, 1.4f))
+                            {
+                                g.DrawLine(selPen, pos.X - box, pos.Y - box, pos.X - box + arm, pos.Y - box);
+                                g.DrawLine(selPen, pos.X - box, pos.Y - box, pos.X - box, pos.Y - box + arm);
+
+                                g.DrawLine(selPen, pos.X + box, pos.Y - box, pos.X + box - arm, pos.Y - box);
+                                g.DrawLine(selPen, pos.X + box, pos.Y - box, pos.X + box, pos.Y - box + arm);
+
+                                g.DrawLine(selPen, pos.X - box, pos.Y + box, pos.X - box + arm, pos.Y + box);
+                                g.DrawLine(selPen, pos.X - box, pos.Y + box, pos.X - box, pos.Y + box - arm);
+
+                                g.DrawLine(selPen, pos.X + box, pos.Y + box, pos.X + box - arm, pos.Y + box);
+                                g.DrawLine(selPen, pos.X + box, pos.Y + box, pos.X + box, pos.Y + box - arm);
+                            }
+                        }
+
+                        PointF nose = new PointF(pos.X + dx * 12, pos.Y + dy * 12);
+                        PointF leftWing = new PointF(pos.X - dx * 7 - dy * 7, pos.Y - dy * 7 + dx * 7);
+                        PointF rightWing = new PointF(pos.X - dx * 7 + dy * 7, pos.Y - dy * 7 - dx * 7);
+                        using (SolidBrush acBr = new SolidBrush(col))
+                            g.FillPolygon(acBr, new PointF[] { nose, leftWing, rightWing });
+                        using (Pen vecPen = new Pen(col, 1.5f))
+                            g.DrawLine(vecPen, pos.X, pos.Y, pos.X + dx * 22, pos.Y + dy * 22);
+                            string jModeTag;
+                            if (jammedTargets.TryGetValue(ent.Id, out jModeTag))
+                                drawJamBadge(pos, jModeTag);
+
+                            string vsTag = "";
+                        DebriefSample prevS = ent.GetStateAt(Math.Max(ent.FirstTime, currentTime - 1.0));
+                        if (prevS != null && currentTime - prevS.Time > 0.2)
+                        {
+                            double vs = (cur.Alt - prevS.Alt) / (currentTime - prevS.Time);
+                            if (vs > 15.0) vsTag = " ▲";
+                            else if (vs < -15.0) vsTag = " ▼";
+                        }
+
+                        string unitTitle = !string.IsNullOrEmpty(ent.Pilot) && ent.Pilot != "AI Bandit" && ent.Pilot != ent.Name ? ent.Pilot : ent.Name;
+                        string label = string.Format("{0}\n{1:F0}m{2} · {3:F0}km/h", unitTitle, cur.Alt, vsTag, cur.Speed * 3.6);
+                        Color badgeBorder = isSelectedUnit ? Color.FromArgb(230, 245, 250, 248) : col;
+                        drawSmartBadge(ent.Id, label, acFont, col, badgeBorder, pos.X, pos.Y, false, 1.0f);
+                    }
+                }
+            }
+        }
+        // 4. Живой тактический HUD-виджет в левом верхнем углу планшета
+        int myActiveMsl = 0, allyActiveMsl = 0, enemyActiveMsl = 0;
+        DebriefEntity activeTracked = null;
+        DebriefSample activeTrackedSample = null;
+
+        foreach (DebriefEntity ent in session.Entities)
+        {
+            DebriefSample st = ent.GetStateAt(currentTime);
+            if (st == null) continue;
+            if (!string.IsNullOrEmpty(followEntityId) && ent.Id == followEntityId)
+            {
+                activeTracked = ent;
+                activeTrackedSample = st;
+            }
+            else if (string.IsNullOrEmpty(followEntityId) && ent.IsPlayer)
+            {
+                activeTracked = ent;
+                activeTrackedSample = st;
+            }
+
+            if (ent.Type == "Missile")
+            {
+                bool isMine = ent.Pilot != null && ent.Pilot.StartsWith("MY_MISSILE:");
+                if (isMine) myActiveMsl++;
+                else if (ent.Coalition == "Allies") allyActiveMsl++;
+                else enemyActiveMsl++;
+            }
+        }
+
+        int activeRwrLocks = 0;
+        if (activeTracked != null)
+        {
+            foreach (TacticalBeam bm in session.Beams)
+            {
+                if (currentTime >= bm.StartTime && currentTime <= bm.EndTime &&
+                    bm.Kind == "RWR_SPIKE" && bm.ToName.Equals(activeTracked.Name, StringComparison.OrdinalIgnoreCase))
+                    activeRwrLocks++;
+            }
+        }
+
+        using (Font hudTitleFont = new Font("Consolas", 8f, FontStyle.Bold))
+        using (Font hudBodyFont = new Font("Consolas", 7.8f, FontStyle.Regular))
+        {
+            float hx = 12f, hy = 12f, hw = 315f;
+            float hh = activeTrackedSample != null ? (activeRwrLocks > 0 ? 102f : 86f) : 52f;
+
+            using (SolidBrush hudBg = new SolidBrush(Color.FromArgb(195, 10, 16, 15)))
+                g.FillRectangle(hudBg, hx, hy, hw, hh);
+            Color hudBorder = activeRwrLocks > 0 ? Color.FromArgb(220, 255, 55, 55) : Color.FromArgb(110, 0, 255, 130);
+            using (Pen hudPen = new Pen(hudBorder, activeRwrLocks > 0 ? 1.4f : 1.0f))
+                g.DrawRectangle(hudPen, hx, hy, hw, hh);
+            using (SolidBrush sideBar = new SolidBrush(hudBorder))
+                g.FillRectangle(sideBar, hx, hy, 3f, hh);
+
+            float curY = hy + 7f;
+            if (activeRwrLocks > 0)
+            {
+                using (SolidBrush rwrBr = new SolidBrush(Color.FromArgb(255, 75, 75)))
+                    g.DrawString(string.Format("⚠ ЗАХВАТ БОРТА ПО RWR: {0} ИСТОЧН.", activeRwrLocks), hudTitleFont, rwrBr, hx + 10f, curY);
+                curY += 17f;
+            }
+
+            string mslSummary = string.Format("РАКЕТЫ В ВОЗДУХЕ: МОИ {0} · СОЮЗ {1} · ВРАГ {2}", myActiveMsl, allyActiveMsl, enemyActiveMsl);
+            using (SolidBrush hdrBr = new SolidBrush(Color.FromArgb(0, 255, 135)))
+                g.DrawString(mslSummary, hudTitleFont, hdrBr, hx + 10f, curY);
+            curY += 19f;
+
+            if (activeTrackedSample != null)
+            {
+                double mach = activeTrackedSample.Speed / 315.0;
+                string machStr = mach.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+                string roleTag = activeTracked.IsPlayer ? "[ВЫ]" : (activeTracked.Coalition == "Allies" ? "[СОЮЗ]" : "[ВРАГ]");
+                string line1 = string.Format("БОРТ {0}: {1}", roleTag, activeTracked.Name);
+                string line2 = string.Format("HDG {0:000}° · ALT {1:F0}m · {2:F0}km/h (M{3})",
+                    activeTrackedSample.Heading, activeTrackedSample.Alt, activeTrackedSample.Speed * 3.6, machStr);
+                using (SolidBrush b1 = new SolidBrush(Color.FromArgb(225, 240, 230)))
+                    g.DrawString(line1, hudBodyFont, b1, hx + 10f, curY);
+                using (SolidBrush b2 = new SolidBrush(Color.FromArgb(170, 235, 195)))
+                    g.DrawString(line2, hudBodyFont, b2, hx + 10f, curY + 17f);
+                using (SolidBrush b3 = new SolidBrush(Color.FromArgb(120, 180, 150)))
+                    g.DrawString("Клик по борту — выбрать | Пробел — пауза", hudBodyFont, b3, hx + 10f, curY + 35f);
+            }
+            else
+            {
+                using (SolidBrush bOff = new SolidBrush(Color.FromArgb(150, 175, 165)))
+                    g.DrawString("ВЫБРАННЫЙ БОРТ ВНЕ ВОЗДУХА", hudBodyFont, bOff, hx + 10f, curY);
+            }
+        }
+
+
+
+        // 3. Анимированные маркеры взрывов, сбитий и оповещения (с волной детонации и плавным затуханием)
+        using (Font evFont = new Font("Consolas", 8f, FontStyle.Bold))
+        {
+            int evIdx = 0;
+            foreach (TacticalEvent ev in session.Events)
+            {
+                evIdx++;
+                string evKey = "ev_" + evIdx + "_" + ev.Time.ToString("F1");
+                double age = currentTime - ev.Time;
+                if (ev.Kind == "GROUND_KILL" && currentTime > 1.5 && age >= 0.0 && age <= 5.0 && (Math.Abs(ev.WorldX) > 1.0 || Math.Abs(ev.WorldY) > 1.0))
+                {
+                    PointF gp = WorldToScreen(ev.WorldX, ev.WorldY, w, h);
+                    if (gp.X >= -40 && gp.X <= w + 40 && gp.Y >= -40 && gp.Y <= h + 40)
+                    {
+                        float fade = age > 3.8 ? (float)((5.0 - age) / 1.2) : 1.0f;
+                        if (age < 1.4)
+                        {
+                            float blastR = (float)(6.0 + age * 26.0);
+                            int blastAlpha = Math.Max(0, (int)(220 * (1.0 - age / 1.4)));
+                            using (Pen blastPen = new Pen(Color.FromArgb(blastAlpha, 255, 190, 60), 2.2f))
+                                g.DrawEllipse(blastPen, gp.X - blastR, gp.Y - blastR, blastR * 2f, blastR * 2f);
+                        }
+                        using (Pen kPen = new Pen(Color.FromArgb((int)(255 * fade), 55, 255, 85), 2.2f))
+                        {
+                            g.DrawLine(kPen, gp.X - 8, gp.Y - 8, gp.X + 8, gp.Y + 8);
+                            g.DrawLine(kPen, gp.X + 8, gp.Y - 8, gp.X - 8, gp.Y + 8);
+                        }
+                        drawSmartBadge(evKey, "💥 " + ev.Title, evFont, Color.FromArgb(55, 255, 85), Color.FromArgb(55, 255, 85), gp.X, gp.Y, true, fade);
+                    }
+                    continue;
+                }
+                if (currentTime > 1.5 && age >= 0.0 && age <= 5.0 && (Math.Abs(ev.WorldX) > 1.0 || Math.Abs(ev.WorldY) > 1.0))
+                {
+                    PointF ep = WorldToScreen(ev.WorldX, ev.WorldY, w, h);
+                    if (ep.X < -60 || ep.X > w + 60 || ep.Y < -60 || ep.Y > h + 60) continue;
+                    float fade = age > 3.8 ? (float)((5.0 - age) / 1.2) : 1.0f;
+                    if (ev.Kind == "KILL")
+                    {
+                        if (age < 1.5)
+                        {
+                            float blastR = (float)(8.0 + age * 28.0);
+                            int blastAlpha = Math.Max(0, (int)(230 * (1.0 - age / 1.5)));
+                            using (Pen blastPen = new Pen(Color.FromArgb(blastAlpha, 55, 255, 85), 2.2f))
+                                g.DrawEllipse(blastPen, ep.X - blastR, ep.Y - blastR, blastR * 2f, blastR * 2f);
+                        }
+                        using (Pen kPen = new Pen(Color.FromArgb((int)(255 * fade), 55, 255, 85), 2.2f))
+                        {
+                            g.DrawLine(kPen, ep.X - 8, ep.Y - 8, ep.X + 8, ep.Y + 8);
+                            g.DrawLine(kPen, ep.X + 8, ep.Y - 8, ep.X - 8, ep.Y + 8);
+                        }
+                        drawSmartBadge(evKey, "★ " + ev.Title, evFont, Color.FromArgb(55, 255, 85), Color.FromArgb(55, 255, 85), ep.X, ep.Y, true, fade);
+                    }
+                    else if (ev.Kind == "DAMAGE")
+                    {
+                        using (Pen dPen = new Pen(Color.FromArgb((int)(255 * fade), Color.Orange), 1.8f))
+                            g.DrawRectangle(dPen, ep.X - 8, ep.Y - 8, 16, 16);
+                        drawSmartBadge(evKey, "💥 " + ev.Title, evFont, Color.Orange, Color.Orange, ep.X, ep.Y, true, fade);
+                    }
+                    else if (ev.Kind == "MISTAKE" || ev.Kind == "KIA" || ev.Kind == "THREAT")
+                    {
+                        Color ec = ev.Severity == "CRITICAL" ? Color.FromArgb(255, 55, 55) : Color.Gold;
+                        float waveR = 12f + (float)((age % 1.0) * 18.0);
+                        int waveA = Math.Max(0, (int)(220 * (1.0 - (age % 1.0)) * fade));
+                            using (Pen ringPen = new Pen(Color.FromArgb(waveA, ec), 2f))
+                                g.DrawEllipse(ringPen, ep.X - waveR, ep.Y - waveR, waveR * 2f, waveR * 2f);
+                            drawSmartBadge(evKey, "⚠ " + ev.Title, evFont, ec, ec, ep.X, ep.Y, true, fade);
+                        }
+                    }
+                }
+            }
+            double surgeElapsed = currentTime - lastJamSurgeTime;
+            if (surgeElapsed >= 0.0 && surgeElapsed <= 0.75)
+            {
+                // Плавный синусоидальный импульс перепада напряжения (нарастает и мягко затухает без дёргания)
+                float wave = (float)Math.Sin((surgeElapsed / 0.75) * Math.PI);
+                using (SolidBrush tintBr = new SolidBrush(Color.FromArgb((int)(16 * wave), 185, 110, 255)))
+                    g.FillRectangle(tintBr, 0, 0, w, h);
+
+                // Мягкая виньетка по краям экрана и двойная неоновая рамка
+                int edgeAlpha = (int)(110 * wave);
+                using (Pen outerPen = new Pen(Color.FromArgb(edgeAlpha, 210, 120, 255), 3f))
+                    g.DrawRectangle(outerPen, 1.5f, 1.5f, w - 4f, h - 4f);
+                using (Pen innerPen = new Pen(Color.FromArgb(edgeAlpha / 2, 160, 90, 255), 8f))
+                    g.DrawRectangle(innerPen, 5f, 5f, w - 11f, h - 11f);
+            }
+
+            // Информационное оповещение «Внимание: электронная атака!» в верхней центральной части экрана (3.5 сек)
+            if (surgeElapsed >= 0.0 && surgeElapsed <= 3.5 && !string.IsNullOrEmpty(lastJamBannerActor))
+            {
+                float bannerAlpha = surgeElapsed > 2.7 ? (float)((3.5 - surgeElapsed) / 0.8) : 1.0f;
+                int aText = Math.Max(0, Math.Min(255, (int)(245 * bannerAlpha)));
+                int aBg = Math.Max(0, Math.Min(255, (int)(195 * bannerAlpha)));
+                int aBorder = Math.Max(0, Math.Min(255, (int)(170 * bannerAlpha)));
+
+                if (aText > 10)
+                {
+                    using (Font warnFont = new Font("Consolas", 8.8f, FontStyle.Bold))
+                    {
+                        string bannerText = "⚡ " + lastJamBannerActor.ToUpperInvariant();
+                        SizeF bSz = g.MeasureString(bannerText, warnFont);
+                        float bx = Math.Max(340f, (w - bSz.Width) * 0.5f);
+                        float by = 14f;
+                        RectangleF bRect = new RectangleF(bx - 10f, by, bSz.Width + 20f, bSz.Height + 8f);
+
+                        using (SolidBrush bgBr = new SolidBrush(Color.FromArgb(aBg, 22, 12, 34)))
+                            g.FillRectangle(bgBr, bRect);
+                        using (Pen bdPen = new Pen(Color.FromArgb(aBorder, 210, 120, 255), 1.3f))
+                            g.DrawRectangle(bdPen, bRect.X, bRect.Y, bRect.Width, bRect.Height);
+                        using (SolidBrush barBr = new SolidBrush(Color.FromArgb(aText, 215, 130, 255)))
+                            g.FillRectangle(barBr, bRect.X, bRect.Y, 3f, bRect.Height);
+                        using (SolidBrush txtBr = new SolidBrush(Color.FromArgb(aText, 235, 185, 255)))
+                            g.DrawString(bannerText, warnFont, txtBr, bx, by + 4f);
+                    }
+                }
+            }
+        }
+        catch { /* Защита от редких OverflowException GDI+ при экстремальном зуме */ }
     }
     private void PnlTimeline_Paint(object sender, PaintEventArgs e)
     {
@@ -490,23 +1857,152 @@ public class DebriefRadarForm : Form
         int w = pnlTimeline.Width;
         int h = pnlTimeline.Height;
         if (session == null || session.Duration <= 0.1) return;
-        // Маркеры событий и ошибок на полосе времени
         foreach (TacticalEvent ev in session.Events)
         {
             float x = (float)((ev.Time / session.Duration) * w);
             Color mc = Color.Gray;
             if (ev.Severity == "CRITICAL") mc = Color.OrangeRed;
+            else if (ev.Kind == "RWR" || ev.Kind == "THREAT") mc = Color.Orange;
+            else if (ev.Kind == "RADAR") mc = Color.DeepSkyBlue;
             else if (ev.Severity == "WARNING") mc = Color.Gold;
             else if (ev.Severity == "GOOD") mc = Color.FromArgb(0, 255, 102);
             else if (ev.Kind == "LAUNCH") mc = Color.Cyan;
-            using (Pen mp = new Pen(mc, ev.Kind == "MISTAKE" ? 2.5f : 1.5f))
+            else if (ev.Kind == "JAMMER") mc = Color.FromArgb(200, 110, 255);
+            using (Pen mp = new Pen(mc, (ev.Kind == "MISTAKE" || ev.Kind == "KIA" || ev.Kind == "THREAT") ? 2.5f : 1.5f))
                 g.DrawLine(mp, x, 4, x, h - 4);
         }
-        // Бегунок текущего времени
         float curX = (float)((currentTime / session.Duration) * w);
         using (Pen curPen = new Pen(Color.White, 2f))
             g.DrawLine(curPen, curX, 0, curX, h);
     }
+
+    private bool InspectNearestObjectAt(Point mousePt)
+    {
+        if (session == null) return false;
+        int w = pnlRadar.Width;
+        int h = pnlRadar.Height;
+        double bestDist = 26.0;
+        string report = null;
+        bool hitAir = false;
+
+        foreach (DebriefEntity ent in session.Entities)
+        {
+            DebriefSample st = ent.GetStateAt(currentTime);
+            if (st == null) continue;
+            PointF sp = WorldToScreen3D(st.X, st.Y, st.Alt, w, h);
+            double d = Math.Sqrt(Math.Pow(sp.X - mousePt.X, 2) + Math.Pow(sp.Y - mousePt.Y, 2));
+            if (d < bestDist)
+            {
+                bestDist = d;
+                hitAir = (ent.Type == "Air");
+                if (hitAir && cmbFollowTarget != null)
+                {
+                    for (int idx = 1; idx < cmbFollowTarget.Items.Count; idx++)
+                    {
+                        if (cmbFollowTarget.Items[idx].ToString().EndsWith("[" + ent.Id + "]"))
+                        {
+                            cmbFollowTarget.SelectedIndex = idx;
+                            break;
+                        }
+                    }
+                }
+                report = string.Format(
+                    "🔍 ИНСПЕКТОР ЮНИТА:\r\n" +
+                    "Имя: {0} ({1})\r\n" +
+                    "Тип / Роль: {2} / {3} ({4})\r\n" +
+                    "Время жизни: {5} .. {6}\r\n" +
+                    "Координаты: X={7:F0} м, Y={8:F0} м\r\n" +
+                    "Высота: {9:F0} м | Скорость: {10:F0} км/ч | Курс: {11:F0}°\r\n" +
+                    "Точек в треке: {12}",
+                    ent.Name, ent.Pilot ?? "-", ent.Type, ent.RoleTag ?? "-", ent.Coalition,
+                    FormatSec(ent.FirstTime), FormatSec(ent.LastTime),
+                    st.X, st.Y, st.Alt, st.Speed * 3.6, st.Heading, ent.Track.Count);
+            }
+        }
+
+
+        foreach (TacticalEvent ev in session.Events)
+        {
+            double age = currentTime - ev.Time;
+            if (age < 0 || age > 12.0) continue;
+            if (Math.Abs(ev.WorldX) < 1.0 && Math.Abs(ev.WorldY) < 1.0) continue;
+            PointF sp = WorldToScreen(ev.WorldX, ev.WorldY, w, h);
+            double d = Math.Sqrt(Math.Pow(sp.X - mousePt.X, 2) + Math.Pow(sp.Y - mousePt.Y, 2));
+            if (d < bestDist)
+            {
+                bestDist = d;
+                report = string.Format(
+                    "🔍 ИНСПЕКТОР СОБЫТИЯ:\r\n" +
+                    "Таймкод: {0} ({1:F1} сек)\r\n" +
+                    "Тип: [{2} / {3}] {4}\r\n" +
+                    "Координаты: X={5:F0} м, Y={6:F0} м\r\n" +
+                    "Описание: {7}",
+                    FormatSec(ev.Time), ev.Time, ev.Kind, ev.Severity, ev.Title,
+                    ev.WorldX, ev.WorldY, ev.Description);
+            }
+        }
+
+        if (!string.IsNullOrEmpty(report))
+            txtCoachAdvice.Text = report;
+        return hitAir;
+    }
+
+    private void BtnInspector_Click(object sender, EventArgs e)
+    {
+        if (session == null)
+        {
+            MessageBox.Show(this, "Сначала загрузите или импортируйте вылет.", "Инспектор", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        string dump = DebriefEngine.BuildDebugReport(session);
+        Form dlg = new Form()
+        {
+            Text = "Инспектор данных повтора — " + (session.Title ?? ""),
+            Size = new Size(880, 620),
+            StartPosition = FormStartPosition.CenterParent,
+            BackColor = Color.FromArgb(18, 22, 20),
+            ForeColor = Color.FromArgb(0, 255, 102),
+            Font = new Font("Consolas", 9.5f)
+        };
+        DarkWindowHelper.Apply(dlg);
+
+        Button btnCopy = new Button()
+        {
+            Text = "📋 Скопировать дамп в буфер обмена",
+            Left = 12,
+            Top = 10,
+            Width = 290,
+            Height = 28,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(0, 120, 75),
+            ForeColor = Color.White,
+            Font = new Font("Consolas", 9f, FontStyle.Bold)
+        };
+        btnCopy.Click += (s2, e2) => {
+            Clipboard.SetText(dump);
+            btnCopy.Text = "✔ Скопировано!";
+        };
+        dlg.Controls.Add(btnCopy);
+
+        TextBox txtDump = new TextBox()
+        {
+            Left = 12,
+            Top = 46,
+            Width = 840,
+            Height = 524,
+            Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Both,
+            WordWrap = false,
+            BackColor = Color.FromArgb(14, 18, 16),
+            ForeColor = Color.FromArgb(215, 245, 225),
+            Text = dump
+        };
+        dlg.Controls.Add(txtDump);
+        dlg.ShowDialog(this);
+    }
+
     private string FormatSec(double sec)
     {
         if (sec < 0) sec = 0;
@@ -514,3 +2010,4 @@ public class DebriefRadarForm : Form
         return string.Format("{0:D2}:{1:D2}", total / 60, total % 60);
     }
 }
+

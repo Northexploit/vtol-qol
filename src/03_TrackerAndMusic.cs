@@ -55,6 +55,8 @@ public class GameTracker
 
 
     private bool running = false;
+    private string lastSentActivityKey = "";
+    private DateTime lastActivitySentUtc = DateTime.MinValue;
     private static bool elevationAttempted = false;
     private LogPatterns patterns;
 
@@ -66,6 +68,10 @@ public class GameTracker
     private string activeReplayFile = null;
     private DateTime activeReplayStartUtc = DateTime.UtcNow;
 
+    private string activeCampaignId = "";
+    private string activeScenarioId = "";
+    private string activeVtsPath = "";
+
     private void StartReplayRecording(string pilot, string aircraft)
     {
         try
@@ -74,7 +80,13 @@ public class GameTracker
             activeReplayStartUtc = DateTime.UtcNow;
             string safeAc = Regex.Replace(aircraft ?? "VTOL", @"[^A-Za-z0-9\-]", "_");
             activeReplayFile = Path.Combine(dir, string.Format("Sortie_{0}_{1}.vtolrep", DateTime.Now.ToString("yyyyMMdd_HHmmss"), safeAc));
-            File.WriteAllText(activeReplayFile, string.Format("0.0|META|{0}|{1}\r\n", pilot ?? "Pilot", aircraft ?? "VTOL"), System.Text.Encoding.UTF8);
+            StringBuilder hdr = new StringBuilder();
+            hdr.AppendFormat("0.0|META|{0}|{1}\r\n", pilot ?? "Pilot", aircraft ?? "VTOL");
+            if (!string.IsNullOrEmpty(activeVtsPath))
+                hdr.AppendFormat("0.0|VTS|{0}|\r\n", activeVtsPath);
+            if (!string.IsNullOrEmpty(activeCampaignId) || !string.IsNullOrEmpty(activeScenarioId))
+                hdr.AppendFormat("0.0|SCENARIO|{0}|{1}\r\n", activeCampaignId, activeScenarioId);
+            File.WriteAllText(activeReplayFile, hdr.ToString(), System.Text.Encoding.UTF8);
         }
         catch { activeReplayFile = null; }
     }
@@ -85,7 +97,9 @@ public class GameTracker
         try
         {
             double sec = Math.Max(0.0, (DateTime.UtcNow - activeReplayStartUtc).TotalSeconds);
-            string line = string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0:F1}|{1}|{2}|{3}\r\n", sec, kind, arg1 ?? "", arg2 ?? "");
+            string clean1 = (arg1 ?? "").Replace("|", "/").Replace("\r", "").Replace("\n", " ");
+            string clean2 = (arg2 ?? "").Replace("|", "/").Replace("\r", "").Replace("\n", " ");
+            string line = string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0:F1}|{1}|{2}|{3}\r\n", sec, kind, clean1, clean2);
             File.AppendAllText(activeReplayFile, line, System.Text.Encoding.UTF8);
         }
         catch { }
@@ -282,6 +296,7 @@ public class GameTracker
                 {
                     // Игра только что запустилась
                     wasRunning = true;
+                    AudioSessionDucking.SetDuck(false, "VTOLVR");
                     AppLogger.Log("TRACKER", "Обнаружен запуск VTOLVR.exe! Файл лога: " + logPath + " (существует: " + File.Exists(logPath) + ")");
                     if (File.Exists(logPath))
                     {
@@ -377,7 +392,29 @@ public class GameTracker
                                     }
                                 }
 
-                                // 1.5. Определяем название загруженной миссии или карты из Player.log
+                                // 1.5. Определяем загруженную кампанию, сценарий и путь к .vts файлу
+                                Match mCamp = Regex.Match(chunk, @"LoadCampaign\((?<camp>[^,\)\r\n]+),\s*(?<scen>[^\)\r\n]+)\)", RegexOptions.IgnoreCase);
+                                if (mCamp.Success)
+                                {
+                                    activeCampaignId = mCamp.Groups["camp"].Value.Trim();
+                                    activeScenarioId = mCamp.Groups["scen"].Value.Trim();
+                                    activeVtsPath = "";
+                                    currentMission = activeCampaignId + " / " + activeScenarioId;
+                                    AppLogger.Log("TRACKER", "Обнаружена кампания/миссия: " + currentMission);
+                                }
+
+                                Match mVts = Regex.Match(chunk, @"scenario\s+(?<path>[A-Za-z]:\\[^\r\n]+?\.vts)\b", RegexOptions.IgnoreCase);
+                                if (mVts.Success)
+                                {
+                                    string pVts = mVts.Groups["path"].Value.Trim();
+                                    if (File.Exists(pVts))
+                                    {
+                                        activeVtsPath = pVts;
+                                        currentMission = Path.GetFileNameWithoutExtension(pVts);
+                                        AppLogger.Log("TRACKER", "Обнаружен файл сценария .vts: " + activeVtsPath);
+                                    }
+                                }
+
                                 Match mScen = Regex.Match(chunk, @"(?:Loading campaign mission|Loading workshop scenario|Starting mission|Selected scenario|Scenario name)[:\s]+(?<val>[^\r\n\(\[]+)", RegexOptions.IgnoreCase);
                                 if (mScen.Success)
                                 {
@@ -386,7 +423,7 @@ public class GameTracker
                                         !Regex.IsMatch(sc, @"^(?:none|async|true|false|null|scene|level)$", RegexOptions.IgnoreCase))
                                     {
                                         currentMission = sc;
-                                        AppLogger.Log("TRACKER", "Обнаружена миссия/карта: " + currentMission);
+                                        if (string.IsNullOrEmpty(activeScenarioId)) activeScenarioId = sc;
                                     }
                                 }
 
@@ -395,6 +432,8 @@ public class GameTracker
                                 {
                                     string acWithRole = FormatAircraftWithRole(currentAircraft, currentCrewRole);
                                     WriteFlightLog("LANDED", acWithRole, currentCallsign, GetDurStr(sortieStart), kills, "Завершение вылета / выход в брифинг");
+                                    RecordReplayEvent("END", "Выход в брифинг");
+                                    activeReplayFile = null;
                                     currentAircraft = "В ангаре / Меню";
                                     currentCallsign = "В ангаре / Меню";
                                     currentMission = "";
@@ -424,7 +463,6 @@ public class GameTracker
                                         }
                                     }
 
-                                    // Дополнительная проверка при непосредственной посадке игрока в кабину (МП)
                                     Match mSeat = Regex.Match(chunk, @"(?:Seat|SetOccupant|EnterVehicle)[^\r\n]*" + myNickEsc + @"[^\r\n]*?(?:seat(?:Idx)?\s*[=:]\s*(?<idx>\d+)|(?<role>Gunner|Copilot|EWO|WSO|BackSeat|Pilot))", RegexOptions.IgnoreCase);
                                     if (mSeat.Success)
                                     {
@@ -437,17 +475,13 @@ public class GameTracker
                                     }
                                 }
 
-
-                                // 4. Старт реального вылета:
-                                // В мультиплеере: "shutze has spawned" или "FlightLogger: shutze has spawned"
-                                // В одиночной игре: "PlayerSpawn:OnSpawnUnit()" или "Registering actor Player"
+                                // 4. Старт реального вылета
                                 bool mpSpawned = !string.IsNullOrEmpty(myNickEsc) && Regex.IsMatch(chunk, @"(?:FlightLogger:\s*)?" + myNickEsc + @"\s+has spawned", RegexOptions.IgnoreCase);
                                 bool spSpawned = Regex.IsMatch(chunk, @"PlayerSpawn:OnSpawnUnit\(\)|Registering actor Player \[\d+\]", RegexOptions.IgnoreCase);
 
                                 if (mpSpawned || spSpawned)
                                 {
                                     string veh = SettingsManager.Get("LastSelectedVehicle", "В ангаре / Меню");
-                                    // Проверяем, нет ли в этом же куске лога строки "AV-42C (shutze)" или "F-45A (shutze)"
                                     if (!string.IsNullOrEmpty(myNickEsc))
                                     {
                                         Match mActorVeh = Regex.Match(chunk, @"(?<val>" + aircraftRegexStr + @")\s*\(" + myNickEsc + @"\)", RegexOptions.IgnoreCase);
@@ -477,11 +511,83 @@ public class GameTracker
                                     }
                                 }
 
-
-                                // 5. Боевая телеметрия: пуски ракет, захваты целей и подтверждённые сбития
+                                // 5. ПОЛНАЯ БОЕВАЯ ТЕЛЕМЕТРИЯ ИЗ PLAYER.LOG (АКТОРЫ, РАДАРЫ, RWR, РАКЕТЫ, ПОВРЕЖДЕНИЯ, УБИЙСТВА)
                                 if (!string.IsNullOrEmpty(myNickEsc))
                                 {
-                                    // 5а. Фиксируем пуск ракеты игроком ("Starting missile info for AIM-120C(101) by Player [0] (shutze)")
+                                    // 5.1 Взлёт / Посадка / Задачи миссии
+                                    Match mTakeoff = Regex.Match(chunk, @"FlightLogger:\s*" + myNickEsc + @"\s+took off from\s+(?<base>[^\r\n\.]+)", RegexOptions.IgnoreCase);
+                                    if (mTakeoff.Success)
+                                        RecordReplayEvent("TAKEOFF", mTakeoff.Groups["base"].Value.Trim());
+
+                                    Match mLanded = Regex.Match(chunk, @"FlightLogger:\s*" + myNickEsc + @"\s+landed at\s+(?<base>[^\r\n\.]+)", RegexOptions.IgnoreCase);
+                                    if (mLanded.Success)
+                                        RecordReplayEvent("LANDED", mLanded.Groups["base"].Value.Trim());
+
+                                    foreach (Match mObj in Regex.Matches(chunk, @"FlightLogger:\s*(?<st>Completed|Failed)\s+objective:\s*(?<obj>[^\r\n]+)", RegexOptions.IgnoreCase))
+                                        RecordReplayEvent("OBJECTIVE", mObj.Groups["st"].Value, mObj.Groups["obj"].Value.Trim());
+
+                                    // 5.2 Регистрация всех юнитов (союзников, врагов, ДРЛО, танкеров, ЗРК) и их начальных векторов скорости
+                                    foreach (Match mActor in Regex.Matches(chunk, @"Registering actor\s+(?<unit>[^\r\n\(\)]+?)\s*\((?<type>[^\r\n\(\)]+)\)", RegexOptions.IgnoreCase))
+                                    {
+                                        string uName = mActor.Groups["unit"].Value.Trim();
+                                        string uType = mActor.Groups["type"].Value.Trim();
+                                        if (uName.StartsWith("Player", StringComparison.OrdinalIgnoreCase) ||
+                                            uName.IndexOf("Clone", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                            uName == "null" || uName.StartsWith("elevator", StringComparison.OrdinalIgnoreCase))
+                                            continue;
+
+                                        // Отсекаем ракеты — для них есть отдельный блок пусков
+                                        if (Regex.IsMatch(uType, @"\b(?:AIM-|ASF-MRM|ASF-SRM|AIRS-T|AGM-|R-77|R-27|SA-|MIM-)\b", RegexOptions.IgnoreCase) ||
+                                            uName.IndexOf("(" + myNick + ")", StringComparison.OrdinalIgnoreCase) >= 0)
+                                            continue;
+
+                                        RecordReplayEvent("ACTOR_REG", uName, uType);
+                                    }
+
+                                    foreach (Match mFly in Regex.Matches(chunk, @"(?<unit>[^\r\n\(\)]+?)\s*\([^\)]+\)\s*set rb vel from InitialFlyRoutine\s*\(\((?<vx>[-\d,]+),\s*(?<vy>[-\d,]+),\s*(?<vz>[-\d,]+)\)\)", RegexOptions.IgnoreCase))
+                                    {
+                                        string uName = mFly.Groups["unit"].Value.Trim();
+                                        string vel = string.Format("{0};{1};{2}",
+                                            mFly.Groups["vx"].Value.Replace(',', '.'),
+                                            mFly.Groups["vy"].Value.Replace(',', '.'),
+                                            mFly.Groups["vz"].Value.Replace(',', '.'));
+                                        RecordReplayEvent("UNIT_SPAWN", uName, vel);
+                                    }
+
+                                    // 5.3 Радарная обстановка: обнаружения игроком, ДРЛО (AWACS), союзниками и облучение RWR (СПО)
+                                    foreach (Match mDet in Regex.Matches(chunk, @"(?<observer>[^\r\n]+?)\s+detected\s+(?<target>[^\r\n]+?)\s+via radar\.", RegexOptions.IgnoreCase))
+                                    {
+                                        string obs = mDet.Groups["observer"].Value.Trim();
+                                        string tgt = mDet.Groups["target"].Value.Trim();
+
+                                        if (tgt.Equals(myNick, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            // Кто-то засветил игрока своим радаром (RWR!)
+                                            RecordReplayEvent("RWR_DETECT", obs, "Радарное облучение");
+                                        }
+                                        else if (obs.Equals(myNick, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            // Игрок обнаружил цель на свой радар
+                                            RecordReplayEvent("RADAR_DETECT", "PLAYER", tgt);
+                                        }
+                                        else if (obs.IndexOf("Overlord", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                 obs.IndexOf("AWACS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                 obs.IndexOf("Magic", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                 obs.IndexOf("Wizard", StringComparison.OrdinalIgnoreCase) >= 0)
+                                        {
+                                            // ДРЛО / АВАКС передал контакт по даталинку
+                                            RecordReplayEvent("RADAR_DETECT", obs, tgt);
+                                        }
+                                    }
+
+                                    // 5.4 Захват цели игроком (TWS / STT) и управление режимами радара
+                                    foreach (Match mSoft in Regex.Matches(chunk, @"SoftLockActor\((?<tgt>[^\r\n\)]+\))", RegexOptions.IgnoreCase))
+                                        RecordReplayEvent("RADAR_LOCK", CleanUnitDisplayName(mSoft.Groups["tgt"].Value));
+
+                                    foreach (Match mRdrPwr in Regex.Matches(chunk, @"MFDRadarUI\.SetPower\(\d+,\s*(?<st>True|False)\)", RegexOptions.IgnoreCase))
+                                        RecordReplayEvent("RADAR_PWR", mRdrPwr.Groups["st"].Value);
+
+                                    // 5.5 Все пуски ракет (игрока, союзных ботов и противников) и их захваты целей
                                     MatchCollection mcLaunch = Regex.Matches(
                                         chunk,
                                         @"Starting missile info for\s+(?<msl>[^\r\n\(\[]+)(?:\(\d+\))?\s+by\s+[^\r\n]*?\(" + myNickEsc + @"\)",
@@ -498,72 +604,105 @@ public class GameTracker
                                         }
                                     }
 
-                                    // 5б. Связываем ракету с ID захваченной цели ("AIM-120 (shutze) acquired radar target: ASF-30 [11] (ASF-30)")
-                                    MatchCollection mcLock = Regex.Matches(
+                                    // Все захваты ракет (любого стрелка по любой цели)
+                                    MatchCollection mcAllMslLock = Regex.Matches(
                                         chunk,
-                                        @"(?<msl>[A-Za-z0-9\-]+)\s*\(" + myNickEsc + @"\)\s+acquired\s+(?:radar\s+|optical\s+|heat\s+)?target:\s*[^\r\n\[]+\[(?<tid>\d+)\]",
+                                        @"(?<msl>[A-Za-z0-9\-]+)\s*\((?<shooter>[^\)]+)\)\s+acquired\s+(?:radar\s+|optical\s+|heat\s+)?target:\s*(?<tfull>[^\r\n]+)",
                                         RegexOptions.IgnoreCase
                                     );
-                                    foreach (Match mLock in mcLock)
+                                    foreach (Match mLock in mcAllMslLock)
                                     {
-                                        string tid = mLock.Groups["tid"].Value;
                                         string lockMsl = mLock.Groups["msl"].Value.Trim();
-                                        // Если точное имя с модификацией (например AIM-120C) совпадает по базе с AIM-120 — берём полное имя
-                                        if (!string.IsNullOrEmpty(lastFiredPlayerMissile) &&
-                                            lastFiredPlayerMissile.StartsWith(lockMsl, StringComparison.OrdinalIgnoreCase))
-                                        {
-                                            lockMsl = lastFiredPlayerMissile;
-                                        }
-                                        targetIdToMissile[tid] = lockMsl;
-                                    }
+                                        string shooter = mLock.Groups["shooter"].Value.Trim();
+                                        string targetFull = mLock.Groups["tfull"].Value.Trim();
 
-                                    // 5в. Подтверждённые сбития ("FlightLogger: ASF-30 [13] (ASF-30) was killed by Player [0] (shutze). explosion")
+                                        if (shooter.Equals(myNick, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            if (!string.IsNullOrEmpty(lastFiredPlayerMissile) &&
+                                                lastFiredPlayerMissile.StartsWith(lockMsl, StringComparison.OrdinalIgnoreCase))
+                                                lockMsl = lastFiredPlayerMissile;
+
+                                            Match mTid = Regex.Match(targetFull, @"\[(?<tid>\d+)\]");
+                                            if (mTid.Success)
+                                                targetIdToMissile[mTid.Groups["tid"].Value] = lockMsl;
+
+                                            RecordReplayEvent("MSL_ACTIVE", lockMsl, CleanUnitDisplayName(targetFull));
+                                        }
+                                        else if (targetFull.IndexOf("(" + myNick + ")", StringComparison.OrdinalIgnoreCase) >= 0)
+                                        {
+                                            // Ракета противника вышла на активное самонаведение по игроку!
+                                            RecordReplayEvent("THREAT_LOCK", lockMsl, shooter);
+                                        }
+                                        else
+                                        {
+                                            // Пуск/наведение ракеты ИИ (союзника или врага) по другой цели
+                                            RecordReplayEvent("AI_MSL_LOCK", lockMsl + " (" + shooter + ")", CleanUnitDisplayName(targetFull));
+                                        }
+                                    }
+                                    // 5.6 Повреждения (отказы двигателей и отрыв пилонов/подвесок при попаданиях)
+                                    foreach (Match mEng in Regex.Matches(chunk, @"Failed engine\s+(?[^\r\n]+)", RegexOptions.IgnoreCase))
+                                    {
+                                        string part = mEng.Groups["part"].Value.Trim();
+                                        if (part.IndexOf("(Clone)", StringComparison.OrdinalIgnoreCase) >= 0)
+                                            RecordReplayEvent("DAMAGE", "PLAYER", "Отказ двигателя: " + part);
+                                        else
+                                            RecordReplayEvent("DAMAGE", "UNIT", "Повреждён двигатель: " + part);
+                                    }
+                                    foreach (Match mJet in Regex.Matches(chunk, @"jettisoning by part destruction:\s*(?[^\r\n]+)", RegexOptions.IgnoreCase))
+                                    {
+                                        RecordReplayEvent("PART_LOSS", mJet.Groups["item"].Value.Trim());
+                                    }
+                                    // 5.7 Все сбития и потери в миссии (игрока, союзников и врагов)
                                     int newKills = 0;
                                     string lastTarget = "Цель";
                                     string acDisplay = FormatAircraftWithRole(currentAircraft, currentCrewRole);
-
-                                    MatchCollection mcKill = Regex.Matches(
-                                        chunk,
-                                        @"FlightLogger:\s*(?<target>[^\r\n]+?)\s+was killed by\s+[^\r\n]*?\(" + myNickEsc + @"\)(?:\s+with\s+(?<weapon>[^\r\n\.]+))?",
-                                        RegexOptions.IgnoreCase
+                                    MatchCollection mcAllKills = Regex.Matches(
+                                    chunk,
+                                    @"FlightLogger:\s*(?[^\r\n]+?)\s+was killed by\s+(?[^\r\n.]+?)(?:\s+with\s+(?[^\r\n.]+))?(?:.|$)",
+                                    RegexOptions.IgnoreCase
                                     );
-                                    foreach (Match mk in mcKill)
+                                    foreach (Match mk in mcAllKills)
                                     {
                                         string rawTarget = mk.Groups["target"].Value.Trim();
+                                        string rawKiller = mk.Groups["killer"].Value.Trim();
+                                        // Гибель самого игрока обрабатывается в блоке 6
                                         if (rawTarget.IndexOf("(" + myNick + ")", StringComparison.OrdinalIgnoreCase) >= 0)
                                             continue;
-
                                         string targetName = CleanUnitDisplayName(rawTarget);
+                                        string killerName = CleanUnitDisplayName(rawKiller);
                                         string weapon = mk.Groups["weapon"].Success ? CleanUnitDisplayName(mk.Groups["weapon"].Value) : "";
-
-                                        // Ищем ракету по ID цели [13] из словаря захватов
-                                        Match mTid = Regex.Match(rawTarget, @"\[(?<tid>\d+)\]");
-                                        if (string.IsNullOrEmpty(weapon) && mTid.Success)
+                                        bool isPlayerKill = rawKiller.IndexOf("(" + myNick + ")", StringComparison.OrdinalIgnoreCase) >= 0;
+                                        if (isPlayerKill)
                                         {
-                                            string mappedMsl;
-                                            if (targetIdToMissile.TryGetValue(mTid.Groups["tid"].Value, out mappedMsl))
+                                            Match mTid = Regex.Match(rawTarget, @"(?<tid>\d+)");
+                                            if (string.IsNullOrEmpty(weapon) && mTid.Success)
                                             {
-                                                weapon = mappedMsl;
-                                                targetIdToMissile.Remove(mTid.Groups["tid"].Value);
+                                                string mappedMsl;
+                                                if (targetIdToMissile.TryGetValue(mTid.Groups["tid"].Value, out mappedMsl))
+                                                {
+                                                    weapon = mappedMsl;
+                                                    targetIdToMissile.Remove(mTid.Groups["tid"].Value);
+                                                }
                                             }
-                                        }
-
-                                        if (!string.IsNullOrEmpty(weapon))
-                                            RecordWeaponStat(weapon, 0, 1);
-                                        else
-                                            RecordWeaponStat("Пушка / Неупр. АСП", 0, 1);
-
-                                        string killNote = string.IsNullOrEmpty(weapon)
+                                            if (!string.IsNullOrEmpty(weapon))
+                                                RecordWeaponStat(weapon, 0, 1);
+                                            else
+                                                RecordWeaponStat("Пушка / Неупр. АСП", 0, 1);
+                                            string killNote = string.IsNullOrEmpty(weapon)
                                             ? ("Уничтожен: " + targetName)
                                             : ("Уничтожен: " + targetName + "  |  Оружие: " + weapon);
-
-                                        newKills++;
-                                        lastTarget = targetName;
-                                        kills++;
-                                        WriteFlightLog("KILL", acDisplay, currentCallsign, GetDurStr(sortieStart), kills, killNote);
-                                        RecordReplayEvent("KILL", targetName, weapon);
+                                            newKills++;
+                                            lastTarget = targetName;
+                                            kills++;
+                                            WriteFlightLog("KILL", acDisplay, currentCallsign, GetDurStr(sortieStart), kills, killNote);
+                                            RecordReplayEvent("KILL", targetName, weapon);
+                                        }
+                                        else
+                                        {
+                                            // Сбитие союзником, ЗРК или врагом (нужно для удаления цели с карты в нужный момент)
+                                            RecordReplayEvent("WORLD_KILL", targetName, killerName);
+                                        }
                                     }
-
                                     if (newKills > 0)
                                     {
                                         AppLogger.Log("TRACKER", string.Format("Подтверждено сбитие ({0}): всего за сессию = {1}", lastTarget, kills));
@@ -571,20 +710,17 @@ public class GameTracker
                                             KillSoundPlayer.RegisterKills(newKills);
                                     }
                                 }
-
-
-                                // 6. Катапультирование / гибель борта с точным указанием убийцы, оружия или причины крушения
+                                // 6. Катапультирование / гибель борта с точным определением причины (ракета, земля, перегрузка)
                                 bool hit = false;
                                 string deathEventType = "KIA";
                                 string deathDetails = "Борт потерян";
-
+                                string deathCauseCode = "UNKNOWN";
                                 if (!string.IsNullOrEmpty(myNickEsc))
                                 {
-                                    // Вариант А: Сбит противником или ботом ("FlightLogger: F/A-26B (shutze) was killed by <Killer> with <Weapon>.")
                                     Match mKilledBy = Regex.Match(
-                                        chunk,
-                                        @"FlightLogger:\s*[^\r\n]*?\(" + myNickEsc + @"\)[^\r\n]*?\bwas killed by\s+(?<killer>[^\r\n\.]+?)(?:\s+with\s+(?<weapon>[^\r\n\.]+))?(?:\.|$)",
-                                        RegexOptions.IgnoreCase
+                                    chunk,
+                                    @"FlightLogger:\s*[^\r\n]?\(" + myNickEsc + @"\)[^\r\n]?\bwas killed by\s+(?[^\r\n.]+?)(?:\s+with\s+(?[^\r\n.]+))?(?:.|$)",
+                                    RegexOptions.IgnoreCase
                                     );
                                     if (mKilledBy.Success)
                                     {
@@ -592,30 +728,49 @@ public class GameTracker
                                         deathEventType = "KIA";
                                         string killer = CleanUnitDisplayName(mKilledBy.Groups["killer"].Value);
                                         string weap = mKilledBy.Groups["weapon"].Success ? CleanUnitDisplayName(mKilledBy.Groups["weapon"].Value) : "";
-                                        deathDetails = string.IsNullOrEmpty(weap)
+                                        if (killer.Equals("Environment", StringComparison.OrdinalIgnoreCase) ||
+                                        chunk.IndexOf("TerrainCollider", StringComparison.OrdinalIgnoreCase) >= 0)
+                                        {
+                                            deathCauseCode = "CFIT";
+                                            deathDetails = "Столкновение с землёй (CFIT)";
+                                        }
+                                        else
+                                        {
+                                            deathCauseCode = "ENEMY";
+                                            deathDetails = string.IsNullOrEmpty(weap)
                                             ? ("Сбит: " + killer)
                                             : ("Сбит: " + killer + "  |  Оружие: " + weap);
+                                        }
                                     }
-
-                                    // Вариант Б: Катапультирование ("FlightLogger: F/A-26B (shutze) ejected.")
-                                    if (!hit && Regex.IsMatch(chunk, @"(?:FlightLogger:\s*[^\r\n]*?\(" + myNickEsc + @"\)|(?:\$|\b)" + myNickEsc + @"\$?)[^\r\n]*?\bejected\b", RegexOptions.IgnoreCase))
+                                    if (!hit && Regex.IsMatch(chunk, @"Died by instantaneous G-force\s*(?<g>[\d,]+)", RegexOptions.IgnoreCase))
+                                    {
+                                        Match mG = Regex.Match(chunk, @"Died by instantaneous G-force\s*(?<g>[\d,]+)", RegexOptions.IgnoreCase);
+                                        hit = true;
+                                        deathEventType = "KIA";
+                                        deathCauseCode = "GFORCE";
+                                        deathDetails = "Разрушение от перегрузки (" + mG.Groups["g"].Value + " G)";
+                                    }
+                                    if (!hit && Regex.IsMatch(chunk, @"(?:FlightLogger:\s*[^\r\n]?\(" + myNickEsc + @"\)|(?:$|\b)" + myNickEsc + @"$?)[^\r\n]?\bejected\b", RegexOptions.IgnoreCase))
                                     {
                                         hit = true;
                                         deathEventType = "EJECT";
+                                        deathCauseCode = "EJECT";
                                         deathDetails = "Катапультирование пилота";
                                     }
-
-                                    // Вариант В: Столкновение / крушение / самоуничтожение
-                                    if (!hit && Regex.IsMatch(chunk, @"(?:FlightLogger:\s*[^\r\n]*?\(" + myNickEsc + @"\)|(?:\$|\b)" + myNickEsc + @"\$?)[^\r\n]*?\b(?:was killed|died|crashed)\b", RegexOptions.IgnoreCase))
+                                    if (!hit && Regex.IsMatch(chunk, @"(?:FlightLogger:\s*[^\r\n]?\(" + myNickEsc + @"\)|(?:$|\b)" + myNickEsc + @"$?)[^\r\n]?\b(?:was killed|died|crashed)\b", RegexOptions.IgnoreCase))
                                     {
                                         hit = true;
                                         deathEventType = "KIA";
                                         if (chunk.IndexOf("crashed", StringComparison.OrdinalIgnoreCase) >= 0 || chunk.IndexOf("terrain", StringComparison.OrdinalIgnoreCase) >= 0)
+                                        {
+                                            deathCauseCode = "CFIT";
                                             deathDetails = "Столкновение с землёй / крушение";
+                                        }
                                         else
+                                        {
                                             deathDetails = "Борт уничтожен (авария / столкновение)";
+                                        }
                                     }
-
                                     if (!hit)
                                     {
                                         foreach (string ejTpl in patterns.EjectTemplates)
@@ -625,19 +780,17 @@ public class GameTracker
                                         }
                                     }
                                 }
-
                                 if (hit)
                                 {
                                     KillSoundPlayer.ResetCombo();
                                     string acDisplay = FormatAircraftWithRole(currentAircraft, currentCrewRole);
                                     WriteFlightLog(deathEventType, acDisplay, currentCallsign, GetDurStr(sortieStart), kills, deathDetails);
-                                    RecordReplayEvent(deathEventType, deathDetails);
+                                    RecordReplayEvent(deathEventType, deathDetails, deathCauseCode);
                                     activeReplayFile = null;
                                     currentAircraft = "В ангаре / Меню";
                                     currentCallsign = "В ангаре / Меню";
                                     inSortie = false;
-                                    AppLogger.Log("TRACKER", "Пилот " + myNick + " погиб/катапультировался (" + deathEventType + ").");
-
+                                    AppLogger.Log("TRACKER", "Пилот " + myNick + " погиб/катапультировался (" + deathEventType + ": " + deathDetails + ").");
                                     if (SettingsManager.GetBool("Shuffle", true))
                                     {
                                         string mDir = SettingsManager.Get("RadioMusicDir", "");
@@ -654,15 +807,17 @@ public class GameTracker
                 }
 
                 // Ducking
-
-
                 if (DuckingEnabled)
                 {
                     bool voiceActive = AudioSessionDucking.IsMicInUse();
                     AudioSessionDucking.SetDuck(voiceActive, "VTOLVR");
                 }
+                else
+                {
+                    AudioSessionDucking.SetDuck(false, "VTOLVR");
+                }
 
-                // Discord IPC
+                // Discord IPC (строго с соблюдением Rate Limit 15 сек и без конфликта нескольких окон)
                 if (DiscordEnabled)
                 {
                     if (pipe == null)
@@ -690,7 +845,7 @@ public class GameTracker
                                     SendPacket(pipe, 0, hs);
                                     int op; string body;
                                     bool ok = ReadPacket(pipe, out op, out body);
-                                    AppLogger.Log("DISCORD", string.Format("Пайп discord-ipc-{0}: ok={1}, op={2}, body={3}", i, ok, op, body));
+                                    AppLogger.Log("DISCORD", string.Format("Пайп discord-ipc-{0}: ok={1}, op={2}", i, ok, op));
                                     if (!ok)
                                     {
                                         pipe.Dispose();
@@ -701,6 +856,8 @@ public class GameTracker
                                     {
                                         IsDiscordConnected = true;
                                         IsDiscordAccessDenied = false;
+                                        lastSentActivityKey = "";
+                                        lastActivitySentUtc = DateTime.MinValue;
                                         Match mUser = Regex.Match(body, @"""username""\s*:\s*""(?<val>[^""]+)""");
                                         if (mUser.Success && !string.IsNullOrEmpty(mUser.Groups["val"].Value))
                                         {
@@ -714,7 +871,6 @@ public class GameTracker
                                         }
                                         break;
                                     }
-
                                 }
                                 catch (Exception exPipe)
                                 {
@@ -729,9 +885,7 @@ public class GameTracker
                                 if (err != 2)
                                 {
                                     if (err == 5) IsDiscordAccessDenied = true;
-                                    AppLogger.Log("DISCORD", string.Format("CreateFile discord-ipc-{0} Win32Error={1}", i, err));
                                     if (err == 5 && !elevationAttempted)
-
                                     {
                                         elevationAttempted = true;
                                         bool isAdmin = new System.Security.Principal.WindowsPrincipal(
@@ -740,7 +894,6 @@ public class GameTracker
 
                                         if (!isAdmin)
                                         {
-                                            AppLogger.Log("DISCORD", "Discord запущен с повышенными правами. Перезапуск VTOL_QoL от имени администратора...");
                                             try
                                             {
                                                 ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath);
@@ -749,14 +902,10 @@ public class GameTracker
                                                 Process.Start(psi);
                                                 Environment.Exit(0);
                                             }
-                                            catch (Exception exElev)
-                                            {
-                                                AppLogger.Log("DISCORD", "Пользователь отменил запрос прав администратора: " + exElev.Message);
-                                            }
+                                            catch { }
                                         }
                                     }
                                 }
-
                             }
                         }
                     }
@@ -776,42 +925,69 @@ public class GameTracker
                             ? ("Позывной: " + currentCallsign + (!string.IsNullOrEmpty(currentMission) ? " | " + currentMission : ""))
                             : (!string.IsNullOrEmpty(currentMission) ? "Брифинг: " + currentMission : "Ожидание вылета");
 
-                        string acAssetKey = GetAircraftAssetKey(currentAircraft);
-                        string assetsJson = string.IsNullOrEmpty(acAssetKey)
-                            ? "\"large_image\":\"vtol_logo\",\"large_text\":\"VTOL QoL by L.Shutze\""
-                            : "\"large_image\":\"vtol_logo\",\"large_text\":\"VTOL QoL by L.Shutze\",\"small_image\":\"" + acAssetKey + "\",\"small_text\":\"" + JsonEscape(currentAircraft) + "\"";
+                        string activityKey = det + "|" + st + "|" + currentAircraft;
+                        double secSinceLastSend = (DateTime.UtcNow - lastActivitySentUtc).TotalSeconds;
 
-                        string json = "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + Process.GetCurrentProcess().Id +
-                                      ",\"activity\":{\"details\":\"" + JsonEscape(det) +
-                                      "\",\"state\":\"" + JsonEscape(st) +
-                                      "\",\"timestamps\":{\"start\":" + startEpoch +
-                                      "},\"assets\":{" + assetsJson + "}}},\"nonce\":\"" + Guid.NewGuid() + "\"}";
-
-                        try
+                        // Шлём SET_ACTIVITY только при изменении статуса или раз в 15 сек (защита от Rate Limit Discord!)
+                        if (activityKey != lastSentActivityKey || secSinceLastSend >= 15.0)
                         {
-                            SendPacket(pipe, 1, json);
-                            int op; string body;
-                            if (ReadPacket(pipe, out op, out body))
+                            int targetPid = Process.GetCurrentProcess().Id;
+                            try
                             {
-                                if (op == 3)
+                                Process[] vProcs = Process.GetProcessesByName("VTOLVR");
+                                if (vProcs.Length > 0)
                                 {
-                                    AppLogger.Log("DISCORD", "Discord вернул ошибку SET_ACTIVITY: " + body);
-                                    try { pipe.Dispose(); } catch { }
-                                    pipe = null;
+                                    targetPid = vProcs[0].Id;
+                                    for (int vp = 0; vp < vProcs.Length; vp++) vProcs[vp].Dispose();
                                 }
                             }
-                            else
+                            catch { }
+
+                            string acAssetKey = GetAircraftAssetKey(currentAircraft);
+                            string assetsJson = string.IsNullOrEmpty(acAssetKey)
+                                ? "\"large_image\":\"vtol_logo\",\"large_text\":\"VTOL QoL by L.Shutze\""
+                                : "\"large_image\":\"vtol_logo\",\"large_text\":\"VTOL QoL by L.Shutze\",\"small_image\":\"" + acAssetKey + "\",\"small_text\":\"" + JsonEscape(currentAircraft) + "\"";
+
+                            string json = "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + targetPid +
+                                          ",\"activity\":{\"details\":\"" + JsonEscape(det) +
+                                          "\",\"state\":\"" + JsonEscape(st) +
+                                          "\",\"timestamps\":{\"start\":" + startEpoch +
+                                          "},\"assets\":{" + assetsJson + "}}},\"nonce\":\"" + Guid.NewGuid() + "\"}";
+
+                            try
                             {
-                                AppLogger.Log("DISCORD", "ReadPacket вернул false после SET_ACTIVITY");
+                                SendPacket(pipe, 1, json);
+                                int op; string body;
+                                if (ReadPacket(pipe, out op, out body))
+                                {
+                                    if (op == 3)
+                                    {
+                                        AppLogger.Log("DISCORD", "Discord вернул ошибку SET_ACTIVITY: " + body);
+                                        try { pipe.Dispose(); } catch { }
+                                        pipe = null;
+                                        IsDiscordConnected = false;
+                                    }
+                                    else
+                                    {
+                                        lastSentActivityKey = activityKey;
+                                        lastActivitySentUtc = DateTime.UtcNow;
+                                    }
+                                }
+                                else
+                                {
+                                    AppLogger.Log("DISCORD", "ReadPacket вернул false после SET_ACTIVITY");
+                                    try { pipe.Dispose(); } catch { }
+                                    pipe = null;
+                                    IsDiscordConnected = false;
+                                }
+                            }
+                            catch (Exception exSend)
+                            {
+                                AppLogger.Error("DISCORD", "SET_ACTIVITY", exSend);
                                 try { pipe.Dispose(); } catch { }
                                 pipe = null;
+                                IsDiscordConnected = false;
                             }
-                        }
-                        catch (Exception exSend)
-                        {
-                            AppLogger.Error("DISCORD", "SET_ACTIVITY", exSend);
-                            try { pipe.Dispose(); } catch { }
-                            pipe = null;
                         }
                     }
                 }
@@ -819,6 +995,7 @@ public class GameTracker
                 {
                     try { pipe.Dispose(); } catch { }
                     pipe = null;
+                    IsDiscordConnected = false;
                 }
 
             }
