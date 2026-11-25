@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AssemblyName>VTOL_QoL</AssemblyName>
+    <RootNamespace>VTOL_QoL</RootNamespace>
+    <ApplicationIcon Condition="Exists('icon.ico')">icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Core\*.cs" />
+    <Compile Include="Audio\*.cs" />
+    <Compile Include="Workshop\*.cs" />
+    <Compile Include="Viewer\*.cs" />
+    <Compile Include="App\*.cs" />
+    <Compile Include="Debrief\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
+    <Reference Include="System.Management" />
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.Runtime.Serialization" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="icon.ico" Condition="Exists('icon.ico')" LogicalName="icon.ico" />
+    <EmbeddedResource Include="Assets\Tools\ffmpeg.exe" Condition="Exists('Assets\Tools\ffmpeg.exe')" LogicalName="ffmpeg.exe" />
+    <EmbeddedResource Include="Assets\Tools\yt-dlp.exe" Condition="Exists('Assets\Tools\yt-dlp.exe')" LogicalName="yt-dlp.exe" />
+    <EmbeddedResource Include="Assets\Meshes\FA-26B.fbx" Condition="Exists('Assets\Meshes\FA-26B.fbx')" LogicalName="FA-26B.fbx" />
+    <EmbeddedResource Include="Assets\Meshes\F-45A.fbx" Condition="Exists('Assets\Meshes\F-45A.fbx')" LogicalName="F-45A.fbx" />
+    <EmbeddedResource Include="Assets\Meshes\AV-42C.fbx" Condition="Exists('Assets\Meshes\AV-42C.fbx')" LogicalName="AV-42C.fbx" />
+    <EmbeddedResource Include="Assets\Meshes\AH-94.fbx" Condition="Exists('Assets\Meshes\AH-94.fbx')" LogicalName="AH-94.fbx" />
+    <EmbeddedResource Include="Assets\Meshes\T-55.fbx" Condition="Exists('Assets\Meshes\T-55.fbx')" LogicalName="T-55.fbx" />
+    <EmbeddedResource Include="Assets\Meshes\EF-24G.fbx" Condition="Exists('Assets\Meshes\EF-24G.fbx')" LogicalName="EF-24G.fbx" />
+    <EmbeddedResource Include="Assets\Sounds\1_kill.mp3" Condition="Exists('Assets\Sounds\1_kill.mp3')" LogicalName="1_kill.mp3" />
+    <EmbeddedResource Include="Assets\Sounds\2_doublekill.mp3" Condition="Exists('Assets\Sounds\2_doublekill.mp3')" LogicalName="2_doublekill.mp3" />
+    <EmbeddedResource Include="Assets\Sounds\3_triplekill.mp3" Condition="Exists('Assets\Sounds\3_triplekill.mp3')" LogicalName="3_triplekill.mp3" />
+    <EmbeddedResource Include="Assets\Sounds\4_megakill.mp3" Condition="Exists('Assets\Sounds\4_megakill.mp3')" LogicalName="4_megakill.mp3" />
+    <EmbeddedResource Include="Assets\Sounds\5_ultrakill.mp3" Condition="Exists('Assets\Sounds\5_ultrakill.mp3')" LogicalName="5_ultrakill.mp3" />
+    <EmbeddedResource Include="Assets\Sounds\6_monsterkill.mp3" Condition="Exists('Assets\Sounds\6_monsterkill.mp3')" LogicalName="6_monsterkill.mp3" />
+    <EmbeddedResource Include="Assets\Sounds\7_ludicrouskill.mp3" Condition="Exists('Assets\Sounds\7_ludicrouskill.mp3')" LogicalName="7_ludicrouskill.mp3" />
+    <EmbeddedResource Include="Assets\Sounds\8_holyshit.mp3" Condition="Exists('Assets\Sounds\8_holyshit.mp3')" LogicalName="8_holyshit.mp3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="icon.ico" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Assets\Sounds\*.mp3" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Assets\Meshes\*.fbx" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

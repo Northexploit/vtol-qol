@@ -7,6 +7,7 @@ using System.Drawing.Text;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
+
 public class OpenGLRadarControl : Control
 {
     [StructLayout(LayoutKind.Sequential)]
@@ -1235,3 +1236,4 @@ public class OpenGLRadarControl : Control
         glDisable(GL_TEXTURE_2D);
     }
 }
+
