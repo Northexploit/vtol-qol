@@ -1,3 +1,19 @@
 @echo off
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:icon.ico /out:VTOL_QoL.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /resource:ffmpeg.exe /resource:yt-dlp.exe VTOL_QoL.cs
+set CSC="C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+set WPF="C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF"
+
+%CSC% /target:winexe /out:VTOL_QoL.exe ^
+  /r:System.dll ^
+  /r:System.Core.dll ^
+  /r:System.Drawing.dll ^
+  /r:System.Windows.Forms.dll ^
+  /r:System.IO.Compression.dll ^
+  /r:System.IO.Compression.FileSystem.dll ^
+  /r:System.Xaml.dll ^
+  /r:%WPF%\PresentationCore.dll ^
+  /r:%WPF%\PresentationFramework.dll ^
+  /r:%WPF%\WindowsBase.dll ^
+  /r:%WPF%\WindowsFormsIntegration.dll ^
+  VTOL_QoL.cs
+
 pause
