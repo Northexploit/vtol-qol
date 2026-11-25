@@ -2684,68 +2684,80 @@ public static class WorkshopBrowser
     private delegate bool SteamAPI_InitDelegate();
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void SteamAPI_RunCallbacksDelegate();
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate IntPtr SteamUGCDelegate();
 
-    [UnmanagedFunctionPointer(CallingConvention.ThisCall)]
-    private delegate ulong SubscribeItemDelegate(IntPtr self, ulong nPublishedFileID);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate ulong Flat_UGC_SubscribeItem(IntPtr self, ulong nPublishedFileID);
 
-    private static bool TryNativeSteamSubscribe(string gameRoot, ulong fileId)
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate bool Flat_UGC_DownloadItem(IntPtr self, ulong nPublishedFileID, [MarshalAs(UnmanagedType.I1)] bool bHighPriority);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate bool Flat_UGC_GetItemDownloadInfo(IntPtr self, ulong nPublishedFileID, out ulong punBytesDownloaded, out ulong punBytesTotal);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint Flat_UGC_GetItemState(IntPtr self, ulong nPublishedFileID);
+
+    private static T GetUgcExport<T>(IntPtr hMod, string procName) where T : class
     {
-        try
+        IntPtr p = GetProcAddress(hMod, procName);
+        if (p == IntPtr.Zero) return null;
+        return (T)(object)Marshal.GetDelegateForFunctionPointer(p, typeof(T));
+    }
+
+    private static IntPtr GetNativeUgcInterface(string gameRoot, out IntPtr hModOut)
+    {
+        hModOut = IntPtr.Zero;
+        if (Process.GetProcessesByName("steam").Length == 0) return IntPtr.Zero;
+
+        string dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\x86_64\steam_api64.dll");
+        if (!File.Exists(dllPath))
+            dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\steam_api64.dll");
+        if (!File.Exists(dllPath)) return IntPtr.Zero;
+
+        Environment.SetEnvironmentVariable("SteamAppId", "667970");
+        Environment.SetEnvironmentVariable("SteamGameId", "667970");
+
+        IntPtr hMod = LoadLibrary(dllPath);
+        if (hMod == IntPtr.Zero) return IntPtr.Zero;
+
+        SteamAPI_InitDelegate fnInit = GetUgcExport<SteamAPI_InitDelegate>(hMod, "SteamAPI_Init");
+        if (fnInit == null || !fnInit()) return IntPtr.Zero;
+
+        string[] ugcExports = new string[] {
+            "SteamAPI_SteamUGC_v021", "SteamAPI_SteamUGC_v020", "SteamAPI_SteamUGC_v018",
+            "SteamAPI_SteamUGC_v017", "SteamAPI_SteamUGC_v016", "SteamAPI_SteamUGC_v015", "SteamUGC"
+        };
+        foreach (string exp in ugcExports)
         {
-            string dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\x86_64\steam_api64.dll");
-            if (!File.Exists(dllPath))
-                dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\steam_api64.dll");
-            if (!File.Exists(dllPath)) return false;
-
-            Environment.SetEnvironmentVariable("SteamAppId", "667970");
-            Environment.SetEnvironmentVariable("SteamGameId", "667970");
-
-            IntPtr hMod = LoadLibrary(dllPath);
-            if (hMod == IntPtr.Zero) return false;
-
-            IntPtr pInit = GetProcAddress(hMod, "SteamAPI_Init");
-            if (pInit == IntPtr.Zero) return false;
-
-            SteamAPI_InitDelegate fnInit = (SteamAPI_InitDelegate)Marshal.GetDelegateForFunctionPointer(pInit, typeof(SteamAPI_InitDelegate));
-            if (!fnInit()) return false;
-
-            string[] ugcExports = new string[] { "SteamAPI_SteamUGC_v020", "SteamAPI_SteamUGC_v018", "SteamAPI_SteamUGC_v017", "SteamAPI_SteamUGC_v016", "SteamAPI_SteamUGC_v015", "SteamUGC" };
-            IntPtr ugcPtr = IntPtr.Zero;
-            foreach (string exp in ugcExports)
+            SteamUGCDelegate fnUgc = GetUgcExport<SteamUGCDelegate>(hMod, exp);
+            if (fnUgc != null)
             {
-                IntPtr pGetUgc = GetProcAddress(hMod, exp);
-                if (pGetUgc != IntPtr.Zero)
+                IntPtr ptr = fnUgc();
+                if (ptr != IntPtr.Zero)
                 {
-                    SteamUGCDelegate fnUgc = (SteamUGCDelegate)Marshal.GetDelegateForFunctionPointer(pGetUgc, typeof(SteamUGCDelegate));
-                    ugcPtr = fnUgc();
-                    if (ugcPtr != IntPtr.Zero) break;
+                    hModOut = hMod;
+                    return ptr;
                 }
             }
-            if (ugcPtr == IntPtr.Zero) return false;
-
-            IntPtr vtable = Marshal.ReadIntPtr(ugcPtr);
-            IntPtr pSub = Marshal.ReadIntPtr(vtable, 27 * IntPtr.Size);
-            SubscribeItemDelegate fnSub = (SubscribeItemDelegate)Marshal.GetDelegateForFunctionPointer(pSub, typeof(SubscribeItemDelegate));
-            ulong callHandle = fnSub(ugcPtr, fileId);
-            AppLogger.Log("WORKSHOP", "Native SteamUGC SubscribeItem вызван, handle=" + callHandle);
-            return callHandle != 0;
         }
-        catch (Exception ex)
-        {
-            AppLogger.Error("WORKSHOP", "TryNativeSteamSubscribe", ex);
-            return false;
-        }
+        return IntPtr.Zero;
     }
 
     public static volatile bool CancelWait = false;
 
-    public static bool SubscribeAndDownloadWorkshop(WorkshopCatalogItem item, string gameRoot, Action<string> onStatus)
+    public static bool SubscribeAndDownloadWorkshop(WorkshopCatalogItem item, string gameRoot, Action<int, string> onProgress)
     {
         CancelWait = false;
-        AppLogger.Log("WORKSHOP", "Подписка на ID=" + item.PublishedFileId + " (" + item.Title + ")");
+        AppLogger.Log("WORKSHOP", "Авто-подписка и загрузка ID=" + item.PublishedFileId + " (" + item.Title + ")");
         if (string.IsNullOrEmpty(gameRoot) || !Directory.Exists(gameRoot))
             throw new Exception("Не определена папка игры VTOL VR.");
+
+        if (Process.GetProcessesByName("steam").Length == 0)
+            throw new Exception("Клиент Steam не запущен. Запустите Steam для скачивания ливреи.");
 
         string steamLibRoot = Path.GetFullPath(Path.Combine(gameRoot, @"..\..\.."));
         string gameWorkshopContent = Path.Combine(steamLibRoot, @"steamapps\workshop\content\667970");
@@ -2753,33 +2765,78 @@ public static class WorkshopBrowser
         string targetFolder = Path.Combine(gameWorkshopContent, item.PublishedFileId);
 
         ulong fileIdNum;
-        ulong.TryParse(item.PublishedFileId, out fileIdNum);
+        if (!ulong.TryParse(item.PublishedFileId, out fileIdNum) || fileIdNum == 0)
+            throw new Exception("Некорректный ID ливреи.");
 
-        bool nativeOk = (IntPtr.Size == 8 && fileIdNum > 0) && TryNativeSteamSubscribe(gameRoot, fileIdNum);
-        if (nativeOk)
+        IntPtr hMod;
+        IntPtr ugcPtr = GetNativeUgcInterface(gameRoot, out hMod);
+        if (ugcPtr == IntPtr.Zero)
+            throw new Exception("Не удалось подключиться к Steamworks UGC. Проверьте, что вы вошли в аккаунт Steam.");
+
+        SteamAPI_RunCallbacksDelegate fnCallbacks = GetUgcExport<SteamAPI_RunCallbacksDelegate>(hMod, "SteamAPI_RunCallbacks");
+        Flat_UGC_SubscribeItem fnSub = GetUgcExport<Flat_UGC_SubscribeItem>(hMod, "SteamAPI_ISteamUGC_SubscribeItem");
+        Flat_UGC_DownloadItem fnDownload = GetUgcExport<Flat_UGC_DownloadItem>(hMod, "SteamAPI_ISteamUGC_DownloadItem");
+        Flat_UGC_GetItemDownloadInfo fnGetInfo = GetUgcExport<Flat_UGC_GetItemDownloadInfo>(hMod, "SteamAPI_ISteamUGC_GetItemDownloadInfo");
+        Flat_UGC_GetItemState fnGetState = GetUgcExport<Flat_UGC_GetItemState>(hMod, "SteamAPI_ISteamUGC_GetItemState");
+
+        if (onProgress != null) onProgress(5, "Оформление подписки в Steam...");
+        if (fnSub != null)
         {
-            if (onStatus != null) onStatus("Подписка оформлена! Ожидание загрузки...");
-        }
-        else
-        {
-            if (onStatus != null) onStatus("Нажмите «Подписаться» в Steam (клик сюда — отмена)");
-            Process.Start(new ProcessStartInfo("steam://url/CommunityFilePage/" + item.PublishedFileId) { UseShellExecute = true });
+            ulong subCall = fnSub(ugcPtr, fileIdNum);
+            AppLogger.Log("WORKSHOP", "Flat SubscribeItem -> callHandle=" + subCall);
         }
 
-        DateTime deadline = DateTime.UtcNow.AddSeconds(20);
+        if (fnCallbacks != null) fnCallbacks();
+        Thread.Sleep(400);
+
+        if (fnDownload != null)
+        {
+            bool dlStarted = fnDownload(ugcPtr, fileIdNum, true);
+            AppLogger.Log("WORKSHOP", "Flat DownloadItem(highPriority=true) -> " + dlStarted);
+        }
+
+        DateTime deadline = DateTime.UtcNow.AddSeconds(45);
+        int lastPct = 10;
+
         while (DateTime.UtcNow < deadline)
         {
             if (CancelWait) return false;
+            if (fnCallbacks != null) fnCallbacks();
 
-            if (Directory.Exists(targetFolder) && Directory.GetFiles(targetFolder, "*.*", SearchOption.AllDirectories).Length > 0)
+            uint state = fnGetState != null ? fnGetState(ugcPtr, fileIdNum) : 0;
+            // k_EItemStateInstalled = 4, k_EItemStateDownloading = 16, k_EItemStateDownloadPending = 32
+            bool isInstalledFlag = (state & 4) != 0 && (state & 16) == 0 && (state & 32) == 0;
+
+            ulong bytesDone = 0, bytesTotal = 0;
+            if (fnGetInfo != null && fnGetInfo(ugcPtr, fileIdNum, out bytesDone, out bytesTotal) && bytesTotal > 0)
             {
-                Thread.Sleep(1000);
+                int pct = Math.Min(99, Math.Max(10, (int)((bytesDone * 100.0) / bytesTotal)));
+                lastPct = pct;
+                double mbDone = bytesDone / (1024.0 * 1024.0);
+                double mbTotal = bytesTotal / (1024.0 * 1024.0);
+                if (onProgress != null)
+                    onProgress(pct, string.Format("Скачивание: {0}% ({1:F1} / {2:F1} МБ)", pct, mbDone, mbTotal));
+            }
+            else if ((state & 32) != 0)
+            {
+                if (onProgress != null) onProgress(lastPct, "В очереди загрузки Steam...");
+            }
+            else if ((state & 16) != 0)
+            {
+                if (onProgress != null) onProgress(Math.Max(lastPct, 25), "Загрузка файлов из Steam...");
+            }
+
+            if ((isInstalledFlag || (state == 0 && lastPct > 50)) &&
+                Directory.Exists(targetFolder) && Directory.GetFiles(targetFolder, "*.*", SearchOption.AllDirectories).Length > 0)
+            {
+                if (onProgress != null) onProgress(100, "Завершение установки...");
+                Thread.Sleep(600);
                 WriteWorkshopMetadata(targetFolder, item);
-                MinimizeSteamWindows();
-                AppLogger.Log("WORKSHOP", "Мод успешно скачан клиентом Steam в " + targetFolder);
+                AppLogger.Log("WORKSHOP", "Мод автоматически скачан без открытия окон Steam: " + targetFolder);
                 return true;
             }
-            Thread.Sleep(500);
+
+            Thread.Sleep(350);
         }
 
         return false;
@@ -2802,46 +2859,22 @@ public static class WorkshopBrowser
         if (!string.IsNullOrEmpty(item.AircraftTag) && item.AircraftTag != "Не определен")
             LiveryParser.SaveUserAircraftMapping(targetFolder, item.AircraftTag);
     }
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate ulong Flat_UGC_UnsubscribeItem(IntPtr self, ulong nPublishedFileID);
+
     private static bool TryNativeSteamUnsubscribe(string gameRoot, ulong fileId)
     {
         try
         {
-            string dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\x86_64\steam_api64.dll");
-            if (!File.Exists(dllPath))
-                dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\steam_api64.dll");
-            if (!File.Exists(dllPath)) return false;
-
-            Environment.SetEnvironmentVariable("SteamAppId", "667970");
-            Environment.SetEnvironmentVariable("SteamGameId", "667970");
-
-            IntPtr hMod = LoadLibrary(dllPath);
-            if (hMod == IntPtr.Zero) return false;
-
-            IntPtr pInit = GetProcAddress(hMod, "SteamAPI_Init");
-            if (pInit == IntPtr.Zero) return false;
-
-            SteamAPI_InitDelegate fnInit = (SteamAPI_InitDelegate)Marshal.GetDelegateForFunctionPointer(pInit, typeof(SteamAPI_InitDelegate));
-            if (!fnInit()) return false;
-
-            string[] ugcExports = new string[] { "SteamAPI_SteamUGC_v020", "SteamAPI_SteamUGC_v018", "SteamAPI_SteamUGC_v017", "SteamAPI_SteamUGC_v016", "SteamAPI_SteamUGC_v015", "SteamUGC" };
-            IntPtr ugcPtr = IntPtr.Zero;
-            foreach (string exp in ugcExports)
-            {
-                IntPtr pGetUgc = GetProcAddress(hMod, exp);
-                if (pGetUgc != IntPtr.Zero)
-                {
-                    SteamUGCDelegate fnUgc = (SteamUGCDelegate)Marshal.GetDelegateForFunctionPointer(pGetUgc, typeof(SteamUGCDelegate));
-                    ugcPtr = fnUgc();
-                    if (ugcPtr != IntPtr.Zero) break;
-                }
-            }
+            IntPtr hMod;
+            IntPtr ugcPtr = GetNativeUgcInterface(gameRoot, out hMod);
             if (ugcPtr == IntPtr.Zero) return false;
 
-            IntPtr vtable = Marshal.ReadIntPtr(ugcPtr);
-            IntPtr pUnsub = Marshal.ReadIntPtr(vtable, 28 * IntPtr.Size);
-            SubscribeItemDelegate fnUnsub = (SubscribeItemDelegate)Marshal.GetDelegateForFunctionPointer(pUnsub, typeof(SubscribeItemDelegate));
+            Flat_UGC_UnsubscribeItem fnUnsub = GetUgcExport<Flat_UGC_UnsubscribeItem>(hMod, "SteamAPI_ISteamUGC_UnsubscribeItem");
+            if (fnUnsub == null) return false;
+
             ulong callHandle = fnUnsub(ugcPtr, fileId);
-            AppLogger.Log("WORKSHOP", "Native SteamUGC UnsubscribeItem вызван, handle=" + callHandle);
+            AppLogger.Log("WORKSHOP", "Flat SteamUGC UnsubscribeItem вызван, handle=" + callHandle);
             return callHandle != 0;
         }
         catch (Exception ex)
@@ -5188,6 +5221,7 @@ public class LiveryManagerForm : Form
 
     private Button btn3D;
     private Button btnDownloadWs;
+    private Button btnDeleteWs;
     private Button btnInstallFolder;
     private Button btnInstallZip;
     private Button btnDelete;
@@ -5343,9 +5377,12 @@ public class LiveryManagerForm : Form
         btn3D.Click += Btn3D_Click;
 
         btnDownloadWs = new Button() { Text = "⬇ Скачать ливрею", Location = new Point(500, 302), Size = new Size(390, 42), FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 130, 80), ForeColor = Color.White, Font = new Font("Consolas", 10f, FontStyle.Bold), Visible = false };
-
         btnDownloadWs.Click += BtnDownloadWs_Click;
         this.Controls.Add(btnDownloadWs);
+
+        btnDeleteWs = new Button() { Text = "🗑 Удалить установленную ливрею", Location = new Point(500, 352), Size = new Size(390, 36), FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(140, 35, 35), ForeColor = Color.White, Font = new Font("Consolas", 9.5f, FontStyle.Bold), Visible = false };
+        btnDeleteWs.Click += BtnDeleteWs_Click;
+        this.Controls.Add(btnDeleteWs);
 
         btnInstallFolder = CreateBtn("+ Добавить скин", 500, ref top, btnW, btnH, gap, Color.FromArgb(0, 110, 140));
         btnInstallFolder.Click += BtnInstallFolder_Click;
@@ -5406,6 +5443,7 @@ public class LiveryManagerForm : Form
         btnOpenDir.Visible = !catalog;
         btnOpenItemDir.Visible = !catalog;
         btnDownloadWs.Visible = catalog;
+        if (!catalog && btnDeleteWs != null) btnDeleteWs.Visible = false;
 
         if (catalog) { catalogPage = 1; SearchCatalogAsync(); }
         else LoadLiveries();
@@ -5530,19 +5568,27 @@ public class LiveryManagerForm : Form
 
         if (lstLiveries.SelectedIndex < 0 || lstLiveries.SelectedIndex >= catalogItems.Count)
         {
-            MessageBox.Show("Выберите ливрею из каталога для скачивания.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show("Выберите ливрею из каталога.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
         WorkshopCatalogItem item = catalogItems[lstLiveries.SelectedIndex];
+        string existingFolder = GetWorkshopItemFolder(item.PublishedFileId);
+        if (!string.IsNullOrEmpty(existingFolder) && Directory.Exists(existingFolder))
+        {
+            OpenCatalogItemIn3D(item, existingFolder);
+            return;
+        }
         isWaitingDownload = true;
         btnDownloadWs.BackColor = Color.FromArgb(140, 95, 20);
-        btnDownloadWs.Text = "⏳ Ожидание Steam... (нажмите для отмены)";
+        btnDownloadWs.Text = "⏳ Подписка... (нажмите для отмены)";
 
         ProgressBar pbWs = new ProgressBar();
-        pbWs.Style = ProgressBarStyle.Marquee;
-        pbWs.MarqueeAnimationSpeed = 25;
-        pbWs.Location = new Point(500, 352);
+        pbWs.Style = ProgressBarStyle.Continuous;
+        pbWs.Minimum = 0;
+        pbWs.Maximum = 100;
+        pbWs.Value = 5;
+        pbWs.Location = new Point(500, 396);
         pbWs.Size = new Size(390, 16);
         this.Controls.Add(pbWs);
 
@@ -5551,12 +5597,13 @@ public class LiveryManagerForm : Form
             string errMsg = null;
             try
             {
-                downloaded = WorkshopBrowser.SubscribeAndDownloadWorkshop(item, gameRoot, msg => {
+                downloaded = WorkshopBrowser.SubscribeAndDownloadWorkshop(item, gameRoot, (pct, msg) => {
                     try
                     {
                         this.Invoke(new Action(delegate {
                             if (isWaitingDownload)
                             {
+                                pbWs.Value = Math.Max(0, Math.Min(100, pct));
                                 lblStatus.Text = msg;
                                 btnDownloadWs.Text = "⏳ " + msg;
                             }
@@ -5582,25 +5629,24 @@ public class LiveryManagerForm : Form
 
                     if (downloaded)
                     {
-                        this.Activate();
-                        this.BringToFront();
-                        lblStatus.Text = "✔ Ливрея \"" + item.Title + "\" установлена и готова к использованию!";
+                        lblStatus.Text = "✔ Ливрея \"" + item.Title + "\" скачана и установлена!";
                         int selIdx = lstLiveries.SelectedIndex;
                         if (selIdx >= 0 && selIdx < lstLiveries.Items.Count)
                         {
                             string curText = lstLiveries.Items[selIdx].ToString();
                             if (!curText.StartsWith("✔ "))
-                                lstLiveries.Items[selIdx] = "✔ " + curText + " [УСТАНОВЛЕНО]";
+                                lstLiveries.Items[selIdx] = "✔ " + curText + "  [УСТАНОВЛЕНО]";
                         }
+                        SetCatalogPrimaryButtonMode(true);
+                        if (btnDeleteWs != null) btnDeleteWs.Visible = true;
                     }
-
                     else if (!string.IsNullOrEmpty(errMsg))
                     {
                         lblStatus.Text = "Ошибка: " + errMsg;
                     }
                     else
                     {
-                        lblStatus.Text = "Ожидание завершено. Нажмите «Обн.» во вкладке «Мои ливреи», если подписка уже оформлена.";
+                        lblStatus.Text = "Загрузка отменена или превышено время ожидания.";
                     }
                 }));
             }
@@ -5637,6 +5683,81 @@ public class LiveryManagerForm : Form
         }
     }
 
+    private string GetWorkshopItemFolder(string publishedFileId)
+    {
+        if (string.IsNullOrEmpty(gameRoot) || string.IsNullOrEmpty(publishedFileId)) return "";
+        string steamLibRoot = Path.GetFullPath(Path.Combine(gameRoot, @"..\..\.."));
+        return Path.Combine(steamLibRoot, @"steamapps\workshop\content\667970", publishedFileId);
+    }
+
+    private void BtnDeleteWs_Click(object sender, EventArgs e)
+    {
+        if (!isCatalogMode || lstLiveries.SelectedIndex < 0 || lstLiveries.SelectedIndex >= catalogItems.Count) return;
+        WorkshopCatalogItem item = catalogItems[lstLiveries.SelectedIndex];
+        string folderPath = GetWorkshopItemFolder(item.PublishedFileId);
+
+        if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath))
+        {
+            if (btnDeleteWs != null) btnDeleteWs.Visible = false;
+            return;
+        }
+
+        if (MessageBox.Show("Отписаться и удалить Workshop-ливрею \"" + item.Title + "\"?",
+            "Подтверждение удаления", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+        {
+            try
+            {
+                WorkshopBrowser.UnsubscribeAndDeleteWorkshop(folderPath, gameRoot);
+                int selIdx = lstLiveries.SelectedIndex;
+                if (selIdx >= 0 && selIdx < lstLiveries.Items.Count)
+                {
+                    lstLiveries.Items[selIdx] = string.Format("[WS #{0}] {1}", item.PublishedFileId, item.Title);
+                }
+                SetCatalogPrimaryButtonMode(false);
+                if (btnDeleteWs != null) btnDeleteWs.Visible = false;
+                lblStatus.Text = "Ливрея \"" + item.Title + "\" удалена из Steam Workshop.";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Ошибка удаления: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+    }
+
+    private void SetCatalogPrimaryButtonMode(bool isInstalled)
+    {
+        if (btnDownloadWs == null) return;
+        if (isInstalled)
+        {
+            btnDownloadWs.Text = "🎮 3D-просмотр";
+            btnDownloadWs.BackColor = Color.FromArgb(70, 50, 110);
+        }
+        else
+        {
+            btnDownloadWs.Text = "⬇ Скачать ливрею";
+            btnDownloadWs.BackColor = Color.FromArgb(0, 130, 80);
+        }
+    }
+
+    private void OpenCatalogItemIn3D(WorkshopCatalogItem item, string folderPath)
+    {
+        try
+        {
+            LiveryEntry parsed = LiveryParser.ParseFolder(folderPath, "Workshop");
+            if (string.IsNullOrEmpty(parsed.Name) || parsed.Name == item.PublishedFileId)
+                parsed.Name = item.Title;
+            if (parsed.Aircraft == "Не определен" && !string.IsNullOrEmpty(item.AircraftTag) && item.AircraftTag != "Не определен")
+                parsed.Aircraft = item.AircraftTag;
+
+            using (Livery3DViewerForm viewer = new Livery3DViewerForm(parsed))
+                viewer.ShowDialog(this);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Ошибка открытия 3D-просмотра: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     private void UpdatePreview()
     {
         int currentPrevGen = ++previewLoadGen;
@@ -5649,10 +5770,18 @@ public class LiveryManagerForm : Form
             if (lstLiveries.SelectedIndex < 0 || lstLiveries.SelectedIndex >= catalogItems.Count)
             {
                 lblPreviewInfo.Text = "Выберите скин из каталога";
+                SetCatalogPrimaryButtonMode(false);
+                if (btnDeleteWs != null) btnDeleteWs.Visible = false;
                 return;
             }
             WorkshopCatalogItem item = catalogItems[lstLiveries.SelectedIndex];
             lblPreviewInfo.Text = item.Title + " (ID: " + item.PublishedFileId + ")";
+
+            string wsFolder = GetWorkshopItemFolder(item.PublishedFileId);
+            bool isInstalled = (!string.IsNullOrEmpty(wsFolder) && Directory.Exists(wsFolder));
+            SetCatalogPrimaryButtonMode(isInstalled);
+            if (btnDeleteWs != null)
+                btnDeleteWs.Visible = isInstalled;
 
             if (string.IsNullOrEmpty(item.PreviewUrl))
             {
@@ -7985,7 +8114,6 @@ public class MainForm : Form
         }
 
     }
-
 
     private static bool SettingsManagerSafeGetShuffleFlag()
     {
