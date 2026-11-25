@@ -4034,6 +4034,84 @@ public static class DebriefEngine
             s.Launches.Add(dl);
         }
         s.Launches.Sort((a, b) => a.Time.CompareTo(b.Time));
+
+        // 5. Лучи захвата для борта игрока и его ракет.
+        // Игра не пишет LockingRadar/customTracks для техники игрока, поэтому восстанавливаем
+        // их тем же видом луча (MY_LOCK) по фактам из треков: пуск + подтверждённая цель.
+        foreach (DebriefLaunch dl in s.Launches)
+        {
+            if (dl.Side != "МОЙ" || string.IsNullOrEmpty(dl.TargetName)) continue;
+
+            DebriefEntity mslEnt = null;
+            DebriefEntity tgtEnt = null;
+            foreach (DebriefEntity e in s.Entities)
+            {
+                if (mslEnt == null && e.Id == dl.MissileId) mslEnt = e;
+                if (tgtEnt == null && e.Name == dl.TargetName) tgtEnt = e;
+            }
+            if (mslEnt == null || tgtEnt == null || mslEnt.Track.Count == 0) continue;
+
+            bool alreadyHasLock = false;
+            foreach (TacticalBeam existing in s.Beams)
+            {
+                if (existing.Kind == "MY_LOCK" && existing.FromId == mslEnt.Id)
+                {
+                    alreadyHasLock = true;
+                    break;
+                }
+            }
+            if (alreadyHasLock) continue;
+
+            DebriefSample m0 = mslEnt.Track[0];
+            DebriefSample t0 = tgtEnt.GetStateAt(mslEnt.FirstTime);
+            if (t0 == null) continue;
+
+            // Луч от ракеты к цели — на всё время её полёта
+            s.Beams.Add(new TacticalBeam
+            {
+                StartTime = mslEnt.FirstTime,
+                EndTime = mslEnt.LastTime,
+                Kind = "MY_LOCK",
+                FromId = mslEnt.Id,
+                ToId = tgtEnt.Id,
+                FromName = (mslEnt.Type == "Missile" ? "[АРЛ] " : "") + mslEnt.Name,
+                ToName = tgtEnt.Name,
+                FromX = m0.X,
+                FromY = m0.Y,
+                ToX = t0.X,
+                ToY = t0.Y
+            });
+
+            // Луч от борта игрока к цели — момент пуска
+            if (mslEnt.Pilot != null && mslEnt.Pilot.StartsWith("MY_MISSILE:"))
+            {
+                string ownerName = mslEnt.Pilot.Substring("MY_MISSILE:".Length);
+                DebriefEntity ownerEnt = null;
+                foreach (DebriefEntity e in s.Entities)
+                    if (e.IsPlayer && e.Name == ownerName) { ownerEnt = e; break; }
+                if (ownerEnt != null)
+                {
+                    DebriefSample o0 = ownerEnt.GetStateAt(mslEnt.FirstTime);
+                    if (o0 != null)
+                    {
+                        s.Beams.Add(new TacticalBeam
+                        {
+                            StartTime = mslEnt.FirstTime,
+                            EndTime = Math.Min(mslEnt.LastTime, mslEnt.FirstTime + 2.0),
+                            Kind = "MY_LOCK",
+                            FromId = ownerEnt.Id,
+                            ToId = tgtEnt.Id,
+                            FromName = ownerEnt.Name,
+                            ToName = tgtEnt.Name,
+                            FromX = o0.X,
+                            FromY = o0.Y,
+                            ToX = t0.X,
+                            ToY = t0.Y
+                        });
+                    }
+                }
+            }
+        }
     }
 
 
