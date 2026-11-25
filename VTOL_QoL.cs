@@ -16,6 +16,56 @@ using OpenFileDialog = System.Windows.Forms.OpenFileDialog;
 using SaveFileDialog = System.Windows.Forms.SaveFileDialog;
 
 
+
+// =========================================================================
+// === ЕДИНЫЙ ЛОГ ОТЛАДКИ ПРОГРАММЫ (app_debug.log) ========================
+// =========================================================================
+public static class AppLogger
+{
+    private static readonly object logLock = new object();
+    private static string logPath = null;
+
+    public static string GetLogPath()
+    {
+        if (logPath == null)
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL");
+            try { Directory.CreateDirectory(dir); } catch { }
+            logPath = Path.Combine(dir, "app_debug.log");
+        }
+        return logPath;
+    }
+
+    public static void InitSession()
+    {
+        try
+        {
+            string p = GetLogPath();
+            File.WriteAllText(p, "=== VTOL_QoL Debug Session: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===" + Environment.NewLine, Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    public static void Log(string module, string message)
+    {
+        lock (logLock)
+        {
+            try
+            {
+                string line = string.Format("[{0}] [{1}] {2}", DateTime.Now.ToString("HH:mm:ss.fff"), module, message);
+                File.AppendAllText(GetLogPath(), line + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { }
+        }
+    }
+
+    public static void Error(string module, string context, Exception ex)
+    {
+        Log(module, "ERROR (" + context + "): " + ex.GetType().Name + " — " + ex.Message);
+    }
+}
+
+
 // =========================================================================
 // === НАСТРОЙКИ (settings.ini в %LOCALAPPDATA%\VTOL_QoL) =================
 // =========================================================================
@@ -555,9 +605,25 @@ public static class AudioSessionDucking
 // =========================================================================
 public class GameTracker
 {
-    // ВНИМАНИЕ: впишите сюда Application ID, созданный на https://discord.com/developers/applications
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile
+    );
+
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint OPEN_EXISTING = 3;
+
+    // ВНИМАНИЕ: впишите сюда Application ID, созданный на https://discord.com
     // (кнопка "New Application" -> General Information -> Application ID).
     public const string DiscordClientId = "1573385169807872222";
+
 
     public volatile bool DiscordEnabled = true;
     public volatile bool DuckingEnabled = true;
@@ -565,6 +631,7 @@ public class GameTracker
     public volatile bool DiagnosticsEnabled = false;
 
     private bool running = false;
+    private static bool elevationAttempted = false;
     private LogPatterns patterns;
 
     private string originalPlaybackId = null;
@@ -597,7 +664,7 @@ public class GameTracker
         return sb.ToString();
     }
 
-    private void SendPacket(NamedPipeClientStream pipe, int op, string json)
+    private void SendPacket(Stream pipe, int op, string json)
     {
         byte[] jb = Encoding.UTF8.GetBytes(json);
         byte[] header = new byte[8];
@@ -608,7 +675,7 @@ public class GameTracker
         pipe.Flush();
     }
 
-    private byte[] ReadExact(NamedPipeClientStream pipe, int n)
+    private byte[] ReadExact(Stream pipe, int n)
     {
         byte[] buf = new byte[n];
         int total = 0;
@@ -625,7 +692,7 @@ public class GameTracker
         return buf;
     }
 
-    private bool ReadPacket(NamedPipeClientStream pipe, out int op, out string body)
+    private bool ReadPacket(Stream pipe, out int op, out string body)
     {
         op = 0; body = "";
         byte[] header = ReadExact(pipe, 8);
@@ -682,7 +749,7 @@ public class GameTracker
         long lastSeekPos = 0;
         bool wasRunning = false;
 
-        NamedPipeClientStream pipe = null;
+        Stream pipe = null;
         string aircraftRegexStr = patterns.BuildAircraftRegex();
 
         while (true)
@@ -716,7 +783,7 @@ public class GameTracker
                     if (wasRunning)
                     {
                         // Игра только что закрылась — шлём CLEAR и восстанавливаем аудио
-                        if (DiscordEnabled && pipe != null && pipe.IsConnected)
+                        if (DiscordEnabled && pipe != null)
                         {
                             try
                             {
@@ -755,7 +822,16 @@ public class GameTracker
                 {
                     // Игра только что запустилась
                     wasRunning = true;
-                    lastSeekPos = File.Exists(logPath) ? new FileInfo(logPath).Length : 0;
+                    AppLogger.Log("TRACKER", "Обнаружен запуск VTOLVR.exe! Файл лога: " + logPath + " (существует: " + File.Exists(logPath) + ")");
+                    if (File.Exists(logPath))
+                    {
+                        FileInfo fi = new FileInfo(logPath);
+                        lastSeekPos = (DateTime.Now - fi.LastWriteTime).TotalSeconds < 15 ? 0 : fi.Length;
+                    }
+                    else
+                    {
+                        lastSeekPos = 0;
+                    }
                     WriteFlightLog("SESSION", "В ангаре / Меню", "—", "00:00", 0, "Запуск VTOL VR");
 
                     if (AudioSwitchEnabled)
@@ -800,59 +876,130 @@ public class GameTracker
                                     }
                                 }
 
-                                if (DiscordEnabled || true) // логика статуса/логбука нужна и без дискорда для логбука
+                                // 0. Определяем актуальный ник пилота из строки "Set current pilot to shutze"
+                                Match mPilot = Regex.Match(chunk, @"Set current pilot to\s+(?<val>[^\r\n]+)", RegexOptions.IgnoreCase);
+                                if (mPilot.Success)
                                 {
-                                    string csPat = patterns.CallsignPatterns.Count > 0 ? patterns.CallsignPatterns[0] : @"((?:Alpha|Bravo|Charlie|Delta|Echo|Foxtrot|Golf|Hotel|India|Juliet|Kilo|Lima|Mike|November|Oscar|Papa|Quebec|Romeo|Sierra|Tango|Uniform|Victor|Whiskey|X-?ray|Yankee|Zulu)\s+\d+-\d+)";
-
-                                    Match mCs = !string.IsNullOrEmpty(myNickEsc)
-                                        ? Regex.Match(chunk, myNickEsc + @"[^\r\n]*?" + csPat)
-                                        : Regex.Match(chunk, csPat);
-                                    if (mCs.Success) currentCallsign = mCs.Groups[1].Value;
-
-                                    if (currentCallsign != "В ангаре / Меню")
+                                    string nick = mPilot.Groups["val"].Value.Trim();
+                                    if (nick.Length > 0 && nick != myNick)
                                     {
-                                        Match mPl = Regex.Match(chunk, aircraftRegexStr, RegexOptions.IgnoreCase);
-                                        if (mPl.Success)
+                                        myNick = nick;
+                                        myNickEsc = Regex.Escape(myNick);
+                                        AppLogger.Log("TRACKER", "Активный пилот: " + myNick);
+                                    }
+                                }
+
+                                // 1. Запоминаем выбранный самолёт ("Set current vehicle to F-45A"), но в статус пока не ставим
+                                MatchCollection mVehMatches = Regex.Matches(chunk, @"Set current vehicle to\s+(?<val>[^\r\n]+)", RegexOptions.IgnoreCase);
+                                foreach (Match mv in mVehMatches)
+                                {
+                                    string rawVeh = mv.Groups["val"].Value.Trim();
+                                    if (rawVeh.Equals("none", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        if (inSortie || currentAircraft != "В ангаре / Меню")
                                         {
-                                            string normalized = patterns.NormalizeAircraft(mPl.Groups[1].Value);
-                                            if (!inSortie || currentAircraft != normalized)
-                                            {
-                                                currentAircraft = normalized;
-                                                inSortie = true;
-                                                sortieStart = DateTime.Now;
-                                                WriteFlightLog("SORTIE", currentAircraft, currentCallsign, "00:00", 0, "Занятие слота и вылет");
-                                            }
+                                            if (inSortie)
+                                                WriteFlightLog("LANDED", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Возврат в ангар / меню");
+                                            currentAircraft = "В ангаре / Меню";
+                                            currentCallsign = "В ангаре / Меню";
+                                            inSortie = false;
+                                            AppLogger.Log("TRACKER", "Сброс в ангар / меню (vehicle=none).");
                                         }
                                     }
+                                    else
+                                    {
+                                        string normVeh = patterns.NormalizeAircraft(rawVeh);
+                                        if (inSortie && currentAircraft != normVeh)
+                                            currentAircraft = normVeh;
+                                        SettingsManager.Set("LastSelectedVehicle", normVeh);
+                                    }
+                                }
 
+                                // 2. Сброс при выходе из миссии (сингл или МП)
+                                if (inSortie && Regex.IsMatch(chunk, @"(?:PlayerSpawn destroyed\.|selectedSlot\s*=>\s*-1)", RegexOptions.IgnoreCase))
+                                {
+                                    WriteFlightLog("LANDED", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Завершение вылета / выход в брифинг");
+                                    currentAircraft = "В ангаре / Меню";
+                                    currentCallsign = "В ангаре / Меню";
+                                    inSortie = false;
+                                    AppLogger.Log("TRACKER", "Вылет завершён (выход в брифинг / меню).");
+                                }
+
+                                // 3. Мультиплеер: занятие слота ("Setting up slot UI: Allied 22 (Mike 1-1) = shutze")
+                                if (!string.IsNullOrEmpty(myNickEsc))
+                                {
+                                    MatchCollection slotMatches = Regex.Matches(chunk, @"Setting up slot UI:[^\r\n]*?\((?<val>[^)]+)\)\s*=\s*" + myNickEsc + @"\b", RegexOptions.IgnoreCase);
+                                    if (slotMatches.Count > 0)
+                                    {
+                                        string lastCs = slotMatches[slotMatches.Count - 1].Groups["val"].Value.Trim();
+                                        SettingsManager.Set("LastSlotCallsign", lastCs);
+                                        if (inSortie)
+                                            currentCallsign = lastCs;
+                                    }
+                                }
+
+                                // 4. Старт реального вылета:
+                                // В мультиплеере: "shutze has spawned" или "FlightLogger: shutze has spawned"
+                                // В одиночной игре: "PlayerSpawn:OnSpawnUnit()" или "Registering actor Player"
+                                bool mpSpawned = !string.IsNullOrEmpty(myNickEsc) && Regex.IsMatch(chunk, @"(?:FlightLogger:\s*)?" + myNickEsc + @"\s+has spawned", RegexOptions.IgnoreCase);
+                                bool spSpawned = Regex.IsMatch(chunk, @"PlayerSpawn:OnSpawnUnit\(\)|Registering actor Player \[\d+\]", RegexOptions.IgnoreCase);
+
+                                if (mpSpawned || spSpawned)
+                                {
+                                    string veh = SettingsManager.Get("LastSelectedVehicle", "В ангаре / Меню");
+                                    // Проверяем, нет ли в этом же куске лога строки "AV-42C (shutze)" или "F-45A (shutze)"
                                     if (!string.IsNullOrEmpty(myNickEsc))
                                     {
-                                        foreach (string killTpl in patterns.KillTemplates)
-                                        {
-                                            string pat = killTpl.Replace("{NICK}", myNickEsc);
-                                            if (Regex.IsMatch(chunk, "(?i)" + pat))
-                                            {
-                                                kills++;
-                                                WriteFlightLog("KILL", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Цель уничтожена");
-                                                break;
-                                            }
-                                        }
+                                        Match mActorVeh = Regex.Match(chunk, @"(?<val>" + aircraftRegexStr + @")\s*\(" + myNickEsc + @"\)", RegexOptions.IgnoreCase);
+                                        if (mActorVeh.Success)
+                                            veh = patterns.NormalizeAircraft(mActorVeh.Groups["val"].Value);
                                     }
 
-                                    bool hit = false;
-                                    foreach (string ejTpl in patterns.EjectTemplates)
+                                    string cs = mpSpawned
+                                        ? SettingsManager.Get("LastSlotCallsign", "В полёте")
+                                        : "Одиночный вылет";
+
+                                    if (!inSortie || currentAircraft != veh || currentCallsign != cs)
                                     {
-                                        string pat = !string.IsNullOrEmpty(myNickEsc) ? ejTpl.Replace("{NICK}", myNickEsc) : ejTpl.Replace("{NICK}", ".+?");
-                                        if (Regex.IsMatch(chunk, pat)) { hit = true; break; }
+                                        currentAircraft = veh;
+                                        currentCallsign = cs;
+                                        inSortie = true;
+                                        sortieStart = DateTime.Now;
+                                        AppLogger.Log("TRACKER", string.Format("Старт вылета ({0}): Борт={1}, Позывной={2}", mpSpawned ? "MP" : "SP", currentAircraft, currentCallsign));
+                                        WriteFlightLog("SORTIE", currentAircraft, currentCallsign, "00:00", 0, mpSpawned ? "Вылет (мультиплеер)" : "Вылет (одиночная миссия)");
                                     }
-                                    if (hit)
+                                }
+
+
+                                // 5. Сбитые цели
+                                if (!string.IsNullOrEmpty(myNickEsc))
+                                {
+                                    foreach (string killTpl in patterns.KillTemplates)
                                     {
-                                        string evType = chunk.IndexOf("ejected", StringComparison.OrdinalIgnoreCase) >= 0 ? "EJECT" : "KIA";
-                                        WriteFlightLog(evType, currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, evType == "EJECT" ? "Катапультирование" : "Борт сбит / потерян");
-                                        currentAircraft = "В ангаре / Меню";
-                                        currentCallsign = "В ангаре / Меню";
-                                        inSortie = false;
+                                        string pat = killTpl.Replace("{NICK}", myNickEsc);
+                                        if (Regex.IsMatch(chunk, "(?i)" + pat))
+                                        {
+                                            kills++;
+                                            WriteFlightLog("KILL", currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, "Цель уничтожена");
+                                            break;
+                                        }
                                     }
+                                }
+
+                                // 6. Катапультирование / потеря борта
+                                bool hit = false;
+                                foreach (string ejTpl in patterns.EjectTemplates)
+                                {
+                                    string pat = !string.IsNullOrEmpty(myNickEsc) ? ejTpl.Replace("{NICK}", myNickEsc) : ejTpl.Replace("{NICK}", ".+?");
+                                    if (Regex.IsMatch(chunk, pat)) { hit = true; break; }
+                                }
+                                if (hit)
+                                {
+                                    string evType = chunk.IndexOf("ejected", StringComparison.OrdinalIgnoreCase) >= 0 ? "EJECT" : "KIA";
+                                    WriteFlightLog(evType, currentAircraft, currentCallsign, GetDurStr(sortieStart), kills, evType == "EJECT" ? "Катапультирование" : "Борт сбит / потерян");
+                                    currentAircraft = "В ангаре / Меню";
+                                    currentCallsign = "В ангаре / Меню";
+                                    inSortie = false;
                                 }
                             }
                         }
@@ -860,6 +1007,7 @@ public class GameTracker
                 }
 
                 // Ducking
+
                 if (DuckingEnabled)
                 {
                     bool voiceActive = AudioSessionDucking.IsMicInUse();
@@ -869,29 +1017,86 @@ public class GameTracker
                 // Discord IPC
                 if (DiscordEnabled)
                 {
-                    if (pipe == null || !pipe.IsConnected)
+                    if (pipe == null)
                     {
                         for (int i = 0; i < 10; i++)
                         {
-                            try
+                            string pipeName = @"\\.\pipe\discord-ipc-" + i;
+                            Microsoft.Win32.SafeHandles.SafeFileHandle hPipe = CreateFile(
+                                pipeName,
+                                GENERIC_READ | GENERIC_WRITE,
+                                0,
+                                IntPtr.Zero,
+                                OPEN_EXISTING,
+                                0,
+                                IntPtr.Zero
+                            );
+
+                            if (!hPipe.IsInvalid)
                             {
-                                NamedPipeClientStream p = new NamedPipeClientStream(".", "discord-ipc-" + i, PipeDirection.InOut);
-                                p.Connect(150);
-                                if (p.IsConnected)
+                                try
                                 {
-                                    pipe = p;
+                                    FileStream fsPipe = new FileStream(hPipe, FileAccess.ReadWrite, 4096, false);
+                                    pipe = fsPipe;
                                     string hs = "{\"v\":1,\"client_id\":\"" + DiscordClientId + "\"}";
                                     SendPacket(pipe, 0, hs);
                                     int op; string body;
-                                    ReadPacket(pipe, out op, out body);
-                                    break;
+                                    bool ok = ReadPacket(pipe, out op, out body);
+                                    AppLogger.Log("DISCORD", string.Format("Пайп discord-ipc-{0}: ok={1}, op={2}, body={3}", i, ok, op, body));
+                                    if (!ok)
+                                    {
+                                        pipe.Dispose();
+                                        pipe = null;
+                                    }
+                                    else
+                                    {
+                                        break;
+                                    }
+                                }
+                                catch (Exception exPipe)
+                                {
+                                    AppLogger.Log("DISCORD", string.Format("Ошибка обмена на discord-ipc-{0}: [{1}] {2}", i, exPipe.GetType().Name, exPipe.Message));
+                                    if (pipe != null) { try { pipe.Dispose(); } catch { } pipe = null; }
                                 }
                             }
-                            catch { }
+                            else
+                            {
+                                int err = Marshal.GetLastWin32Error();
+                                hPipe.Dispose();
+                                if (err != 2)
+                                {
+                                    AppLogger.Log("DISCORD", string.Format("CreateFile discord-ipc-{0} Win32Error={1}", i, err));
+                                    if (err == 5 && !elevationAttempted)
+                                    {
+                                        elevationAttempted = true;
+                                        bool isAdmin = new System.Security.Principal.WindowsPrincipal(
+                                            System.Security.Principal.WindowsIdentity.GetCurrent()
+                                        ).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+
+                                        if (!isAdmin)
+                                        {
+                                            AppLogger.Log("DISCORD", "Discord запущен с повышенными правами. Перезапуск VTOL_QoL от имени администратора...");
+                                            try
+                                            {
+                                                ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath);
+                                                psi.Verb = "runas";
+                                                psi.UseShellExecute = true;
+                                                Process.Start(psi);
+                                                Environment.Exit(0);
+                                            }
+                                            catch (Exception exElev)
+                                            {
+                                                AppLogger.Log("DISCORD", "Пользователь отменил запрос прав администратора: " + exElev.Message);
+                                            }
+                                        }
+                                    }
+                                }
+
+                            }
                         }
                     }
 
-                    if (pipe != null && pipe.IsConnected)
+                    if (pipe != null)
                     {
                         string det = "Борт: " + currentAircraft + (kills > 0 ? " | Сбито: " + kills : "");
                         string st = "Позывной: " + currentCallsign;
@@ -899,27 +1104,30 @@ public class GameTracker
                                       ",\"activity\":{\"details\":\"" + JsonEscape(det) +
                                       "\",\"state\":\"" + JsonEscape(st) +
                                       "\",\"timestamps\":{\"start\":" + startEpoch +
-                                      "},\"assets\":{\"large_text\":\"VTOL QoL by L.Shutze\"}}},\"nonce\":\"" + Guid.NewGuid() + "\"}";
+                                      "},\"assets\":{\"large_image\":\"vtol_logo\",\"large_text\":\"VTOL QoL by L.Shutze\"}}},\"nonce\":\"" + Guid.NewGuid() + "\"}";
                         try
                         {
                             SendPacket(pipe, 1, json);
                             int op; string body;
                             if (ReadPacket(pipe, out op, out body))
                             {
-                                if (op == 3) // ERROR
+                                if (op == 3)
                                 {
+                                    AppLogger.Log("DISCORD", "Discord вернул ошибку SET_ACTIVITY: " + body);
                                     try { pipe.Dispose(); } catch { }
                                     pipe = null;
                                 }
                             }
                             else
                             {
+                                AppLogger.Log("DISCORD", "ReadPacket вернул false после SET_ACTIVITY");
                                 try { pipe.Dispose(); } catch { }
                                 pipe = null;
                             }
                         }
-                        catch
+                        catch (Exception exSend)
                         {
+                            AppLogger.Error("DISCORD", "SET_ACTIVITY", exSend);
                             try { pipe.Dispose(); } catch { }
                             pipe = null;
                         }
@@ -930,6 +1138,7 @@ public class GameTracker
                     try { pipe.Dispose(); } catch { }
                     pipe = null;
                 }
+
             }
             catch
             {
@@ -1108,8 +1317,13 @@ public class MusicManagerForm : Form
         Button btnShuffle = CreateBtn("🔀 Перемешать", ref top, btnW, btnH, gap, Color.FromArgb(70, 50, 110));
         btnShuffle.Click += (s, e) => {
             if (MusicShuffler.IsGameRunning()) { MessageBox.Show("Закройте VTOL VR перед перемешиванием треков.", "Игра запущена", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-            if (MusicShuffler.ShuffleNow(musicDir, true)) { LoadTracks(); MessageBox.Show("Плейлист перемешан!", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information); }
+            if (MusicShuffler.ShuffleNow(musicDir, true))
+            {
+                LoadTracks();
+                lblCount.Text = "Всего треков: " + lstTracks.Items.Count + "  |  Плейлист перемешан!";
+            }
         };
+
 
         Button btnCleanPrefix = CreateBtn("Убрать 0001_", ref top, btnW, btnH, gap, Color.FromArgb(45, 75, 60));
         btnCleanPrefix.Click += (s, e) => {
@@ -1721,6 +1935,456 @@ public static class LiveryParser
         catch { return false; }
     }
 }
+// =========================================================================
+// === ОНЛАЙН-КАТАЛОГ И ЗАГРУЗЧИК STEAM WORKSHOP (ЧЕРЕЗ STEAMCMD) ==========
+// =========================================================================
+public class WorkshopCatalogItem
+{
+    public string PublishedFileId;
+    public string Title;
+    public string PreviewUrl;
+    public string AircraftTag;
+}
+
+public static class WorkshopBrowser
+{
+    public static void EnableTls12()
+    {
+        try { System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072; } catch { }
+    }
+
+    public static List<WorkshopCatalogItem> SearchLiveries(string query, string aircraftTag, int page)
+    {
+        EnableTls12();
+        List<WorkshopCatalogItem> list = new List<WorkshopCatalogItem>();
+
+        string qTrim = !string.IsNullOrEmpty(query) ? query.Trim() : "";
+        AppLogger.Log("WORKSHOP", string.Format("Поиск: query='{0}', tag='{1}', page={2}", qTrim, aircraftTag, page));
+
+        Match mDirectId = Regex.Match(qTrim, @"(?:id=|^)(?<val>\d{7,12})(?:&|$)");
+        if (mDirectId.Success)
+        {
+            string directId = mDirectId.Groups["val"].Value;
+            List<WorkshopCatalogItem> singleList = FetchDetailsBatch(new List<string> { directId }, aircraftTag);
+            if (singleList.Count > 0) return singleList;
+            WorkshopCatalogItem single = FetchSingleWorkshopItem(directId, aircraftTag);
+            if (single != null) list.Add(single);
+            return list;
+        }
+
+        string host = "steamcommunity.com";
+        string url = "https://" + host + "/workshop/browse/?appid=667970&browsesort=trend&section=readytouseitems&requiredtags%5B0%5D=Liveries&p=" + page;
+
+        if (!string.IsNullOrEmpty(aircraftTag) && aircraftTag != "Все самолеты" && aircraftTag != "Не определен")
+        {
+            string steamVehicleTag = aircraftTag == "FA-26B" ? "F/A-26B" : aircraftTag;
+            url += "&requiredtags%5B1%5D=" + Uri.EscapeDataString(steamVehicleTag);
+        }
+        if (!string.IsNullOrEmpty(qTrim))
+            url += "&searchtext=" + Uri.EscapeDataString(qTrim);
+
+        AppLogger.Log("WORKSHOP", "GET URL: " + url);
+
+        System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+        req.Method = "GET";
+        req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+        req.Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+        req.CookieContainer = new System.Net.CookieContainer();
+        req.CookieContainer.Add(new Uri("https://" + host), new System.Net.Cookie("birthtime", "283993201"));
+        req.CookieContainer.Add(new Uri("https://" + host), new System.Net.Cookie("wants_mature_content", "1"));
+        req.AllowAutoRedirect = true;
+        req.AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate;
+
+        string html = "";
+        using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse())
+        using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+            html = sr.ReadToEnd();
+
+        List<string> ids = new List<string>();
+        MatchCollection idMatches = Regex.Matches(html, @"sharedfiles/filedetails/\?id=(?<val>\d{7,12})", RegexOptions.IgnoreCase);
+        foreach (Match mId in idMatches)
+        {
+            string id = mId.Groups["val"].Value;
+            if (!ids.Contains(id)) ids.Add(id);
+        }
+
+        AppLogger.Log("WORKSHOP", "Найдено уникальных ID на странице: " + ids.Count);
+        if (ids.Count == 0) return list;
+
+        List<WorkshopCatalogItem> rawList = FetchDetailsBatch(ids, "Не определен");
+        if (string.IsNullOrEmpty(aircraftTag) || aircraftTag == "Все самолеты" || aircraftTag == "Не определен")
+            return rawList;
+
+        foreach (WorkshopCatalogItem it in rawList)
+        {
+            string ac = it.AircraftTag;
+            // Если в тегах Steam борт не был указан, пробуем определить его по названию мода
+            if (ac == "Не определен")
+            {
+                string t = it.Title;
+                if (Regex.IsMatch(t, @"(?i)(EF-?24|F-?14|Tomcat|Mischief)")) ac = "EF-24G";
+                else if (Regex.IsMatch(t, @"(?i)(F-?45|F-?22|F-?35|Ghost)")) ac = "F-45A";
+                else if (Regex.IsMatch(t, @"(?i)(AV-?42|Kestrel)")) ac = "AV-42C";
+                else if (Regex.IsMatch(t, @"(?i)(AH-?94|AH-?1|Cobra|Viper|Dragonfly)")) ac = "AH-94";
+                else if (Regex.IsMatch(t, @"(?i)(T-?55|Tyro|Trainer)")) ac = "T-55";
+                else if (Regex.IsMatch(t, @"(?i)(FA-?26|F/?A-?26|Wasp|F-?15|F-?16|F-?18|Su-?57|Felon)")) ac = "FA-26B";
+                it.AircraftTag = ac;
+            }
+
+            if (it.AircraftTag.Equals(aircraftTag, StringComparison.OrdinalIgnoreCase))
+                list.Add(it);
+        }
+
+        AppLogger.Log("WORKSHOP", string.Format("После строгого фильтра для {0} осталось: {1} из {2}", aircraftTag, list.Count, rawList.Count));
+        return list;
+    }
+
+
+    private static List<WorkshopCatalogItem> FetchDetailsBatch(List<string> ids, string defaultAircraftTag)
+    {
+        List<WorkshopCatalogItem> result = new List<WorkshopCatalogItem>();
+        try
+        {
+            StringBuilder postData = new StringBuilder();
+            postData.Append("itemcount=" + ids.Count);
+            for (int i = 0; i < ids.Count; i++)
+                postData.Append("&publishedfileids[" + i + "]=" + ids[i]);
+
+            byte[] bytes = Encoding.UTF8.GetBytes(postData.ToString());
+
+            string apiHost = "api." + "steampowered" + ".com";
+            string apiUrl = "https://" + apiHost + "/ISteamRemoteStorage/GetPublishedFileDetails/v1/";
+            System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(apiUrl);
+
+            req.Method = "POST";
+            req.Timeout = 8000;
+            req.ContentType = "application/x-www-form-urlencoded";
+            req.ContentLength = bytes.Length;
+            req.AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate;
+
+            using (Stream reqStream = req.GetRequestStream())
+                reqStream.Write(bytes, 0, bytes.Length);
+
+            string json = "";
+            using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse())
+            using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                json = sr.ReadToEnd();
+
+            string[] blocks = Regex.Split(json, @"""publishedfileid""\s*:\s*""");
+            Dictionary<string, WorkshopCatalogItem> map = new Dictionary<string, WorkshopCatalogItem>();
+
+            for (int i = 1; i < blocks.Length; i++)
+            {
+                string b = blocks[i];
+                int qEnd = b.IndexOf('"');
+                if (qEnd <= 0) continue;
+                string id = b.Substring(0, qEnd);
+
+                Match mTitle = Regex.Match(b, @"""title""\s*:\s*""(?<val>(?:\\.|[^""\\])*)""");
+                string title = mTitle.Success ? Regex.Unescape(mTitle.Groups["val"].Value).Trim() : ("Workshop_" + id);
+                if (string.IsNullOrEmpty(title)) title = "Workshop_" + id;
+
+                Match mPrev = Regex.Match(b, @"""preview_url""\s*:\s*""(?<val>(?:\\.|[^""\\])*)""");
+                string prevUrl = mPrev.Success ? Regex.Unescape(mPrev.Groups["val"].Value).Replace(@"\/", "/") : "";
+
+                string detectedAc = (!string.IsNullOrEmpty(defaultAircraftTag) && defaultAircraftTag != "Все самолеты") ? defaultAircraftTag : "Не определен";
+                foreach (Match mTag in Regex.Matches(b, @"""tag""\s*:\s*""(?<val>[^""]+)"""))
+                {
+                    string norm = LiveryParser.NormalizeAircraftName(mTag.Groups["val"].Value.Trim());
+                    if (norm == "FA-26B" || norm == "F-45A" || norm == "AV-42C" || norm == "AH-94" || norm == "T-55" || norm == "EF-24G")
+                    {
+                        detectedAc = norm;
+                        break;
+                    }
+                }
+
+                map[id] = new WorkshopCatalogItem
+                {
+                    PublishedFileId = id,
+                    Title = title,
+                    PreviewUrl = prevUrl,
+                    AircraftTag = detectedAc
+                };
+            }
+
+            foreach (string id in ids)
+            {
+                WorkshopCatalogItem item;
+                if (map.TryGetValue(id, out item)) result.Add(item);
+            }
+            AppLogger.Log("WORKSHOP", "GetPublishedFileDetails вернул метаданные для " + result.Count + " модов.");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("WORKSHOP", "FetchDetailsBatch", ex);
+        }
+        return result;
+    }
+
+    private static WorkshopCatalogItem FetchSingleWorkshopItem(string id, string aircraftTag)
+    {
+        try
+        {
+            string host = "steamcommunity.com";
+            string url = "https://" + host + "/sharedfiles/filedetails/?id=" + id;
+            AppLogger.Log("WORKSHOP", "Загрузка одиночного предмета: " + url);
+            System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+            req.AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate;
+            string html = "";
+            using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse())
+            using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                html = sr.ReadToEnd();
+
+            Match mTitle = Regex.Match(html, @"class=""workshopItemTitle""[^>]*>(?<val>.*?)</div>", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+            string title = mTitle.Success ? System.Net.WebUtility.HtmlDecode(Regex.Replace(mTitle.Groups["val"].Value, "<.*?>", "")).Trim() : ("Workshop_" + id);
+
+            Match mImg = Regex.Match(html, @"id=""previewImageMain""[^>]+src=""(?<val>https?://[^""]+)""", RegexOptions.IgnoreCase);
+            if (!mImg.Success) mImg = Regex.Match(html, @"<link rel=""image_src"" href=""(?<val>https?://[^""]+)""", RegexOptions.IgnoreCase);
+            string prevUrl = mImg.Success ? mImg.Groups["val"].Value : "";
+
+            return new WorkshopCatalogItem
+            {
+                PublishedFileId = id,
+                Title = title,
+                PreviewUrl = prevUrl,
+                AircraftTag = (!string.IsNullOrEmpty(aircraftTag) && aircraftTag != "Все самолеты") ? aircraftTag : "Не определен"
+            };
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("WORKSHOP", "FetchSingleWorkshopItem", ex);
+            return new WorkshopCatalogItem { PublishedFileId = id, Title = "Workshop_" + id, PreviewUrl = "", AircraftTag = "Не определен" };
+        }
+    }
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    public static void MinimizeSteamWindows()
+    {
+        try
+        {
+            string[] names = new string[] { "steam", "steamwebhelper" };
+            foreach (string name in names)
+            {
+                foreach (Process p in Process.GetProcessesByName(name))
+                {
+                    if (p.MainWindowHandle != IntPtr.Zero)
+                        ShowWindow(p.MainWindowHandle, 6);
+                }
+            }
+        }
+        catch { }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr LoadLibrary(string lpFileName);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+    private static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate bool SteamAPI_InitDelegate();
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate IntPtr SteamUGCDelegate();
+
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)]
+    private delegate ulong SubscribeItemDelegate(IntPtr self, ulong nPublishedFileID);
+
+    private static bool TryNativeSteamSubscribe(string gameRoot, ulong fileId)
+    {
+        try
+        {
+            string dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\x86_64\steam_api64.dll");
+            if (!File.Exists(dllPath))
+                dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\steam_api64.dll");
+            if (!File.Exists(dllPath)) return false;
+
+            Environment.SetEnvironmentVariable("SteamAppId", "667970");
+            Environment.SetEnvironmentVariable("SteamGameId", "667970");
+
+            IntPtr hMod = LoadLibrary(dllPath);
+            if (hMod == IntPtr.Zero) return false;
+
+            IntPtr pInit = GetProcAddress(hMod, "SteamAPI_Init");
+            if (pInit == IntPtr.Zero) return false;
+
+            SteamAPI_InitDelegate fnInit = (SteamAPI_InitDelegate)Marshal.GetDelegateForFunctionPointer(pInit, typeof(SteamAPI_InitDelegate));
+            if (!fnInit()) return false;
+
+            string[] ugcExports = new string[] { "SteamAPI_SteamUGC_v020", "SteamAPI_SteamUGC_v018", "SteamAPI_SteamUGC_v017", "SteamAPI_SteamUGC_v016", "SteamAPI_SteamUGC_v015", "SteamUGC" };
+            IntPtr ugcPtr = IntPtr.Zero;
+            foreach (string exp in ugcExports)
+            {
+                IntPtr pGetUgc = GetProcAddress(hMod, exp);
+                if (pGetUgc != IntPtr.Zero)
+                {
+                    SteamUGCDelegate fnUgc = (SteamUGCDelegate)Marshal.GetDelegateForFunctionPointer(pGetUgc, typeof(SteamUGCDelegate));
+                    ugcPtr = fnUgc();
+                    if (ugcPtr != IntPtr.Zero) break;
+                }
+            }
+            if (ugcPtr == IntPtr.Zero) return false;
+
+            IntPtr vtable = Marshal.ReadIntPtr(ugcPtr);
+            IntPtr pSub = Marshal.ReadIntPtr(vtable, 27 * IntPtr.Size);
+            SubscribeItemDelegate fnSub = (SubscribeItemDelegate)Marshal.GetDelegateForFunctionPointer(pSub, typeof(SubscribeItemDelegate));
+            ulong callHandle = fnSub(ugcPtr, fileId);
+            AppLogger.Log("WORKSHOP", "Native SteamUGC SubscribeItem вызван, handle=" + callHandle);
+            return callHandle != 0;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("WORKSHOP", "TryNativeSteamSubscribe", ex);
+            return false;
+        }
+    }
+    public static volatile bool CancelWait = false;
+
+    public static bool SubscribeAndDownloadWorkshop(WorkshopCatalogItem item, string gameRoot, Action<string> onStatus)
+    {
+        CancelWait = false;
+        AppLogger.Log("WORKSHOP", "Подписка на ID=" + item.PublishedFileId + " (" + item.Title + ")");
+        if (string.IsNullOrEmpty(gameRoot) || !Directory.Exists(gameRoot))
+            throw new Exception("Не определена папка игры VTOL VR.");
+
+        string steamLibRoot = Path.GetFullPath(Path.Combine(gameRoot, @"..\..\.."));
+        string gameWorkshopContent = Path.Combine(steamLibRoot, @"steamapps\workshop\content\667970");
+        Directory.CreateDirectory(gameWorkshopContent);
+        string targetFolder = Path.Combine(gameWorkshopContent, item.PublishedFileId);
+
+        ulong fileIdNum;
+        ulong.TryParse(item.PublishedFileId, out fileIdNum);
+
+        bool nativeOk = (IntPtr.Size == 8 && fileIdNum > 0) && TryNativeSteamSubscribe(gameRoot, fileIdNum);
+        if (nativeOk)
+        {
+            if (onStatus != null) onStatus("Подписка оформлена! Ожидание загрузки...");
+        }
+        else
+        {
+            if (onStatus != null) onStatus("Нажмите «Подписаться» в Steam (клик сюда — отмена)");
+            Process.Start(new ProcessStartInfo("steam://url/CommunityFilePage/" + item.PublishedFileId) { UseShellExecute = true });
+        }
+
+        DateTime deadline = DateTime.UtcNow.AddSeconds(20);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (CancelWait) return false;
+
+            if (Directory.Exists(targetFolder) && Directory.GetFiles(targetFolder, "*.*", SearchOption.AllDirectories).Length > 0)
+            {
+                Thread.Sleep(1000);
+                WriteWorkshopMetadata(targetFolder, item);
+                MinimizeSteamWindows();
+                AppLogger.Log("WORKSHOP", "Мод успешно скачан клиентом Steam в " + targetFolder);
+                return true;
+            }
+            Thread.Sleep(500);
+        }
+
+        return false;
+    }
+
+
+    private static void WriteWorkshopMetadata(string targetFolder, WorkshopCatalogItem item)
+    {
+        string xmlPath = Path.Combine(targetFolder, "WorkshopItemInfo.xml");
+        if (!File.Exists(xmlPath))
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("<WorkshopItemInfo>");
+            sb.AppendLine("  <Title>" + System.Security.SecurityElement.Escape(item.Title) + "</Title>");
+            if (!string.IsNullOrEmpty(item.AircraftTag) && item.AircraftTag != "Не определен")
+                sb.AppendLine("  <Tag>" + System.Security.SecurityElement.Escape(item.AircraftTag) + "</Tag>");
+            sb.AppendLine("</WorkshopItemInfo>");
+            File.WriteAllText(xmlPath, sb.ToString(), Encoding.UTF8);
+        }
+        if (!string.IsNullOrEmpty(item.AircraftTag) && item.AircraftTag != "Не определен")
+            LiveryParser.SaveUserAircraftMapping(targetFolder, item.AircraftTag);
+    }
+    private static bool TryNativeSteamUnsubscribe(string gameRoot, ulong fileId)
+    {
+        try
+        {
+            string dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\x86_64\steam_api64.dll");
+            if (!File.Exists(dllPath))
+                dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\steam_api64.dll");
+            if (!File.Exists(dllPath)) return false;
+
+            Environment.SetEnvironmentVariable("SteamAppId", "667970");
+            Environment.SetEnvironmentVariable("SteamGameId", "667970");
+
+            IntPtr hMod = LoadLibrary(dllPath);
+            if (hMod == IntPtr.Zero) return false;
+
+            IntPtr pInit = GetProcAddress(hMod, "SteamAPI_Init");
+            if (pInit == IntPtr.Zero) return false;
+
+            SteamAPI_InitDelegate fnInit = (SteamAPI_InitDelegate)Marshal.GetDelegateForFunctionPointer(pInit, typeof(SteamAPI_InitDelegate));
+            if (!fnInit()) return false;
+
+            string[] ugcExports = new string[] { "SteamAPI_SteamUGC_v020", "SteamAPI_SteamUGC_v018", "SteamAPI_SteamUGC_v017", "SteamAPI_SteamUGC_v016", "SteamAPI_SteamUGC_v015", "SteamUGC" };
+            IntPtr ugcPtr = IntPtr.Zero;
+            foreach (string exp in ugcExports)
+            {
+                IntPtr pGetUgc = GetProcAddress(hMod, exp);
+                if (pGetUgc != IntPtr.Zero)
+                {
+                    SteamUGCDelegate fnUgc = (SteamUGCDelegate)Marshal.GetDelegateForFunctionPointer(pGetUgc, typeof(SteamUGCDelegate));
+                    ugcPtr = fnUgc();
+                    if (ugcPtr != IntPtr.Zero) break;
+                }
+            }
+            if (ugcPtr == IntPtr.Zero) return false;
+
+            IntPtr vtable = Marshal.ReadIntPtr(ugcPtr);
+            IntPtr pUnsub = Marshal.ReadIntPtr(vtable, 28 * IntPtr.Size);
+            SubscribeItemDelegate fnUnsub = (SubscribeItemDelegate)Marshal.GetDelegateForFunctionPointer(pUnsub, typeof(SubscribeItemDelegate));
+            ulong callHandle = fnUnsub(ugcPtr, fileId);
+            AppLogger.Log("WORKSHOP", "Native SteamUGC UnsubscribeItem вызван, handle=" + callHandle);
+            return callHandle != 0;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("WORKSHOP", "TryNativeSteamUnsubscribe", ex);
+            return false;
+        }
+    }
+
+    public static void UnsubscribeAndDeleteWorkshop(string folderPath, string gameRoot)
+    {
+        string itemId = Path.GetFileName(folderPath);
+        AppLogger.Log("WORKSHOP", "Удаление Workshop-ливреи ID=" + itemId);
+
+        ulong fileIdNum;
+        if (IntPtr.Size == 8 && ulong.TryParse(itemId, out fileIdNum) && !string.IsNullOrEmpty(gameRoot))
+            TryNativeSteamUnsubscribe(gameRoot, fileIdNum);
+
+        if (Directory.Exists(folderPath))
+            Directory.Delete(folderPath, true);
+
+        try
+        {
+            string wsRoot = Path.GetFullPath(Path.Combine(folderPath, @"..\.."));
+            string acfPath = Path.Combine(wsRoot, "appworkshop_667970.acf");
+            if (File.Exists(acfPath))
+            {
+                string acf = File.ReadAllText(acfPath, Encoding.UTF8);
+                string updated = Regex.Replace(acf, @"\s*""" + Regex.Escape(itemId) + @"""\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", "");
+                if (updated != acf)
+                    File.WriteAllText(acfPath, updated, new UTF8Encoding(false));
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("WORKSHOP", "Очистка appworkshop_667970.acf", ex);
+        }
+    }
+
+}
+
 
 // =========================================================================
 // === ЗАГРУЗЧИК FBX (БИНАРНЫЙ + УПРОЩЕННЫЙ ASCII) =========================
@@ -2420,64 +3084,122 @@ public class Livery3DViewerForm : Form
     }
 }
 
-    // =========================================================================
-    // === МЕНЕДЖЕР ЛИВРЕЙ (НОВЫЙ, с 3D-кнопкой, ZIP, Workshop) ================
-    // =========================================================================
-    public class LiveryManagerForm : Form
-    {
-        private string gameRoot;
-        private ComboBox cmbAircraft;
-        private ListBox lstLiveries;
-        private PictureBox picPreview;
-        private Label lblPreviewInfo;
-        private Label lblStatus;
-        private List<LiveryEntry> currentEntries = new List<LiveryEntry>();
+// =========================================================================
+// === МЕНЕДЖЕР ЛИВРЕЙ (НОВЫЙ, с 3D-кнопкой, ZIP, Workshop) ================
+// =========================================================================
+public class LiveryManagerForm : Form
+{
+    private string gameRoot;
+    private bool isCatalogMode = false;
+    private int catalogPage = 1;
+
+    private Button btnTabMy;
+    private Button btnTabCatalog;
+    private ComboBox cmbAircraft;
+    private TextBox txtSearch;
+    private Button btnSearchOrRefresh;
+    private CheckBox chkWorkshop;
+    private Button btnPrevPage;
+    private Button btnNextPage;
+    private Label lblPage;
+
+    private ListBox lstLiveries;
+    private PictureBox picPreview;
+    private Label lblPreviewInfo;
+    private Label lblStatus;
+
+    private Button btn3D;
+    private Button btnDownloadWs;
+    private Button btnInstallFolder;
+    private Button btnInstallZip;
+    private Button btnDelete;
+    private Button btnOpenDir;
+    private Button btnOpenItemDir;
+
+    private List<LiveryEntry> currentEntries = new List<LiveryEntry>();
     private List<LiveryEntry> filteredEntries = new List<LiveryEntry>();
+    private List<WorkshopCatalogItem> catalogItems = new List<WorkshopCatalogItem>();
     private readonly string[] aircrafts = new string[] { "Все самолеты", "Не определен", "FA-26B", "F-45A", "AV-42C", "AH-94", "T-55", "EF-24G" };
 
     public LiveryManagerForm(string root)
-        {
-            this.gameRoot = root;
-            this.Text = "VTOL QoL — Менеджер ливрей и 3D-просмотр";
-            this.Size = new Size(920, 560);
-            this.StartPosition = FormStartPosition.CenterParent;
-            this.FormBorderStyle = FormBorderStyle.FixedDialog;
-            this.MaximizeBox = false;
-            this.BackColor = Color.FromArgb(18, 22, 20);
-            this.ForeColor = Color.FromArgb(0, 255, 102);
-            this.Font = new Font("Consolas", 9.5f, FontStyle.Regular);
+    {
+        this.gameRoot = root;
+        this.Text = "VTOL QoL — Менеджер ливрей, 3D-просмотр и Steam Workshop";
+        this.Size = new Size(920, 585);
+        this.StartPosition = FormStartPosition.CenterParent;
+        this.FormBorderStyle = FormBorderStyle.FixedDialog;
+        this.MaximizeBox = false;
+        this.BackColor = Color.FromArgb(18, 22, 20);
+        this.ForeColor = Color.FromArgb(0, 255, 102);
+        this.Font = new Font("Consolas", 9.5f, FontStyle.Regular);
 
-            Label lblAc = new Label() { Text = "Фильтр по летательному аппарату:", Left = 20, Top = 15, AutoSize = true, ForeColor = Color.LightGray };
-            this.Controls.Add(lblAc);
+        // Вкладки сверху
+        btnTabMy = new Button() { Text = "📂 МОИ ЛИВРЕИ (LOCAL / STEAM)", Left = 20, Top = 12, Width = 230, Height = 30, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 120, 80), ForeColor = Color.White, Font = new Font("Consolas", 9f, FontStyle.Bold) };
+        btnTabMy.Click += (s, e) => SwitchMode(false);
+        this.Controls.Add(btnTabMy);
 
-            cmbAircraft = new ComboBox();
-            cmbAircraft.DropDownStyle = ComboBoxStyle.DropDownList;
-            cmbAircraft.Location = new Point(20, 38);
-            cmbAircraft.Size = new Size(340, 26);
-            cmbAircraft.BackColor = Color.FromArgb(30, 36, 33);
-            cmbAircraft.ForeColor = Color.Cyan;
-            foreach (string ac in aircrafts) cmbAircraft.Items.Add(ac);
-            cmbAircraft.SelectedIndex = 0;
-            cmbAircraft.SelectedIndexChanged += (s, e) => LoadLiveries();
-            this.Controls.Add(cmbAircraft);
+        btnTabCatalog = new Button() { Text = "🌐 КАТАЛОГ STEAM WORKSHOP", Left = 255, Top = 12, Width = 230, Height = 30, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(32, 40, 36), ForeColor = Color.LightGray, Font = new Font("Consolas", 9f, FontStyle.Bold) };
+        btnTabCatalog.Click += (s, e) => SwitchMode(true);
+        this.Controls.Add(btnTabCatalog);
 
-            Button btnRefresh = new Button() { Text = "Обновить", Left = 370, Top = 37, Width = 115, Height = 28, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 50, 45), ForeColor = Color.White };
-            btnRefresh.Click += (s, e) => LoadLiveries();
-            this.Controls.Add(btnRefresh);
+        cmbAircraft = new ComboBox();
+        cmbAircraft.DropDownStyle = ComboBoxStyle.DropDownList;
+        cmbAircraft.Location = new Point(20, 50);
+        cmbAircraft.Size = new Size(165, 26);
+        cmbAircraft.BackColor = Color.FromArgb(30, 36, 33);
+        cmbAircraft.ForeColor = Color.Cyan;
+        foreach (string ac in aircrafts) cmbAircraft.Items.Add(ac);
+        cmbAircraft.SelectedIndex = 0;
+        cmbAircraft.SelectedIndexChanged += (s, e) => { if (isCatalogMode) { catalogPage = 1; SearchCatalogAsync(); } else LoadLiveries(); };
+        this.Controls.Add(cmbAircraft);
 
-            CheckBox chkWorkshop = new CheckBox() { Text = "Показывать Workshop (только просмотр)", Left = 20, Top = 70, AutoSize = true, ForeColor = Color.FromArgb(210, 240, 220), Checked = true };
-            chkWorkshop.Tag = "workshop";
-            chkWorkshop.CheckedChanged += (s, e) => LoadLiveries();
-            this.Controls.Add(chkWorkshop);
+        txtSearch = new TextBox() { Left = 192, Top = 50, Width = 185, Height = 25, BackColor = Color.FromArgb(30, 36, 33), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
+        txtSearch.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; if (isCatalogMode) { catalogPage = 1; SearchCatalogAsync(); } else LoadLiveries(); } };
+        this.Controls.Add(txtSearch);
+
+        btnSearchOrRefresh = new Button() { Text = "Поиск / Обн.", Left = 383, Top = 49, Width = 102, Height = 27, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 55, 48), ForeColor = Color.White };
+        btnSearchOrRefresh.Click += (s, e) => { if (isCatalogMode) { catalogPage = 1; SearchCatalogAsync(); } else LoadLiveries(); };
+        this.Controls.Add(btnSearchOrRefresh);
+
+        chkWorkshop = new CheckBox() { Text = "Показывать скачанный Workshop", Left = 20, Top = 82, AutoSize = true, ForeColor = Color.FromArgb(210, 240, 220), Checked = true };
+        chkWorkshop.CheckedChanged += (s, e) => LoadLiveries();
+        this.Controls.Add(chkWorkshop);
+
+        btnPrevPage = new Button() { Text = "< Пред.", Left = 20, Top = 80, Width = 80, Height = 24, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(35, 45, 40), ForeColor = Color.White, Visible = false };
+        btnPrevPage.Click += (s, e) => { if (catalogPage > 1) { catalogPage--; SearchCatalogAsync(); } };
+        this.Controls.Add(btnPrevPage);
+
+        lblPage = new Label() { Text = "Стр. 1", Left = 108, Top = 84, Width = 70, ForeColor = Color.Cyan, Visible = false };
+        this.Controls.Add(lblPage);
+
+        btnNextPage = new Button() { Text = "След. >", Left = 180, Top = 80, Width = 80, Height = 24, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(35, 45, 40), ForeColor = Color.White, Visible = false };
+        btnNextPage.Click += (s, e) => { catalogPage++; SearchCatalogAsync(); };
+        this.Controls.Add(btnNextPage);
 
         lstLiveries = new ListBox();
-        lstLiveries.Location = new Point(20, 100);
-        lstLiveries.Size = new Size(465, 360);
+        lstLiveries.Location = new Point(20, 110);
+        lstLiveries.Size = new Size(465, 375);
         lstLiveries.BackColor = Color.FromArgb(24, 28, 26);
         lstLiveries.ForeColor = Color.White;
         lstLiveries.BorderStyle = BorderStyle.FixedSingle;
         lstLiveries.SelectedIndexChanged += (s, e) => UpdatePreview();
         this.Controls.Add(lstLiveries);
+        lstLiveries.DrawMode = DrawMode.OwnerDrawFixed;
+        lstLiveries.ItemHeight = 18;
+        lstLiveries.DrawItem += (s, e) => {
+            if (e.Index < 0 || e.Index >= lstLiveries.Items.Count) return;
+            string text = lstLiveries.Items[e.Index].ToString();
+            bool isSelected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+            bool isInstalled = text.StartsWith("✔ ");
+
+            Color bg = isSelected ? Color.FromArgb(0, 95, 135) : Color.FromArgb(24, 28, 26);
+            Color fg = isInstalled ? Color.FromArgb(0, 255, 102) : Color.White;
+
+            using (SolidBrush bgBrush = new SolidBrush(bg))
+                e.Graphics.FillRectangle(bgBrush, e.Bounds);
+            using (SolidBrush fgBrush = new SolidBrush(fg))
+                e.Graphics.DrawString(text, e.Font, fgBrush, e.Bounds.Left + 4, e.Bounds.Top + 1);
+        };
 
         ContextMenuStrip ctxLivery = new ContextMenuStrip();
         ToolStripMenuItem item3D = new ToolStripMenuItem("🎮 Открыть в 3D-просмотре");
@@ -2491,6 +3213,7 @@ public class Livery3DViewerForm : Form
             string targetPlane = pl;
             ToolStripMenuItem sub = new ToolStripMenuItem(targetPlane);
             sub.Click += (s, e) => {
+                if (isCatalogMode) return;
                 LiveryEntry entry = GetSelectedEntry();
                 if (entry == null) return;
                 entry.Aircraft = targetPlane;
@@ -2527,113 +3250,421 @@ public class Livery3DViewerForm : Form
 
         picPreview = new PictureBox();
         picPreview.Location = new Point(500, 38);
-        picPreview.Size = new Size(390, 220);
+        picPreview.Size = new Size(390, 230);
         picPreview.BackColor = Color.FromArgb(24, 28, 26);
         picPreview.BorderStyle = BorderStyle.FixedSingle;
         picPreview.SizeMode = PictureBoxSizeMode.Zoom;
         this.Controls.Add(picPreview);
 
-        lblPreviewInfo = new Label() { Left = 500, Top = 264, Width = 390, Height = 20, ForeColor = Color.Cyan, Text = "Выберите ливрею (ПКМ — назначить борт)" };
+        lblPreviewInfo = new Label() { Left = 500, Top = 274, Width = 390, Height = 20, ForeColor = Color.Cyan, Text = "Выберите ливрею из списка" };
         this.Controls.Add(lblPreviewInfo);
 
-        int top = 292, btnW = 190, btnH = 36, gap = 10;
-        Button btn3D = CreateBtn("🎮 3D-просмотр", 500, ref top, btnW, btnH, gap, Color.FromArgb(70, 50, 110));
+        int top = 302, btnW = 190, btnH = 36, gap = 10;
+        btn3D = CreateBtn("🎮 3D-просмотр", 500, ref top, btnW, btnH, gap, Color.FromArgb(70, 50, 110));
         btn3D.Click += Btn3D_Click;
 
-        Button btnInstallFolder = CreateBtn("+ Добавить скин", 500, ref top, btnW, btnH, gap, Color.FromArgb(0, 110, 140));
+        btnDownloadWs = new Button() { Text = "⬇ Скачать ливрею", Location = new Point(500, 302), Size = new Size(390, 42), FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 130, 80), ForeColor = Color.White, Font = new Font("Consolas", 10f, FontStyle.Bold), Visible = false };
+
+        btnDownloadWs.Click += BtnDownloadWs_Click;
+        this.Controls.Add(btnDownloadWs);
+
+        btnInstallFolder = CreateBtn("+ Добавить скин", 500, ref top, btnW, btnH, gap, Color.FromArgb(0, 110, 140));
         btnInstallFolder.Click += BtnInstallFolder_Click;
 
-        Button btnInstallZip = CreateBtn("+ Установить .zip", 500, ref top, btnW, btnH, gap, Color.FromArgb(0, 130, 90));
+        btnInstallZip = CreateBtn("+ Установить .zip", 500, ref top, btnW, btnH, gap, Color.FromArgb(0, 130, 90));
         btnInstallZip.Click += BtnInstallZip_Click;
 
-        int topRight = 292;
+        int topRight = 302;
+        btnDelete = CreateBtn("Удалить ливрею", 700, ref topRight, btnW, btnH, gap, Color.FromArgb(140, 35, 35));
+        btnDelete.Click += BtnDelete_Click;
 
+        btnOpenDir = CreateBtn("Папка CustomLiveries", 700, ref topRight, btnW, btnH, gap, Color.FromArgb(45, 55, 50));
+        btnOpenDir.Click += (s, e) => {
+            string dir = GetLiveriesRootDir();
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            Process.Start("explorer.exe", dir);
+        };
 
-        Button btnDelete = CreateBtn("Удалить ливрею", 700, ref topRight, btnW, btnH, gap, Color.FromArgb(140, 35, 35));
-            btnDelete.Click += BtnDelete_Click;
-
-            Button btnOpenDir = CreateBtn("Папка CustomLiveries", 700, ref topRight, btnW, btnH, gap, Color.FromArgb(45, 55, 50));
-            btnOpenDir.Click += (s, e) => {
-                string dir = GetLiveriesRootDir();
-                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                Process.Start("explorer.exe", dir);
-            };
-
-            Button btnOpenItemDir = CreateBtn("Открыть папку мода", 700, ref topRight, btnW, btnH, gap, Color.FromArgb(45, 55, 50));
-            btnOpenItemDir.Click += (s, e) => {
-                LiveryEntry entry = GetSelectedEntry();
-                if (entry != null && Directory.Exists(entry.FolderPath)) Process.Start("explorer.exe", entry.FolderPath);
-            };
-
-            lblStatus = new Label() { Left = 20, Top = 472, Width = 870, Text = "", ForeColor = Color.Silver };
-            this.Controls.Add(lblStatus);
-
-            LoadLiveries();
-        }
-        private Button CreateBtn(string text, int left, ref int top, int width, int height, int gap, Color backColor)
-        {
-            Button btn = new Button() { Text = text, Location = new Point(left, top), Size = new Size(width, height), FlatStyle = FlatStyle.Flat, BackColor = backColor, ForeColor = Color.White };
-            this.Controls.Add(btn);
-            top += height + gap;
-            return btn;
-        }
-
-        private void UpdatePreview()
-        {
-            if (picPreview.Image != null) { picPreview.Image.Dispose(); picPreview.Image = null; }
+        btnOpenItemDir = CreateBtn("Открыть папку мода", 700, ref topRight, btnW, btnH, gap, Color.FromArgb(45, 55, 50));
+        btnOpenItemDir.Click += (s, e) => {
             LiveryEntry entry = GetSelectedEntry();
-            if (entry == null) { lblPreviewInfo.Text = "Выберите ливрею из списка"; return; }
+            if (entry != null && Directory.Exists(entry.FolderPath)) Process.Start("explorer.exe", entry.FolderPath);
+        };
 
-            lblPreviewInfo.Text = entry.Name + " (" + entry.Aircraft + ")";
-            if (!string.IsNullOrEmpty(entry.PreviewPath) && File.Exists(entry.PreviewPath))
+        lblStatus = new Label() { Left = 20, Top = 496, Width = 870, Height = 22, Text = "", ForeColor = Color.Silver };
+        this.Controls.Add(lblStatus);
+
+        LoadLiveries();
+    }
+
+    private Button CreateBtn(string text, int left, ref int top, int width, int height, int gap, Color backColor)
+    {
+        Button btn = new Button() { Text = text, Location = new Point(left, top), Size = new Size(width, height), FlatStyle = FlatStyle.Flat, BackColor = backColor, ForeColor = Color.White };
+        this.Controls.Add(btn);
+        top += height + gap;
+        return btn;
+    }
+
+    private void SwitchMode(bool catalog)
+    {
+        catalogSearchGen++;
+        ShowCatalogLoader(false);
+        isCatalogMode = catalog;
+        btnTabMy.BackColor = !catalog ? Color.FromArgb(0, 120, 80) : Color.FromArgb(32, 40, 36);
+        btnTabMy.ForeColor = !catalog ? Color.White : Color.LightGray;
+        btnTabCatalog.BackColor = catalog ? Color.FromArgb(0, 110, 150) : Color.FromArgb(32, 40, 36);
+        btnTabCatalog.ForeColor = catalog ? Color.White : Color.LightGray;
+
+        chkWorkshop.Visible = !catalog;
+        btnPrevPage.Visible = catalog;
+        lblPage.Visible = catalog;
+        btnNextPage.Visible = catalog;
+
+        btn3D.Visible = !catalog;
+        btnInstallFolder.Visible = !catalog;
+        btnInstallZip.Visible = !catalog;
+        btnDelete.Visible = !catalog;
+        btnOpenDir.Visible = !catalog;
+        btnOpenItemDir.Visible = !catalog;
+        btnDownloadWs.Visible = catalog;
+
+        if (catalog) { catalogPage = 1; SearchCatalogAsync(); }
+        else LoadLiveries();
+    }
+    private Panel pnlCatalogLoader = null;
+    private System.Windows.Forms.Timer catalogAnimTimer = null;
+    private int catalogSearchGen = 0;
+
+    private void ShowCatalogLoader(bool show)
+    {
+        if (catalogAnimTimer != null)
+        {
+            catalogAnimTimer.Stop();
+            catalogAnimTimer.Dispose();
+            catalogAnimTimer = null;
+        }
+        if (pnlCatalogLoader != null)
+        {
+            if (pnlCatalogLoader.Parent != null) this.Controls.Remove(pnlCatalogLoader);
+            pnlCatalogLoader.Dispose();
+            pnlCatalogLoader = null;
+        }
+        if (!show) return;
+
+        pnlCatalogLoader = new Panel();
+        pnlCatalogLoader.Size = new Size(340, 78);
+        pnlCatalogLoader.Location = new Point(lstLiveries.Left + (lstLiveries.Width - 340) / 2, lstLiveries.Top + (lstLiveries.Height - 78) / 2);
+        pnlCatalogLoader.BackColor = Color.FromArgb(28, 36, 33);
+        pnlCatalogLoader.BorderStyle = BorderStyle.FixedSingle;
+
+        Label lblLoader = new Label();
+        lblLoader.Text = "⏳ Загрузка каталога Steam Workshop...";
+        lblLoader.Location = new Point(12, 14);
+        lblLoader.Width = 316;
+        lblLoader.Height = 22;
+        lblLoader.TextAlign = ContentAlignment.MiddleCenter;
+        lblLoader.ForeColor = Color.Cyan;
+        lblLoader.Font = new Font("Consolas", 9.5f, FontStyle.Bold);
+        pnlCatalogLoader.Controls.Add(lblLoader);
+
+        ProgressBar pb = new ProgressBar();
+        pb.Style = ProgressBarStyle.Marquee;
+        pb.MarqueeAnimationSpeed = 25;
+        pb.Location = new Point(20, 44);
+        pb.Size = new Size(300, 16);
+        pnlCatalogLoader.Controls.Add(pb);
+
+        this.Controls.Add(pnlCatalogLoader);
+        pnlCatalogLoader.BringToFront();
+
+        int elapsedSec = 0;
+        catalogAnimTimer = new System.Windows.Forms.Timer();
+        catalogAnimTimer.Interval = 1000;
+        catalogAnimTimer.Tick += (s, e) => {
+            elapsedSec++;
+            lblLoader.Text = string.Format("⏳ Загрузка Steam Workshop... ({0} сек)", elapsedSec);
+        };
+        catalogAnimTimer.Start();
+    }
+
+    private void SearchCatalogAsync()
+    {
+        int currentGen = ++catalogSearchGen;
+        lstLiveries.Items.Clear();
+        catalogItems.Clear();
+        if (picPreview.Image != null) { picPreview.Image.Dispose(); picPreview.Image = null; }
+        lblPage.Text = "Стр. " + catalogPage;
+        string ac = cmbAircraft.SelectedItem != null ? cmbAircraft.SelectedItem.ToString() : "Все самолеты";
+        string q = txtSearch.Text.Trim();
+        lblStatus.Text = "Загрузка каталога Steam Workshop...";
+        ShowCatalogLoader(true);
+
+        ThreadPool.QueueUserWorkItem(delegate {
+            try
             {
+                List<WorkshopCatalogItem> found = WorkshopBrowser.SearchLiveries(q, ac, catalogPage);
+                this.Invoke(new Action(delegate {
+                    if (currentGen != catalogSearchGen || !isCatalogMode) return;
+                    ShowCatalogLoader(false);
+                    catalogItems = found;
+                    lstLiveries.Items.Clear();
+                    string wsContentDir = !string.IsNullOrEmpty(gameRoot)
+    ? Path.Combine(Path.GetFullPath(Path.Combine(gameRoot, @"..\..\..")), @"steamapps\workshop\content\667970")
+    : "";
+
+                    foreach (WorkshopCatalogItem it in catalogItems)
+                    {
+                        bool alreadyInstalled = !string.IsNullOrEmpty(wsContentDir) && Directory.Exists(Path.Combine(wsContentDir, it.PublishedFileId));
+                        string prefix = alreadyInstalled ? "✔ " : "";
+                        string suffix = alreadyInstalled ? "  [УСТАНОВЛЕНО]" : "";
+                        lstLiveries.Items.Add(string.Format("{0}[WS #{1}] {2}{3}", prefix, it.PublishedFileId, it.Title, suffix));
+                    }
+                    lblStatus.Text = "Найдено в Steam Workshop на странице " + catalogPage + ": " + catalogItems.Count;
+                }));
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error("WORKSHOP", "SearchCatalogAsync", ex);
                 try
                 {
-                    byte[] bytes = File.ReadAllBytes(entry.PreviewPath);
-                    using (MemoryStream ms = new MemoryStream(bytes))
-                    {
-                        picPreview.Image = Image.FromStream(ms);
-                    }
+                    this.Invoke(new Action(delegate {
+                        if (currentGen != catalogSearchGen) return;
+                        ShowCatalogLoader(false);
+                        lblStatus.Text = "Ошибка загрузки каталога: " + ex.Message;
+                    }));
                 }
                 catch { }
             }
+        });
+    }
+
+
+    private bool isWaitingDownload = false;
+
+    private void BtnDownloadWs_Click(object sender, EventArgs e)
+    {
+        if (isWaitingDownload)
+        {
+            WorkshopBrowser.CancelWait = true;
+            return;
         }
 
-        private string GetLiveriesRootDir()
+        if (lstLiveries.SelectedIndex < 0 || lstLiveries.SelectedIndex >= catalogItems.Count)
         {
-            if (string.IsNullOrEmpty(gameRoot) || !Directory.Exists(gameRoot))
-                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL", "CustomLiveries");
-            return Path.Combine(gameRoot, "CustomLiveries");
+            MessageBox.Show("Выберите ливрею из каталога для скачивания.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
         }
 
-        private bool ShowWorkshop()
-        {
-            foreach (Control c in this.Controls)
-                if (c is CheckBox && ((CheckBox)c).Tag as string == "workshop") return ((CheckBox)c).Checked;
-            return true;
-        }
+        WorkshopCatalogItem item = catalogItems[lstLiveries.SelectedIndex];
+        isWaitingDownload = true;
+        btnDownloadWs.BackColor = Color.FromArgb(140, 95, 20);
+        btnDownloadWs.Text = "⏳ Ожидание Steam... (нажмите для отмены)";
 
-        private void LoadLiveries()
-        {
-            lstLiveries.Items.Clear();
-            currentEntries.Clear();
-            string dir = GetLiveriesRootDir();
-            string filterAc = cmbAircraft.SelectedItem as string != null ? cmbAircraft.SelectedItem.ToString() : "Все самолеты";
+        ProgressBar pbWs = new ProgressBar();
+        pbWs.Style = ProgressBarStyle.Marquee;
+        pbWs.MarqueeAnimationSpeed = 25;
+        pbWs.Location = new Point(500, 352);
+        pbWs.Size = new Size(390, 16);
+        this.Controls.Add(pbWs);
 
-            List<LiveryEntry> local = LiveryParser.ScanLocal(dir);
-            currentEntries.AddRange(local);
-
-            if (ShowWorkshop() && !string.IsNullOrEmpty(gameRoot))
+        ThreadPool.QueueUserWorkItem(delegate {
+            bool downloaded = false;
+            string errMsg = null;
+            try
             {
-                string steamLibRoot = Path.GetFullPath(Path.Combine(gameRoot, @"..\..\.."));
-                List<LiveryEntry> ws = LiveryParser.ScanWorkshop(steamLibRoot);
-                currentEntries.AddRange(ws);
+                downloaded = WorkshopBrowser.SubscribeAndDownloadWorkshop(item, gameRoot, msg => {
+                    try
+                    {
+                        this.Invoke(new Action(delegate {
+                            if (isWaitingDownload)
+                            {
+                                lblStatus.Text = msg;
+                                btnDownloadWs.Text = "⏳ " + msg;
+                            }
+                        }));
+                    }
+                    catch { }
+                });
             }
+            catch (Exception ex)
+            {
+                errMsg = ex.Message;
+                AppLogger.Error("WORKSHOP", "BtnDownloadWs_Click", ex);
+            }
+
+            try
+            {
+                this.Invoke(new Action(delegate {
+                    isWaitingDownload = false;
+                    if (pbWs.Parent != null) this.Controls.Remove(pbWs);
+                    pbWs.Dispose();
+                    btnDownloadWs.BackColor = Color.FromArgb(0, 130, 80);
+                    btnDownloadWs.Text = "⬇ Скачать ливрею";
+
+                    if (downloaded)
+                    {
+                        this.Activate();
+                        this.BringToFront();
+                        lblStatus.Text = "✔ Ливрея \"" + item.Title + "\" установлена и готова к использованию!";
+                        int selIdx = lstLiveries.SelectedIndex;
+                        if (selIdx >= 0 && selIdx < lstLiveries.Items.Count)
+                        {
+                            string curText = lstLiveries.Items[selIdx].ToString();
+                            if (!curText.StartsWith("✔ "))
+                                lstLiveries.Items[selIdx] = "✔ " + curText + " [УСТАНОВЛЕНО]";
+                        }
+                    }
+
+                    else if (!string.IsNullOrEmpty(errMsg))
+                    {
+                        lblStatus.Text = "Ошибка: " + errMsg;
+                    }
+                    else
+                    {
+                        lblStatus.Text = "Ожидание завершено. Нажмите «Обн.» во вкладке «Мои ливреи», если подписка уже оформлена.";
+                    }
+                }));
+            }
+            catch { }
+        });
+    }
+
+    private Label lblPreviewLoader = null;
+    private int previewLoadGen = 0;
+
+    private void SetPreviewLoaderText(string text)
+    {
+        if (lblPreviewLoader == null)
+        {
+            lblPreviewLoader = new Label();
+            lblPreviewLoader.Size = new Size(picPreview.Width - 20, 32);
+            lblPreviewLoader.Location = new Point(picPreview.Left + 10, picPreview.Top + (picPreview.Height - 32) / 2);
+            lblPreviewLoader.BackColor = Color.FromArgb(24, 28, 26);
+            lblPreviewLoader.ForeColor = Color.Cyan;
+            lblPreviewLoader.TextAlign = ContentAlignment.MiddleCenter;
+            lblPreviewLoader.Font = new Font("Consolas", 9.5f, FontStyle.Bold);
+            this.Controls.Add(lblPreviewLoader);
+        }
+
+        if (string.IsNullOrEmpty(text))
+        {
+            lblPreviewLoader.Visible = false;
+        }
+        else
+        {
+            lblPreviewLoader.Text = text;
+            lblPreviewLoader.Visible = true;
+            lblPreviewLoader.BringToFront();
+        }
+    }
+
+    private void UpdatePreview()
+    {
+        int currentPrevGen = ++previewLoadGen;
+        if (isWaitingDownload) WorkshopBrowser.CancelWait = true;
+        if (picPreview.Image != null) { picPreview.Image.Dispose(); picPreview.Image = null; }
+        SetPreviewLoaderText(null);
+
+        if (isCatalogMode)
+        {
+            if (lstLiveries.SelectedIndex < 0 || lstLiveries.SelectedIndex >= catalogItems.Count)
+            {
+                lblPreviewInfo.Text = "Выберите скин из каталога";
+                return;
+            }
+            WorkshopCatalogItem item = catalogItems[lstLiveries.SelectedIndex];
+            lblPreviewInfo.Text = item.Title + " (ID: " + item.PublishedFileId + ")";
+
+            if (string.IsNullOrEmpty(item.PreviewUrl))
+            {
+                SetPreviewLoaderText("Превью отсутствует");
+                return;
+            }
+
+            SetPreviewLoaderText("⏳ Загрузка превью...");
+            string url = item.PreviewUrl;
+            ThreadPool.QueueUserWorkItem(delegate {
+                try
+                {
+                    WorkshopBrowser.EnableTls12();
+                    using (System.Net.WebClient wc = new System.Net.WebClient())
+                    {
+                        byte[] data = wc.DownloadData(url);
+                        this.Invoke(new Action(delegate {
+                            if (currentPrevGen != previewLoadGen || !isCatalogMode) return;
+                            SetPreviewLoaderText(null);
+                            using (MemoryStream ms = new MemoryStream(data))
+                                picPreview.Image = Image.FromStream(ms);
+                        }));
+                    }
+                }
+                catch
+                {
+                    try
+                    {
+                        this.Invoke(new Action(delegate {
+                            if (currentPrevGen == previewLoadGen && isCatalogMode)
+                                SetPreviewLoaderText("Не удалось загрузить превью");
+                        }));
+                    }
+                    catch { }
+                }
+            });
+            return;
+        }
+
+        LiveryEntry entry = GetSelectedEntry();
+        if (entry == null) { lblPreviewInfo.Text = "Выберите ливрею (ПКМ — назначить борт)"; return; }
+
+        lblPreviewInfo.Text = entry.Name + " (" + entry.Aircraft + ")";
+        if (!string.IsNullOrEmpty(entry.PreviewPath) && File.Exists(entry.PreviewPath))
+        {
+            try
+            {
+                byte[] bytes = File.ReadAllBytes(entry.PreviewPath);
+                using (MemoryStream ms = new MemoryStream(bytes))
+                    picPreview.Image = Image.FromStream(ms);
+            }
+            catch { SetPreviewLoaderText("Ошибка чтения превью"); }
+        }
+        else
+        {
+            SetPreviewLoaderText("Превью отсутствует");
+        }
+    }
+
+
+    private string GetLiveriesRootDir()
+    {
+        if (string.IsNullOrEmpty(gameRoot) || !Directory.Exists(gameRoot))
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL", "CustomLiveries");
+        return Path.Combine(gameRoot, "CustomLiveries");
+    }
+
+    private void LoadLiveries()
+    {
+        lstLiveries.Items.Clear();
+        currentEntries.Clear();
+        string dir = GetLiveriesRootDir();
+        string filterAc = cmbAircraft.SelectedItem != null ? cmbAircraft.SelectedItem.ToString() : "Все самолеты";
+        string searchQ = txtSearch != null ? txtSearch.Text.Trim() : "";
+
+        List<LiveryEntry> local = LiveryParser.ScanLocal(dir);
+        currentEntries.AddRange(local);
+
+        if (chkWorkshop.Checked && !string.IsNullOrEmpty(gameRoot))
+        {
+            string steamLibRoot = Path.GetFullPath(Path.Combine(gameRoot, @"..\..\.."));
+            List<LiveryEntry> ws = LiveryParser.ScanWorkshop(steamLibRoot);
+            currentEntries.AddRange(ws);
+        }
 
         filteredEntries.Clear();
         foreach (LiveryEntry e in currentEntries)
         {
-            if (filterAc == "Все самолеты" || e.Aircraft.Equals(filterAc, StringComparison.OrdinalIgnoreCase))
+            bool matchAc = (filterAc == "Все самолеты" || e.Aircraft.Equals(filterAc, StringComparison.OrdinalIgnoreCase));
+            bool matchText = (string.IsNullOrEmpty(searchQ) || e.Name.IndexOf(searchQ, StringComparison.OrdinalIgnoreCase) >= 0);
+            if (matchAc && matchText)
             {
                 filteredEntries.Add(e);
                 string mark = e.Valid ? "" : " [!невалидна]";
@@ -2668,74 +3699,79 @@ public class Livery3DViewerForm : Form
         catch (Exception ex) { MessageBox.Show("Ошибка открытия 3D-просмотра: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error); }
     }
 
-
     private void BtnInstallFolder_Click(object sender, EventArgs e)
+    {
+        using (FolderBrowserDialog fbd = new FolderBrowserDialog())
         {
-            using (FolderBrowserDialog fbd = new FolderBrowserDialog())
+            fbd.Description = "Выберите папку со скином (livery.cfg/*.vtl и текстуры)";
+            if (fbd.ShowDialog() == DialogResult.OK)
             {
-                fbd.Description = "Выберите папку со скином (livery.cfg/*.vtl и текстуры)";
-                if (fbd.ShowDialog() == DialogResult.OK)
-                {
-                    string src = fbd.SelectedPath;
-                    string folderName = Path.GetFileName(src);
-                    string dst = Path.Combine(GetLiveriesRootDir(), folderName);
-                    try
-                    {
-                        Directory.CreateDirectory(dst);
-                        foreach (string f in Directory.GetFiles(src, "*.*", SearchOption.AllDirectories))
-                        {
-                            string rel = f.Substring(src.Length).TrimStart('\\', '/');
-                            string target = Path.Combine(dst, rel);
-                            Directory.CreateDirectory(Path.GetDirectoryName(target));
-                            File.Copy(f, target, true);
-                        }
-                        LoadLiveries();
-                        MessageBox.Show("Ливрея \"" + folderName + "\" добавлена!", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    }
-                    catch (Exception ex) { MessageBox.Show("Ошибка установки скина: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error); }
-                }
-            }
-        }
-
-        private void BtnInstallZip_Click(object sender, EventArgs e)
-        {
-            using (OpenFileDialog ofd = new OpenFileDialog() { Filter = "ZIP-архив (*.zip)|*.zip" })
-            {
-                if (ofd.ShowDialog() == DialogResult.OK)
-                {
-                    if (LiveryParser.InstallZip(ofd.FileName, GetLiveriesRootDir()))
-                    {
-                        LoadLiveries();
-                        MessageBox.Show("Архив успешно распакован и установлен!", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    }
-                    else MessageBox.Show("Не удалось распаковать архив.", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-            }
-        }
-
-        private void BtnDelete_Click(object sender, EventArgs e)
-        {
-            LiveryEntry entry = GetSelectedEntry();
-            if (entry == null) { MessageBox.Show("Выберите ливрею для удаления.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-            if (entry.Source == "Workshop") { MessageBox.Show("Ливреи из Workshop удаляются только через Steam.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
-
-            if (MessageBox.Show("Удалить камуфляж \"" + entry.Name + "\"?", "Подтверждение", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
-            {
+                string src = fbd.SelectedPath;
+                string folderName = Path.GetFileName(src);
+                string dst = Path.Combine(GetLiveriesRootDir(), folderName);
                 try
                 {
-                    if (Directory.Exists(entry.FolderPath)) Directory.Delete(entry.FolderPath, true);
+                    Directory.CreateDirectory(dst);
+                    foreach (string f in Directory.GetFiles(src, "*.*", SearchOption.AllDirectories))
+                    {
+                        string rel = f.Substring(src.Length).TrimStart('\\', '/');
+                        string target = Path.Combine(dst, rel);
+                        Directory.CreateDirectory(Path.GetDirectoryName(target));
+                        File.Copy(f, target, true);
+                    }
                     LoadLiveries();
+                    MessageBox.Show("Ливрея \"" + folderName + "\" добавлена!", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
-                catch (Exception ex) { MessageBox.Show("Ошибка: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+                catch (Exception ex) { MessageBox.Show("Ошибка установки скина: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error); }
             }
         }
     }
+    private void BtnInstallZip_Click(object sender, EventArgs e)
+    {
+        using (OpenFileDialog ofd = new OpenFileDialog() { Filter = "ZIP-архив (.zip)|.zip" })
+        {
+            if (ofd.ShowDialog() == DialogResult.OK)
+            {
+                if (LiveryParser.InstallZip(ofd.FileName, GetLiveriesRootDir()))
+                {
+                    LoadLiveries();
+                    MessageBox.Show("Архив успешно распакован и установлен!", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else MessageBox.Show("Не удалось распаковать архив.", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+    }
+    private void BtnDelete_Click(object sender, EventArgs e)
+    {
+        LiveryEntry entry = GetSelectedEntry();
+        if (entry == null) { MessageBox.Show("Выберите ливрею для удаления.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
 
+        string msg = entry.Source == "Workshop"
+            ? "Отписаться и удалить Workshop-ливрею \"" + entry.Name + "\"?"
+            : "Удалить камуфляж \"" + entry.Name + "\"?";
 
-    // =========================================================================
-    // === ТАКТИЧЕСКИЙ ЖУРНАЛ ВЫЛЕТОВ (без изменений логики) ===================
-    // =========================================================================
-    public class FlightLogbookForm : Form
+        if (MessageBox.Show(msg, "Подтверждение удаления", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+        {
+            try
+            {
+                if (entry.Source == "Workshop")
+                    WorkshopBrowser.UnsubscribeAndDeleteWorkshop(entry.FolderPath, gameRoot);
+                else if (Directory.Exists(entry.FolderPath))
+                    Directory.Delete(entry.FolderPath, true);
+
+                LoadLiveries();
+                lblStatus.Text = "Ливрея \"" + entry.Name + "\" удалена.";
+            }
+            catch (Exception ex) { MessageBox.Show("Ошибка удаления: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        }
+    }
+
+}
+
+// =========================================================================
+// === ТАКТИЧЕСКИЙ ЖУРНАЛ ВЫЛЕТОВ (без изменений логики) ===================
+// =========================================================================
+public class FlightLogbookForm : Form
 {
     private ListView lvLog;
     private Label lblSummary;
@@ -3236,14 +4272,25 @@ public class MainForm : Form
         this.Controls.Add(btnAudioSettings);
 
         btnDiagnostics = new Button();
-        btnDiagnostics.Text = "🔧 ДИАГНОСТИКА ЛОГА";
+        btnDiagnostics.Text = "🔧 ЛОГ ИГРЫ";
         btnDiagnostics.Location = new Point(24, 572);
-        btnDiagnostics.Size = new Size(255, 32);
+        btnDiagnostics.Size = new Size(125, 32);
         btnDiagnostics.FlatStyle = FlatStyle.Flat;
         btnDiagnostics.BackColor = Color.FromArgb(30, 38, 34);
         btnDiagnostics.ForeColor = Color.FromArgb(0, 255, 102);
         btnDiagnostics.Click += new EventHandler(BtnDiagnostics_Click);
         this.Controls.Add(btnDiagnostics);
+
+        Button btnAppLog = new Button();
+        btnAppLog.Text = "🐞 ЛОГ ПРОГИ";
+        btnAppLog.Location = new Point(155, 572);
+        btnAppLog.Size = new Size(124, 32);
+        btnAppLog.FlatStyle = FlatStyle.Flat;
+        btnAppLog.BackColor = Color.FromArgb(55, 35, 45);
+        btnAppLog.ForeColor = Color.Gold;
+        btnAppLog.Click += (s, e) => { try { Process.Start("notepad.exe", AppLogger.GetLogPath()); } catch { } };
+        this.Controls.Add(btnAppLog);
+
 
         btnOpenFolder = new Button();
         btnOpenFolder.Text = "📁 ПАПКА RADIOMUSIC";
@@ -3751,7 +4798,13 @@ public class MainForm : Form
     [STAThread]
     static void Main(string[] args)
     {
-        if (args != null && args.Length >= 1 && args[0] == "--shuffle")
+        bool isShuffleMode = (args != null && args.Length >= 1 && args[0] == "--shuffle");
+        if (!isShuffleMode)
+            AppLogger.InitSession();
+
+        AppLogger.Log("CORE", "Запуск приложения. Аргументы: " + (args != null ? string.Join(" ", args) : "нет"));
+
+        if (isShuffleMode)
         {
             string dir = args.Length >= 2 ? args[1] : "";
             if (!string.IsNullOrEmpty(dir))
@@ -3765,14 +4818,50 @@ public class MainForm : Form
                 bool smart = SettingsManagerSafeGetShuffleFlag();
                 MusicShuffler.ShuffleNow(dir, smart);
             }
+
+            // Если основной экземпляр VTOL_QoL.exe не открыт — запускаем трекер в фоне на время этой игровой сессии
+            bool createdNewBg;
+            using (Mutex bgMutex = new Mutex(true, @"Local\VTOL_QoL_Tracker_SingleInstance", out createdNewBg))
+            {
+                if (createdNewBg)
+                {
+                    SettingsManager.Load();
+                    GameTracker bgTracker = new GameTracker();
+                    bgTracker.DiscordEnabled = SettingsManager.GetBool("Discord", true);
+                    bgTracker.DuckingEnabled = SettingsManager.GetBool("Ducking", true);
+                    bgTracker.AudioSwitchEnabled = SettingsManager.GetBool("AudioSwitch", true);
+                    bgTracker.DiagnosticsEnabled = SettingsManager.GetBool("DiagnosticsEnabled", false);
+                    bgTracker.Start();
+
+                    // Ждём старта VTOLVR.exe (до 30 сек), а затем работаем, пока игра открыта
+                    DateTime startWait = DateTime.UtcNow.AddSeconds(30);
+                    while (DateTime.UtcNow < startWait && !MusicShuffler.IsGameRunning())
+                        Thread.Sleep(500);
+
+                    while (MusicShuffler.IsGameRunning())
+                        Thread.Sleep(2000);
+
+                    Thread.Sleep(2500); // даём трекеру завершить очистку Discord и вернуть звук
+                }
+                else
+                {
+                    AppLogger.Log("CORE", "Основной экземпляр VTOL_QoL уже активен, фоновый трекер пропущен.");
+                }
+            }
             return;
         }
 
-        Application.EnableVisualStyles();
-        Application.SetCompatibleTextRenderingDefault(false);
-        SettingsManager.Load();
-        Application.Run(new MainForm());
+        bool createdNewMain;
+        using (Mutex mainMutex = new Mutex(true, @"Local\VTOL_QoL_Tracker_SingleInstance", out createdNewMain))
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            SettingsManager.Load();
+            Application.Run(new MainForm());
+        }
+
     }
+
 
     private static bool SettingsManagerSafeGetShuffleFlag()
     {
