@@ -12,11 +12,12 @@ using Microsoft.Win32;
 
 public class MapPoiMarker
 {
-    public string Kind; // "Base", "Carrier", "SAM", "Waypoint", "Bullseye"
+    public string Kind; // "Base", "Carrier", "SAM", "Waypoint", "Bullseye", "Airfield"
     public string Label;
     public string Coalition;
     public double X;
     public double Y;
     public double RadiusMeters;
+    public double Heading;   // курс ВПП, градусы (для аэродромов)
 }
 

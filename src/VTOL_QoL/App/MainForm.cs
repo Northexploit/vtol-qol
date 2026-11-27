@@ -44,7 +44,7 @@ public class MainForm : Form
     private Label lblStatus;
     private ProgressBar progressBar;
     private Button btnLiveryManager;
-    private Button btnLogbook;
+    private Button btnDebrief;
     private Button btnServers;
     private volatile Process currentWorkerProcess = null;
     private volatile bool isCancelRequested = false;
@@ -72,7 +72,7 @@ public class MainForm : Form
     private ServerBrowserForm openServersForm = null;
     private MusicManagerForm openMusicForm = null;
     private LiveryManagerForm openLiveryForm = null;
-    private FlightLogbookForm openLogbookForm = null;
+    private DebriefRadarForm openDebriefForm = null;
     private AudioSettingsForm openAudioForm = null;
     private LogDiagnosticsForm openDiagForm = null;
 
@@ -306,15 +306,16 @@ public class MainForm : Form
         btnServers.Click += new EventHandler(BtnServers_Click);
         this.Controls.Add(btnServers);
 
-        btnLogbook = new Button();
-        btnLogbook.Text = "📋 ЛОГБУК";
-        btnLogbook.Location = new Point(288, 238);
-        btnLogbook.Size = new Size(124, 38);
-        btnLogbook.FlatStyle = FlatStyle.Flat;
-        btnLogbook.BackColor = Color.FromArgb(40, 85, 70);
-        btnLogbook.ForeColor = Color.White;
-        btnLogbook.Click += new EventHandler(BtnLogbook_Click);
-        this.Controls.Add(btnLogbook);
+        btnDebrief = new Button();
+        btnDebrief.Text = "🎯 РАЗБОР БОЯ";
+        btnDebrief.Font = new Font("Consolas", 8.5f, FontStyle.Bold);
+        btnDebrief.Location = new Point(288, 238);
+        btnDebrief.Size = new Size(124, 38);
+        btnDebrief.FlatStyle = FlatStyle.Flat;
+        btnDebrief.BackColor = Color.FromArgb(70, 50, 115);
+        btnDebrief.ForeColor = Color.Cyan;
+        btnDebrief.Click += new EventHandler(BtnDebrief_Click);
+        this.Controls.Add(btnDebrief);
 
         Button btnSettings = new Button();
         btnSettings.Text = "⚙ ОПЦИИ";
@@ -873,12 +874,12 @@ public class MainForm : Form
         openLiveryForm.Show(this);
     }
 
-    private void BtnLogbook_Click(object sender, EventArgs e)
+    private void BtnDebrief_Click(object sender, EventArgs e)
     {
-        if (BringExistingToFront(openLogbookForm)) return;
-        openLogbookForm = new FlightLogbookForm();
-        openLogbookForm.FormClosed += (s, ev) => { openLogbookForm = null; };
-        openLogbookForm.Show(this);
+        if (BringExistingToFront(openDebriefForm)) return;
+        openDebriefForm = new DebriefRadarForm();
+        openDebriefForm.FormClosed += (s, ev) => { openDebriefForm = null; };
+        openDebriefForm.Show(this);
     }
 
     private void BtnAudioSettings_Click(object sender, EventArgs e)
@@ -1059,7 +1060,7 @@ public class MainForm : Form
         btnInstall.Enabled = enabled;
         btnManageMusic.Enabled = enabled;
         btnLiveryManager.Enabled = enabled;
-        btnLogbook.Enabled = enabled;
+        btnDebrief.Enabled = enabled;
         btnServers.Enabled = enabled;
         pnlDropZone.AllowDrop = enabled;
         btnStopDownload.Visible = !enabled;

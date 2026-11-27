@@ -18,6 +18,14 @@ public static class JammerModel
     public const double DirectionalPower = 8.0;
     public const double SignalLeakFactor = 0.03;
 
+    // Конус сильного подавления для отрисовки. Диаграмма в игре — cos^8:
+    // на 10° от оси сигнал ещё 88% от осевого (cos(10°)^8 = 0.88), на 23.5° — 50%.
+    // Рисуем зону именно сильного подавления, а не «широкий лепесток» на -10 дБ.
+    public const double NoiseConeHalfAngleDeg = 10.0;
+    // Максимальная дальность конуса. В игре РЭБ достаёт очень далеко, но конус
+    // не должен занимать полкарты: длину ограничиваем дистанцией до цели + запас.
+    public const double NoiseConeRangeM = 150000.0;
+
     // Угол (в градусах) от оси луча, на котором относительный сигнал падает до level.
     // cos(theta)^directionalPower = level  =>  theta = acos(level^(1/power))
     public static double AngleForLevel(double level)

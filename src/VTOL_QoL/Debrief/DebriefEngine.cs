@@ -2511,6 +2511,9 @@ public static class DebriefEngine
         if (File.Exists(hmPath))
             TryBuildTerrainFromHeightmapPngb(s, hmPath, mapSize);
 
+        // Аэродромы определяем после рельефа: нужно отсеять точки над водой
+        DetectAirfields(s);
+
         return s;
     }
     private static string LastVtrDiagnostic = "";
@@ -4112,6 +4115,479 @@ public static class DebriefEngine
                 }
             }
         }
+
+        // 6. Универсальный fallback лучей захвата.
+        // Игра пишет LockingRadar/customTracks не для всей техники: в части реплеев вообще нет
+        // треков для АРЛ/ПКР/ПРР (ASM-66, BSM-66, RIM-67B, HARM, ...) и для наземных/надводных РЛС.
+        // Восстанавливаем недостающие лучи по кинематике треков — это не зависит от типа техники,
+        // стороны конфликта и версии игры.
+        SynthesizeMissingLockBeams(s);
+    }
+
+    private static readonly Regex RadarGuidedMissilePattern = new Regex(
+        @"AIM-120|AIM-54|AIM-7|RIM-67|ASM-66|BSM-66|HARM|AGM-188|FLKM|SEA-900|9M311|SAAW|CAGM",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static bool IsRadarGuidedMissile(DebriefEntity e)
+    {
+        if (e == null || e.Type != "Missile") return false;
+        return RadarGuidedMissilePattern.IsMatch(e.Name ?? "");
+    }
+
+    // Наземный/надводный носитель РЛС: ЗРК, корабль, РЛС обнаружения.
+    private static bool IsSurfaceRadarUnit(DebriefEntity e)
+    {
+        if (e == null) return false;
+        if (e.Class != "Ground" && e.Class != "Sea") return false;
+        string nm = e.Name ?? "";
+        if (nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            nm.IndexOf("Infantry", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            nm.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            nm.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            nm.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0)
+            return false;
+        // Пусковые установки без собственной РЛС не «светят» цель
+        if (nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) < 0 &&
+            (nm.IndexOf("Launcher", StringComparison.OrdinalIgnoreCase) >= 0 ||
+             nm.IndexOf("Battery", StringComparison.OrdinalIgnoreCase) >= 0 ||
+             nm.IndexOf("Turret", StringComparison.OrdinalIgnoreCase) >= 0 ||
+             nm.IndexOf("Phalanx", StringComparison.OrdinalIgnoreCase) >= 0 ||
+             nm.IndexOf("CIWS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+             nm.IndexOf("VLS", StringComparison.OrdinalIgnoreCase) >= 0))
+            return false;
+        return e.RoleTag == "SAM" || e.RoleTag == "Ship" ||
+               nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               nm.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               nm.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               nm.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               nm.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static double BeamDist3D(DebriefSample a, DebriefSample b)
+    {
+        double dx = a.X - b.X, dy = a.Alt - b.Alt, dz = a.Y - b.Y;
+        return Math.Sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    private static DebriefEntity FindEntityByName(DebriefSession s, string name)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        foreach (DebriefEntity e in s.Entities)
+            if (string.Equals(e.Name, name, StringComparison.OrdinalIgnoreCase)) return e;
+        return null;
+    }
+
+    private static string BeamKindFor(DebriefEntity src)
+    {
+        if (src == null) return "ALLY_LOCK";
+        if (src.Coalition == "Enemies") return "RWR_SPIKE";
+        if (src.IsPlayer || (src.Pilot != null && src.Pilot.StartsWith("MY_MISSILE:"))) return "MY_LOCK";
+        return "ALLY_LOCK";
+    }
+
+    private static void AddSyntheticBeam(DebriefSession s, DebriefEntity src, DebriefEntity dst,
+        double t0, double t1, string kind, string fromLabel)
+    {
+        if (src == null || dst == null) return;
+        // Короткие лучи (0,1-0,5 с) визуально не читаются — держим минимум 1,5 с в пределах жизни целей
+        if (t1 - t0 < 1.5)
+            t1 = Math.Min(Math.Min(src.LastTime, dst.LastTime), t0 + 1.5);
+        if (t1 <= t0 + 0.25) return;
+
+        DebriefSample a = src.GetStateAt(t0);
+        if (a == null && src.Track.Count > 0) a = src.Track[0];
+        DebriefSample b = dst.GetStateAt(t0);
+        if (b == null && dst.Track.Count > 0) b = dst.Track[0];
+        if (a == null || b == null) return;
+
+        s.Beams.Add(new TacticalBeam
+        {
+            StartTime = t0,
+            EndTime = t1,
+            Kind = kind,
+            FromId = src.Id,
+            ToId = dst.Id,
+            FromName = string.IsNullOrEmpty(fromLabel) ? src.Name : fromLabel,
+            ToName = dst.Name,
+            FromX = a.X,
+            FromY = a.Y,
+            ToX = b.X,
+            ToY = b.Y
+        });
+    }
+
+    // Цель ракеты: сначала подтверждённое попадание из аналитики пусков,
+    // затем — ближайший противник в конце трека, затем — минимальное сближение.
+    private static DebriefEntity FindMissileTarget(DebriefSession s, DebriefEntity msl)
+    {
+        foreach (DebriefLaunch dl in s.Launches)
+        {
+            if (dl.MissileId != msl.Id || string.IsNullOrEmpty(dl.TargetName)) continue;
+            DebriefEntity hit = FindEntityByName(s, dl.TargetName);
+            if (hit != null) return hit;
+        }
+
+        if (msl.Track.Count < 2) return null;
+
+        // Цель определяем по последней точке трека: ракета заканчивает полёт у цели
+        // (попадание, подрыв рядом или промах в непосредственной близости). Поиск
+        // «минимальной дистанции за весь полёт» даёт ложные срабатывания на пролетающих бортах.
+        DebriefSample endPoint = msl.GetStateAt(msl.LastTime);
+        if (endPoint != null)
+        {
+            DebriefEntity pointTarget = null;
+            double pointBest = double.MaxValue;
+            foreach (DebriefEntity cand in s.Entities)
+            {
+                if (cand == msl || cand.Track.Count == 0) continue;
+                if (cand.Coalition == msl.Coalition) continue;
+                if (cand.Class == "Missile") continue;
+                DebriefSample b = cand.GetStateAt(msl.LastTime);
+                if (b == null) continue;
+                double d = BeamDist3D(endPoint, b);
+                if (d < pointBest) { pointBest = d; pointTarget = cand; }
+            }
+            if (pointTarget != null && pointBest <= 3000.0) return pointTarget;
+        }
+
+        DebriefEntity endTarget = null;
+        double endBest = double.MaxValue;
+        double tEndFrom = Math.Max(msl.FirstTime, msl.LastTime - 2.0);
+        for (double t = tEndFrom; t <= msl.LastTime + 0.01; t += 0.5)
+        {
+            DebriefSample a = msl.GetStateAt(t);
+            if (a == null) continue;
+            foreach (DebriefEntity cand in s.Entities)
+            {
+                if (cand == msl || cand.Track.Count == 0) continue;
+                if (cand.Coalition == msl.Coalition) continue;
+                if (cand.Class == "Missile") continue;
+                DebriefSample b = cand.GetStateAt(t);
+                if (b == null) continue;
+                double d = BeamDist3D(a, b);
+                if (d < endBest) { endBest = d; endTarget = cand; }
+            }
+        }
+        if (endTarget != null && endBest <= 3000.0) return endTarget;
+
+        // Резерв: последние 20% полёта, только очень близкое сближение
+        double tFrom = msl.FirstTime + (msl.LastTime - msl.FirstTime) * 0.8;
+        double best = double.MaxValue;
+        DebriefEntity bestEnt = null;
+
+        foreach (DebriefEntity cand in s.Entities)
+        {
+            if (cand == msl || cand.Track.Count == 0) continue;
+            // Кинематика ищет только реальную цель: своя техника и соседние ракеты из залпа
+            // летят рядом и дают ложное «сближение».
+            if (cand.Coalition == msl.Coalition) continue;
+            if (cand.Class == "Missile") continue;
+            if (cand.LastTime < tFrom || cand.FirstTime > msl.LastTime) continue;
+
+            for (double t = tFrom; t <= msl.LastTime + 0.01; t += 1.0)
+            {
+                DebriefSample a = msl.GetStateAt(t);
+                DebriefSample b = cand.GetStateAt(t);
+                if (a == null || b == null) continue;
+                double d = BeamDist3D(a, b);
+                if (d < best) { best = d; bestEnt = cand; }
+            }
+        }
+
+        return best <= 2000.0 ? bestEnt : null;
+    }
+
+    // Резерв для ракет, которые не попали: цель определяется по начальному направлению
+    // пуска (продолжение вектора полёта на первые секунды). Так ИИ-пуски по кораблям/РЛС
+    // получают пунктир захвата даже при промахе.
+    private static DebriefEntity FindTargetByHeading(DebriefSession s, DebriefEntity msl)
+    {
+        if (msl.Track.Count < 3) return null;
+        DebriefSample p0 = msl.Track[0];
+        DebriefSample p1 = null;
+        for (int i = 1; i < msl.Track.Count; i++)
+        {
+            if (msl.Track[i].Time >= msl.FirstTime + 3.0) { p1 = msl.Track[i]; break; }
+        }
+        if (p1 == null) p1 = msl.Track[msl.Track.Count - 1];
+
+        double dx = p1.X - p0.X, dy = p1.Y - p0.Y;
+        double len = Math.Sqrt(dx * dx + dy * dy);
+        if (len < 100.0) return null;
+        dx /= len; dy /= len;
+
+        DebriefEntity best = null;
+        double bestPerp = double.MaxValue;
+        foreach (DebriefEntity cand in s.Entities)
+        {
+            if (cand == msl || cand.Track.Count == 0) continue;
+            if (cand.Coalition == msl.Coalition) continue;
+            if (cand.Class == "Missile") continue;
+
+            DebriefSample b = cand.GetStateAt(msl.FirstTime);
+            if (b == null && cand.Track.Count > 0) b = cand.Track[0];
+            if (b == null) continue;
+
+            double rx = b.X - p0.X, ry = b.Y - p0.Y;
+            double proj = rx * dx + ry * dy;
+            if (proj < 1000.0 || proj > 120000.0) continue;
+
+            double perp = Math.Abs(rx * (-dy) + ry * dx);
+            if (perp > Math.Max(3000.0, proj * 0.15)) continue;
+            if (perp < bestPerp) { bestPerp = perp; best = cand; }
+        }
+        return best;
+    }
+
+    // =====================================================================
+    // === Аэродромы ========================================================
+    // В штатном .vtr статических объектов карты нет. Восстанавливаем аэродромы
+    // по трекам бортов: точки, где самолёт/вертолёт стоял или катился по земле
+    // (малая высота и малая скорость) в начале либо в конце трека.
+    // =====================================================================
+    private static void DetectAirfields(DebriefSession s)
+    {
+        if (s == null) return;
+        s.Airfields.Clear();
+        if (s.Entities == null || s.Entities.Count == 0) return;
+
+        List<double[]> candidates = new List<double[]>();
+        bool haveTerrain = s.TerrainHeights != null && s.MapSizeMeters > 100.0;
+
+        foreach (DebriefEntity ent in s.Entities)
+        {
+            if (ent.Class != "Air" && ent.Class != "Chopper") continue;
+            if (ent.Track.Count < 5) continue;
+
+            TryAddAirfieldPoint(s, ent, 0, 1, candidates, haveTerrain);
+            TryAddAirfieldPoint(s, ent, ent.Track.Count - 1, -1, candidates, haveTerrain);
+        }
+
+        if (candidates.Count == 0) return;
+
+        // Жадная кластеризация: одна точка на аэродром
+        const double clusterR = 2500.0;
+        List<double[]> clusters = new List<double[]>();   // x, y, sumSin, sumCos, count
+        foreach (double[] c in candidates)
+        {
+            bool merged = false;
+            for (int i = 0; i < clusters.Count; i++)
+            {
+                double dx = clusters[i][0] - c[0];
+                double dy = clusters[i][1] - c[1];
+                if (dx * dx + dy * dy <= clusterR * clusterR)
+                {
+                    double n = clusters[i][4];
+                    clusters[i][0] = (clusters[i][0] * n + c[0]) / (n + 1.0);
+                    clusters[i][1] = (clusters[i][1] * n + c[1]) / (n + 1.0);
+                    clusters[i][2] += Math.Sin(c[2] * Math.PI / 180.0);
+                    clusters[i][3] += Math.Cos(c[2] * Math.PI / 180.0);
+                    clusters[i][4] = n + 1.0;
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged)
+                clusters.Add(new double[] { c[0], c[1], Math.Sin(c[2] * Math.PI / 180.0), Math.Cos(c[2] * Math.PI / 180.0), 1.0 });
+        }
+
+        int idx = 0;
+        foreach (double[] cl in clusters)
+        {
+            double hdg = Math.Atan2(cl[2], cl[3]) * 180.0 / Math.PI;
+            if (hdg < 0.0) hdg += 360.0;
+            idx++;
+            s.Airfields.Add(new MapPoiMarker
+            {
+                Kind = "Airfield",
+                Label = "АЭРОДРОМ " + idx,
+                Coalition = "Neutral",
+                X = cl[0],
+                Y = cl[1],
+                Heading = hdg
+            });
+        }
+    }
+
+    // Аэродром — ровная площадка: перепад высот в радиусе r не должен превышать maxDelta
+    private static bool IsFlatArea(DebriefSession s, double x, double y, double r, double maxDelta)
+    {
+        double mn = double.MaxValue, mx = double.MinValue;
+        for (int i = 0; i < 8; i++)
+        {
+            double a = i * Math.PI / 4.0;
+            double h = s.GetGroundAltitudeAt(x + Math.Cos(a) * r, y + Math.Sin(a) * r);
+            if (h < mn) mn = h;
+            if (h > mx) mx = h;
+        }
+        double hc = s.GetGroundAltitudeAt(x, y);
+        if (hc < mn) mn = hc;
+        if (hc > mx) mx = hc;
+        return (mx - mn) <= maxDelta;
+    }
+
+    private static void TryAddAirfieldPoint(DebriefSession s, DebriefEntity ent, int startIdx, int step,
+        List<double[]> candidates, bool haveTerrain)
+    {
+        int count = ent.Track.Count;
+        int limit = Math.Min(10, count);
+        for (int k = 0; k < limit; k++)
+        {
+            int i = startIdx + k * step;
+            if (i < 0 || i >= count) return;
+            DebriefSample smp = ent.Track[i];
+            if (smp.Speed > 100.0) continue;     // уже в разбеге/пробеге на большой скорости
+            double ground = haveTerrain ? s.GetGroundAltitudeAt(smp.X, smp.Y) : 0.0;
+            if (haveTerrain && ground < 1.5) return;   // над водой аэродрома нет
+            if (smp.Alt - ground > 45.0) continue;     // «на земле», а не пролёт над горой
+            if (haveTerrain && !IsFlatArea(s, smp.X, smp.Y, 700.0, 140.0)) continue;
+
+            // Курс ВПП: по направлению движения, если борт успел переместиться
+            double hdg = smp.Heading;
+            int j0 = Math.Max(0, i - 4);
+            int j1 = Math.Min(count - 1, i + 4);
+            double bx = ent.Track[j0].X, by = ent.Track[j0].Y;
+            for (int j = j1; j >= j0; j--)
+            {
+                double dx = ent.Track[j].X - bx;
+                double dy = ent.Track[j].Y - by;
+                if (dx * dx + dy * dy > 300.0 * 300.0)
+                {
+                    hdg = Math.Atan2(dx, dy) * 180.0 / Math.PI;
+                    if (hdg < 0.0) hdg += 360.0;
+                    break;
+                }
+            }
+            candidates.Add(new double[] { smp.X, smp.Y, hdg });
+            return;
+        }
+    }
+
+    private static void SynthesizeMissingLockBeams(DebriefSession s)
+    {
+        if (s == null || s.Entities.Count == 0) return;
+
+        // Что уже восстановлено штатно (customTracks/лог) — не дублируем
+        HashSet<string> existingFrom = new HashSet<string>();
+        HashSet<string> existingPair = new HashSet<string>();
+        foreach (TacticalBeam bm in s.Beams)
+        {
+            if (string.IsNullOrEmpty(bm.FromId)) continue;
+            existingFrom.Add(bm.FromId);
+            existingPair.Add(bm.FromId + "|" + (bm.ToId ?? ""));
+        }
+
+        // 6.1 Ракеты с радиолокационным наведением: пунктир «ракета → цель»
+        foreach (DebriefEntity msl in s.Entities)
+        {
+            if (!IsRadarGuidedMissile(msl) || msl.Track.Count < 2) continue;
+            if (msl.LastTime <= msl.FirstTime + 0.5) continue;
+            if (existingFrom.Contains(msl.Id)) continue;
+
+            DebriefEntity tgt = FindMissileTarget(s, msl);
+            if (tgt == null) tgt = FindTargetByHeading(s, msl);
+            if (tgt == null) continue;
+            if (existingPair.Contains(msl.Id + "|" + tgt.Id)) continue;
+
+            AddSyntheticBeam(s, msl, tgt, msl.FirstTime, msl.LastTime, BeamKindFor(msl), "[АРЛ] " + msl.Name);
+            existingFrom.Add(msl.Id);
+            existingPair.Add(msl.Id + "|" + tgt.Id);
+
+            // Подсветка цели наземным/надводным носителем (ЗРК/корабль) в момент пуска
+            DebriefEntity launcher = FindEntityByName(s, msl.Pilot);
+            if (launcher != null && launcher != msl && IsSurfaceRadarUnit(launcher) &&
+                !existingFrom.Contains(launcher.Id) &&
+                !existingPair.Contains(launcher.Id + "|" + tgt.Id))
+            {
+                double tStart = Math.Max(launcher.FirstTime, msl.FirstTime - 2.0);
+                double tEnd = Math.Min(Math.Min(launcher.LastTime, tgt.LastTime), msl.FirstTime + 4.0);
+                AddSyntheticBeam(s, launcher, tgt, tStart, tEnd, BeamKindFor(launcher), launcher.Name);
+                existingPair.Add(launcher.Id + "|" + tgt.Id);
+            }
+        }
+
+        // 6.2 Наземные/надводные РЛС без штатных лучей: пунктир «РЛС → цель»
+        foreach (DebriefEntity radar in s.Entities)
+        {
+            if (!IsSurfaceRadarUnit(radar) || radar.Track.Count == 0) continue;
+            if (existingFrom.Contains(radar.Id)) continue;
+
+            double range = 45000.0;
+            string rn = radar.Name ?? "";
+            if (rn.IndexOf("Early Warning", StringComparison.OrdinalIgnoreCase) >= 0) range = 90000.0;
+            else if (radar.Class == "Sea" || radar.RoleTag == "Ship") range = 60000.0;
+
+            DebriefEntity bestTgt = null;
+            double bestLen = 0, bestStart = 0, bestEnd = 0;
+
+            foreach (DebriefEntity cand in s.Entities)
+            {
+                if (cand == radar || cand.Track.Count == 0) continue;
+                if (cand.Coalition == radar.Coalition) continue;
+                if (cand.Class != "Air" && cand.Class != "Chopper" && cand.Class != "Missile") continue;
+
+                double t0 = Math.Max(radar.FirstTime, cand.FirstTime);
+                double t1 = Math.Min(radar.LastTime, cand.LastTime);
+                if (t1 <= t0 + 1.0) continue;
+
+                double segStart = -1, segEnd = 0;
+                double firstD = -1, lastD = -1;
+                double candBestLen = 0, candBestStart = 0, candBestEnd = 0;
+
+                for (double t = t0; t <= t1 + 0.01; t += 2.0)
+                {
+                    DebriefSample a = radar.GetStateAt(t);
+                    DebriefSample b = cand.GetStateAt(t);
+                    bool inRange = a != null && b != null && BeamDist3D(a, b) <= range;
+                    if (inRange)
+                    {
+                        if (segStart < 0) { segStart = t; firstD = BeamDist3D(a, b); }
+                        lastD = BeamDist3D(a, b);
+                        segEnd = Math.Min(t + 2.0, t1);
+                    }
+                    else if (segStart >= 0)
+                    {
+                        if (segEnd - segStart > candBestLen)
+                        { candBestLen = segEnd - segStart; candBestStart = segStart; candBestEnd = segEnd; }
+                        segStart = -1;
+                    }
+                }
+                if (segStart >= 0 && segEnd - segStart > candBestLen)
+                { candBestLen = segEnd - segStart; candBestStart = segStart; candBestEnd = segEnd; }
+                if (candBestLen < 2.0) continue;
+
+                // Ракета — только если реально летит на РЛС, а не пролетает мимо в зоне
+                if (cand.Class == "Missile" && firstD > 0 && lastD > 0 && lastD > firstD * 0.8) continue;
+
+                if (candBestLen > bestLen)
+                {
+                    bestLen = candBestLen;
+                    bestStart = candBestStart;
+                    bestEnd = candBestEnd;
+                    bestTgt = cand;
+                }
+            }
+
+            if (bestTgt == null) continue;
+            if (existingPair.Contains(radar.Id + "|" + bestTgt.Id)) continue;
+
+            // Долгий захват режем на сегменты: радар «обновляет» засветку, а не тянет
+            // сплошную линию через весь реплей. Шаг растёт на длинных захватах,
+            // чтобы не плодить сотни лучей.
+            double segLen = Math.Max(12.0, bestLen / 30.0);
+            double segGap = Math.Max(3.0, segLen * 0.25);
+            for (double ts = bestStart; ts < bestEnd - 0.5; ts += segLen + segGap)
+            {
+                double te = Math.Min(bestEnd, ts + segLen);
+                if (te - ts < 1.5) break;
+                AddSyntheticBeam(s, radar, bestTgt, ts, te, BeamKindFor(radar), radar.Name);
+            }
+            existingFrom.Add(radar.Id);
+            existingPair.Add(radar.Id + "|" + bestTgt.Id);
+        }
     }
 
 
@@ -4176,9 +4652,31 @@ public static class DebriefEngine
                 }
 
                 double chunkSpan = (gw - 1) * 153.6;
-                double[] candidateSpans = new double[] { mapSize, chunkSpan, mapSize * 2.0, chunkSpan * 2.0 };
-                double[] candidateOriginsX = new double[] { 0.0, -mapSize * 0.5, -mapSize, -chunkSpan * 0.5 };
-                double[] candidateOriginsY = new double[] { 0.0, -mapSize * 0.5, -mapSize, -chunkSpan * 0.5 };
+                // Heightmap может покрывать как всю карту, так и её часть (один квадрант).
+                // Перебираем масштаб, смещение и ориентацию, а качество оцениваем по ГЛАВНОМУ
+                // критерию: высота рельефа должна совпадать с высотой наземных юнитов.
+                List<double> spanList = new List<double>();
+                foreach (double sp in new double[] { chunkSpan, mapSize, chunkSpan * 2.0, mapSize * 2.0 })
+                {
+                    if (sp < 10000) continue;
+                    bool dup = false;
+                    foreach (double ex in spanList) if (Math.Abs(ex - sp) < 500.0) { dup = true; break; }
+                    if (!dup) spanList.Add(sp);
+                }
+
+                List<double> originList = new List<double>();
+                Action<double> addOrigin = (v) =>
+                {
+                    foreach (double ex in originList) if (Math.Abs(ex - v) < 500.0) return;
+                    originList.Add(v);
+                };
+                addOrigin(0.0);
+                addOrigin(-mapSize);
+                addOrigin(-mapSize * 0.5);
+                addOrigin(mapSize * 0.5);
+                addOrigin(-chunkSpan);
+                addOrigin(-chunkSpan * 0.5);
+                addOrigin(chunkSpan * 0.5);
 
                 int bestOrient = 1;
                 double bestSpan = mapSize;
@@ -4188,28 +4686,27 @@ public static class DebriefEngine
 
                 if (refPoints.Count > 0)
                 {
-                    foreach (double sp in candidateSpans)
+                    foreach (double sp in spanList)
                     {
-                        if (sp < 10000) continue;
-                        foreach (double ox in candidateOriginsX)
+                        foreach (double ox in originList)
                         {
-                            if (s.BoundsMinX < ox - 2000 || s.BoundsMaxX > ox + sp + 2000) continue;
-                            foreach (double oy in candidateOriginsY)
+                            foreach (double oy in originList)
                             {
-                                if (s.BoundsMinY < oy - 2000 || s.BoundsMaxY > oy + sp + 2000) continue;
-
                                 for (int orient = 0; orient < 8; orient++)
                                 {
                                     double score = 0;
+                                    int inside = 0;
+                                    double errSum = 0.0;
                                     foreach (double[] rp in refPoints)
                                     {
                                         double rpX = (double)rp.GetValue(0);
                                         double rpY = (double)rp.GetValue(1);
                                         double rpIsLand = (double)rp.GetValue(2);
+                                        double rpAlt = (double)rp.GetValue(3);
 
                                         double u = (rpX - ox) / sp;
                                         double v = (rpY - oy) / sp;
-                                        if (u < 0 || u > 1 || v < 0 || v > 1) { score -= 50; continue; }
+                                        if (u < 0 || u > 1 || v < 0 || v > 1) { score -= 12.0; continue; }
 
                                         int px = Math.Max(0, Math.Min(gw - 1, (int)(u * (gw - 1))));
                                         int py = Math.Max(0, Math.Min(gh - 1, (int)(v * (gh - 1))));
@@ -4229,11 +4726,28 @@ public static class DebriefEngine
 
                                         double e = rawElev[tx, ty];
                                         bool pixelIsLand = e > 0.03;
+                                        double pixelAlt = -80.0 + e * 6080.0;   // та же формула, что ниже (hmMinHeight/hmSpan)
+                                        inside++;
+
                                         if (rpIsLand > 0.5)
-                                            score += pixelIsLand ? (10.0 + e * 20.0) : -25.0;
+                                        {
+                                            // Наземный юнит стоит на земле: высота рельефа = его Alt
+                                            double dh = Math.Abs(pixelAlt - rpAlt);
+                                            errSum += dh;
+                                            score += Math.Max(0.0, 45.0 - dh * 0.35);
+                                            if (!pixelIsLand) score -= 35.0;
+                                        }
                                         else
-                                            score += !pixelIsLand ? 12.0 : -20.0;
+                                        {
+                                            // Корабль: под ним должна быть вода
+                                            score += pixelAlt <= 20.0 ? 22.0 : -22.0;
+                                        }
                                     }
+                                    if (inside < 2) continue;
+                                    // Штраф за среднюю ошибку высоты — главный критерий
+                                    double avgErr = errSum / Math.Max(1, inside);
+                                    score -= avgErr * 0.55;
+                                    score += inside * 0.6;
 
                                     if (score > bestScore)
                                     {
@@ -4320,9 +4834,11 @@ public static class DebriefEngine
 
                 if (s.TerrainBitmap != null) s.TerrainBitmap.Dispose();
                 s.TerrainBitmap = bmp;
-                s.MapMinX = bestMinX;
-                s.MapMinY = bestMinY;
-                s.MapSizeMeters = bestSpan;
+                // Границы карты (Map*) не меняем: heightmap может покрывать только её часть,
+                // а границы карты определяются по всем объектам боя.
+                s.TerrainMinX = bestMinX;
+                s.TerrainMinY = bestMinY;
+                s.TerrainSizeMeters = bestSpan;
                 LastVtrDiagnostic += string.Format(" | HM_PNGB OK ({0}x{1}, orient={2}, origin=({3:F0},{4:F0}), span={5:F0}, range=[-80..6000m])",
                     gw, gh, bestOrient, bestMinX, bestMinY, bestSpan);
             }

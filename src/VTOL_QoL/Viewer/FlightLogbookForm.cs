@@ -119,17 +119,6 @@ public class FlightLogbookForm : Form
         btnClear.Click += BtnClear_Click;
         this.Controls.Add(btnClear);
 
-        DebriefRadarForm openDebrief = null;
-        Button btnDebrief = new Button() { Text = "🎯 Разбор боя (Повторы)", Left = 460, Top = 536, Width = 205, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(70, 50, 115), ForeColor = Color.Cyan, Font = new Font("Consolas", 9.5f, FontStyle.Bold) };
-        btnDebrief.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
-        btnDebrief.Click += (s, e) => {
-            if (openDebrief != null && !openDebrief.IsDisposed) { openDebrief.Activate(); openDebrief.BringToFront(); return; }
-            openDebrief = new DebriefRadarForm();
-            openDebrief.FormClosed += (s2, e2) => { openDebrief = null; };
-            openDebrief.Show(this);
-        };
-        this.Controls.Add(btnDebrief);
-
         Button btnClose = new Button() { Text = "Закрыть", Left = 894, Top = 536, Width = 130, Height = 32, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 50, 45), ForeColor = Color.White };
         btnClose.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         btnClose.Click += (s, e) => this.Close();

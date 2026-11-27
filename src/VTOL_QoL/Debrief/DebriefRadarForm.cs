@@ -13,6 +13,21 @@ using OpenFileDialog = System.Windows.Forms.OpenFileDialog;
 // =========================================================================
 public class DebriefRadarForm : Form
 {
+    // Детерминированный псевдослучайный шум 0..1 для визуализации помех
+    private static double Hash01(int k)
+    {
+        unchecked
+        {
+            uint x = (uint)(k * 747796405 + 2891336453);
+            x ^= x >> 15;
+            x *= 2246822519u;
+            x ^= x >> 13;
+            x *= 3266489917u;
+            x ^= x >> 16;
+            return (x & 0xFFFFFF) / 16777216.0;
+        }
+    }
+
     private class DoubleBufferedPanel : Panel
     {
         public DoubleBufferedPanel()
@@ -55,6 +70,20 @@ public class DebriefRadarForm : Form
     private double targetCamY = 0.0;
     private bool hasSmoothCamTarget = false;
     private double pixelsPerMeter = 0.0085;
+    // Пределы масштаба карты (пикселей на метр). Верхний предел задаёт максимальное
+    // приближение: 2D — ~0.8 км на экран, 3D — камера в ~1.9 км от цели.
+    private const double ZoomMin2D = 0.0008;
+    private const double ZoomMax2D = 1.2;
+    private const double ZoomMin3D = 0.00003;
+    private const double ZoomMax3D = 5.0;
+    private const double CamDistMinKm = 1.9;
+    private const double CamDistMaxKm = 350.0;
+
+    // Дистанция 3D-камеры (км) из текущего масштаба
+    private double CamDistKm()
+    {
+        return Math.Max(CamDistMinKm, Math.Min(CamDistMaxKm, 9.5 / Math.Max(ZoomMin3D, pixelsPerMeter)));
+    }
     private bool isPanning = false;
     private Point lastPanMouse;
     private bool followPlayer = false;
@@ -78,6 +107,8 @@ public class DebriefRadarForm : Form
     private double lastJamSurgeTime = -99.0;
     private string lastJamBannerActor = "";
     private HashSet<string> triggeredJamEvents = new HashSet<string>();
+    // Запомненная цель направленного луча DRFM/SAS: ключ луча -> id юнита
+    private Dictionary<string, string> dirJamLock = new Dictionary<string, string>();
 
     // Линейка (измерение расстояния и азимута по карте)
     private bool rulerActive = false;
@@ -95,6 +126,7 @@ public class DebriefRadarForm : Form
     private bool launchesMode = false;
     private Panel pnlFiltersRef;
     private Label lblChronoTitle;
+    private FlightLogbookForm openLogbook = null;
 
 
     public DebriefRadarForm()
@@ -120,20 +152,20 @@ public class DebriefRadarForm : Form
         Label lblFile = new Label() { Text = "Вылет:", Left = 10, Top = 10, AutoSize = true, ForeColor = Color.LightGray };
         pnlTop.Controls.Add(lblFile);
 
-        cmbReplays = new ComboBox() { Left = 64, Top = 6, Width = 290, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(30, 38, 34), ForeColor = Color.Cyan };
+        cmbReplays = new ComboBox() { Left = 64, Top = 6, Width = 200, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(30, 38, 34), ForeColor = Color.Cyan };
         cmbReplays.SelectedIndexChanged += (s, e) => LoadSelectedReplay();
         pnlTop.Controls.Add(cmbReplays);
 
-        btnBrowseFile = new Button() { Text = "📂 Файл...", Left = 360, Top = 5, Width = 88, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 105, 135), ForeColor = Color.White };
+        btnBrowseFile = new Button() { Text = "📂 Файл...", Left = 270, Top = 5, Width = 88, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(0, 105, 135), ForeColor = Color.White };
         btnBrowseFile.Click += BtnBrowseFile_Click;
         pnlTop.Controls.Add(btnBrowseFile);
 
-        Button btnFitAll = new Button() { Text = "🌐 Бой", Left = 456, Top = 5, Width = 62, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(38, 78, 62), ForeColor = Color.White };
+        Button btnFitAll = new Button() { Text = "🌐 Бой", Left = 366, Top = 5, Width = 62, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(38, 78, 62), ForeColor = Color.White };
         btnFitAll.Click += (s, e) => { followPlayer = false; chkFollowPlayer.Checked = false; FitCameraToBattle(); pnlRadar.Invalidate(); };
         pnlTop.Controls.Add(btnFitAll);
 
         // Крупный переключатель 2D/3D — основной элемент управления видом
-        btnToggle3D = new Button() { Text = "📐 3D-ПРОСМОТР", Left = 524, Top = 3, Width = 156, Height = 30, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 52, 65), ForeColor = Color.LightGray, Font = new Font("Consolas", 9.5f, FontStyle.Bold) };
+        btnToggle3D = new Button() { Text = "📐 3D-ПРОСМОТР", Left = 434, Top = 3, Width = 140, Height = 30, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 52, 65), ForeColor = Color.LightGray, Font = new Font("Consolas", 9f, FontStyle.Bold) };
         btnToggle3D.FlatAppearance.BorderSize = 1;
         btnToggle3D.Click += (s, e) =>
         {
@@ -148,11 +180,11 @@ public class DebriefRadarForm : Form
         };
         pnlTop.Controls.Add(btnToggle3D);
 
-        chkFollowPlayer = new CheckBox() { Text = "Следить:", Left = 692, Top = 9, AutoSize = true, Checked = false, ForeColor = Color.FromArgb(180, 240, 200) };
+        chkFollowPlayer = new CheckBox() { Text = "Следить:", Left = 586, Top = 9, AutoSize = true, Checked = false, ForeColor = Color.FromArgb(180, 240, 200) };
         chkFollowPlayer.CheckedChanged += (s, e) => { followPlayer = chkFollowPlayer.Checked; UpdateFrame(); };
         pnlTop.Controls.Add(chkFollowPlayer);
 
-        cmbFollowTarget = new ComboBox() { Left = 772, Top = 6, Width = 135, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(30, 38, 34), ForeColor = Color.FromArgb(180, 240, 200), Font = new Font("Consolas", 8f) };
+        cmbFollowTarget = new ComboBox() { Left = 666, Top = 6, Width = 115, DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Color.FromArgb(30, 38, 34), ForeColor = Color.FromArgb(180, 240, 200), Font = new Font("Consolas", 8f) };
         cmbFollowTarget.SelectedIndexChanged += (s, e) =>
         {
             if (cmbFollowTarget.SelectedIndex <= 0) followEntityId = "";
@@ -167,23 +199,23 @@ public class DebriefRadarForm : Form
         };
         pnlTop.Controls.Add(cmbFollowTarget);
 
-        chkShowTerrain = new CheckBox() { Text = "Рельеф", Left = 913, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.Cyan };
+        chkShowTerrain = new CheckBox() { Text = "Рельеф", Left = 787, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.Cyan };
         chkShowTerrain.CheckedChanged += (s, e) => { showTerrain = chkShowTerrain.Checked; pnlRadar.Invalidate(); };
         pnlTop.Controls.Add(chkShowTerrain);
 
-        chkShowBeams = new CheckBox() { Text = "RWR", Left = 982, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.Gold };
+        chkShowBeams = new CheckBox() { Text = "RWR", Left = 856, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.Gold };
         chkShowBeams.CheckedChanged += (s, e) => { showBeams = chkShowBeams.Checked; pnlRadar.Invalidate(); };
         pnlTop.Controls.Add(chkShowBeams);
 
-        chkShowAllies = new CheckBox() { Text = "Союз", Left = 1034, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.DeepSkyBlue };
+        chkShowAllies = new CheckBox() { Text = "Союз", Left = 908, Top = 8, AutoSize = true, Checked = true, ForeColor = Color.DeepSkyBlue };
         chkShowAllies.CheckedChanged += (s, e) => { showAllies = chkShowAllies.Checked; pnlRadar.Invalidate(); };
         pnlTop.Controls.Add(chkShowAllies);
 
-        Button btnInspector = new Button() { Text = "🔍 Дамп", Left = 1092, Top = 5, Width = 84, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(65, 55, 110), ForeColor = Color.White, Font = new Font("Consolas", 8f, FontStyle.Bold) };
+        Button btnInspector = new Button() { Text = "🔍 Дамп", Left = 966, Top = 5, Width = 84, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(65, 55, 110), ForeColor = Color.White, Font = new Font("Consolas", 8f, FontStyle.Bold) };
         btnInspector.Click += BtnInspector_Click;
         pnlTop.Controls.Add(btnInspector);
 
-        Button btnCleanOld = new Button() { Text = "🗑", Left = 1181, Top = 5, Width = 28, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(120, 38, 38), ForeColor = Color.White };
+        Button btnCleanOld = new Button() { Text = "🗑", Left = 1056, Top = 5, Width = 28, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(120, 38, 38), ForeColor = Color.White };
         btnCleanOld.Click += (s, e) =>
         {
             if (MessageBox.Show(this, "Удалить все старые/дублирующие повторы из папки Replays?", "Очистка повторов", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
@@ -197,6 +229,16 @@ public class DebriefRadarForm : Form
             }
         };
         pnlTop.Controls.Add(btnCleanOld);
+
+        Button btnLogbook = new Button() { Text = "📋 ЛОГБУК", Left = 1090, Top = 5, Width = 100, Height = 26, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(40, 85, 70), ForeColor = Color.White, Font = new Font("Consolas", 8f, FontStyle.Bold) };
+        btnLogbook.Click += (s, e) =>
+        {
+            if (openLogbook != null && !openLogbook.IsDisposed) { openLogbook.Activate(); openLogbook.BringToFront(); return; }
+            openLogbook = new FlightLogbookForm();
+            openLogbook.FormClosed += (s2, e2) => { openLogbook = null; };
+            openLogbook.Show(this);
+        };
+        pnlTop.Controls.Add(btnLogbook);
 
         // Левая основная зона: тактический радар-планшет
         pnlRadar = new DoubleBufferedPanel();
@@ -296,7 +338,7 @@ public class DebriefRadarForm : Form
         pnlRadar.MouseWheel += (s, e) =>
         {
             double factor = e.Delta > 0 ? 1.25 : 0.8;
-            pixelsPerMeter = Math.Max(0.0008, Math.Min(0.25, pixelsPerMeter * factor));
+            pixelsPerMeter = Math.Max(ZoomMin2D, Math.Min(ZoomMax2D, pixelsPerMeter * factor));
             pnlRadar.Invalidate();
         };
         this.Controls.Add(pnlRadar);
@@ -329,7 +371,7 @@ public class DebriefRadarForm : Form
         glRadar3D.GetCurrentTime = () => currentTime;
         glRadar3D.GetCamX = () => camCenterX;
         glRadar3D.GetCamY = () => camCenterY;
-        glRadar3D.GetCamDist = () => Math.Max(1.0, Math.Min(350.0, 9.5 / Math.Max(0.00003, pixelsPerMeter)));
+        glRadar3D.GetCamDist = () => CamDistKm();
         glRadar3D.GetYaw = () => camYawDeg;
         glRadar3D.GetPitch = () => camPitchDeg;
         glRadar3D.GetRoll = () => 0.0;
@@ -356,7 +398,7 @@ public class DebriefRadarForm : Form
                 hasSmoothCamTarget = false;
                 if (followPlayer) { followPlayer = false; chkFollowPlayer.Checked = false; }
                 double yawRad = camYawDeg * Math.PI / 180.0;
-                double distKm = Math.Max(1.0, Math.Min(350.0, 9.5 / Math.Max(0.00003, pixelsPerMeter)));
+                double distKm = CamDistKm();
                 double metersPerPx = (distKm * 1000.0) / Math.Max(300.0, glRadar3D.Height * 0.85);
                 double sinP = Math.Max(0.32, Math.Sin(camPitchDeg * Math.PI / 180.0));
                 double wdx = (dx * Math.Cos(yawRad) - (dy / sinP) * Math.Sin(yawRad)) * metersPerPx;
@@ -370,7 +412,7 @@ public class DebriefRadarForm : Form
         glRadar3D.MouseWheel += (s, e) =>
         {
             double factor = e.Delta > 0 ? 1.28 : 0.78;
-            pixelsPerMeter = Math.Max(0.00003, Math.Min(0.35, pixelsPerMeter * factor));
+            pixelsPerMeter = Math.Max(ZoomMin3D, Math.Min(ZoomMax3D, pixelsPerMeter * factor));
             glRadar3D.Invalidate();
         };
         this.Controls.Add(glRadar3D);
@@ -593,6 +635,7 @@ public class DebriefRadarForm : Form
         {
             if (playTimer != null) { playTimer.Stop(); playTimer.Dispose(); }
             if (session != null && session.TerrainBitmap != null) { session.TerrainBitmap.Dispose(); session.TerrainBitmap = null; }
+            DebriefSoundPlayer.StopContinuousLoop();
         };
         RefreshReplayList();
     }
@@ -612,6 +655,7 @@ public class DebriefRadarForm : Form
         }
         if (key == Keys.Left || key == Keys.Right)
         {
+            ResetJamEvents();
             double step = shift ? 5.0 : 1.0;
             currentTime += (key == Keys.Left ? -step : step);
             if (currentTime < 0) currentTime = 0;
@@ -621,12 +665,14 @@ public class DebriefRadarForm : Form
         }
         if (key == Keys.Home)
         {
+            ResetJamEvents();
             currentTime = 0;
             UpdateFrame();
             return true;
         }
         if (key == Keys.End)
         {
+            ResetJamEvents();
             currentTime = session.Duration;
             UpdateFrame();
             return true;
@@ -762,10 +808,22 @@ public class DebriefRadarForm : Form
         if (currentTime >= session.Duration) currentTime = 0;
         isPlaying = !isPlaying;
         btnPlayPause.Text = isPlaying ? "⏸ ПАУЗА" : "▶ ПУСК";
+        if (glRadar3D != null)
+        {
+            if (isPlaying) glRadar3D.ResumeJamContinuous();
+            else glRadar3D.PauseJamContinuous();
+        }
+    }
+    private void ResetJamEvents()
+    {
+        triggeredJamEvents.Clear();
+        dirJamLock.Clear();
+        if (glRadar3D != null) glRadar3D.ResetJamTriggers();
     }
     private void SeekTimelineByX(int mouseX)
     {
         if (session == null || pnlTimeline.Width <= 4) return;
+        ResetJamEvents();
         double ratio = Math.Max(0.0, Math.Min(1.0, (double)mouseX / pnlTimeline.Width));
         currentTime = ratio * session.Duration;
         UpdateFrame();
@@ -877,6 +935,7 @@ public class DebriefRadarForm : Form
             rulerHasB = false;
             lastJamSurgeTime = -99.0;
             lastJamBannerActor = "";
+            if (glRadar3D != null) glRadar3D.StopJamContinuous();
             followEntityId = "";
             followPlayer = false;
             chkFollowPlayer.Checked = false;
@@ -1008,6 +1067,7 @@ public class DebriefRadarForm : Form
     {
         TacticalEvent ev = lstMistakes.SelectedItem as TacticalEvent;
         if (ev == null) return;
+        ResetJamEvents();
         currentTime = ev.Time;
         if (Math.Abs(ev.WorldX) > 1.0 || Math.Abs(ev.WorldY) > 1.0)
         {
@@ -1133,8 +1193,12 @@ public class DebriefRadarForm : Form
             // 0. Отрисовка 2D-карты рельефа или 3D-каркаса гор
             if (!is3DMode && session != null && showTerrain && session.TerrainBitmap != null && session.MapSizeMeters > 100)
             {
-                PointF topLeft = WorldToScreen(session.MapMinX, session.MapMinY + session.MapSizeMeters, w, h);
-                PointF botRight = WorldToScreen(session.MapMinX + session.MapSizeMeters, session.MapMinY, w, h);
+                // Подложка рисуется в границах heightmap, а не всей карты
+                double tMinX = session.TerrainSizeMeters > 100.0 ? session.TerrainMinX : session.MapMinX;
+                double tMinY = session.TerrainSizeMeters > 100.0 ? session.TerrainMinY : session.MapMinY;
+                double tSize = session.TerrainSizeMeters > 100.0 ? session.TerrainSizeMeters : session.MapSizeMeters;
+                PointF topLeft = WorldToScreen(tMinX, tMinY + tSize, w, h);
+                PointF botRight = WorldToScreen(tMinX + tSize, tMinY, w, h);
                 float mapW = botRight.X - topLeft.X;
                 float mapH = botRight.Y - topLeft.Y;
                 if (mapW > 10 && mapH > 10)
@@ -1453,6 +1517,47 @@ public class DebriefRadarForm : Form
                         drawSmartBadge("poi_" + poiIdx, poi.Label, poiFont, Color.FromArgb(220, sc), sc, pt.X, pt.Y, false, 1.0f);
                 }
             }
+
+            // 0.9 Аэродромы: ВПП, осевая и пороги
+            if (session.Airfields != null && session.Airfields.Count > 0)
+            {
+                using (Font afFont = new Font("Consolas", 6.6f, FontStyle.Bold))
+                {
+                    int afIdx = 0;
+                    foreach (MapPoiMarker af in session.Airfields)
+                    {
+                        afIdx++;
+                        double hdg = af.Heading * Math.PI / 180.0;
+                        double fx = Math.Sin(hdg), fz = Math.Cos(hdg);
+                        double rx = Math.Cos(hdg), rz = -Math.Sin(hdg);
+                        double L = 2400.0, W = 70.0;
+                        Func<double, double, PointF> afPt = (along, side) =>
+                            WorldToScreen3D(af.X + fx * along + rx * side, af.Y + fz * along + rz * side,
+                                is3DMode ? session.GetGroundAltitudeAt(af.X + fx * along + rx * side, af.Y + fz * along + rz * side) : 0.0, w, h);
+                        PointF a0 = afPt(-L * 0.5, -W * 0.5), a1 = afPt(L * 0.5, -W * 0.5);
+                        PointF a2 = afPt(L * 0.5, W * 0.5), a3 = afPt(-L * 0.5, W * 0.5);
+                        PointF[] strip = new PointF[] { a0, a1, a2, a3 };
+                        using (SolidBrush fill = new SolidBrush(Color.FromArgb(190, 52, 56, 58)))
+                            g.FillPolygon(fill, strip);
+                        using (Pen edge = new Pen(Color.FromArgb(190, 200, 210, 205), 1.3f))
+                            g.DrawPolygon(edge, strip);
+                        // Осевая
+                        using (Pen mid = new Pen(Color.FromArgb(150, 235, 240, 235), 1.1f) { DashStyle = DashStyle.Dash, DashPattern = new float[] { 6f, 5f } })
+                            g.DrawLine(mid, afPt(-L * 0.45, 0), afPt(L * 0.45, 0));
+                        // Пороги
+                        using (Pen thr = new Pen(Color.FromArgb(190, 240, 245, 240), 1.6f))
+                        {
+                            g.DrawLine(thr, afPt(-L * 0.46, -W * 0.28), afPt(-L * 0.40, -W * 0.28));
+                            g.DrawLine(thr, afPt(-L * 0.46, W * 0.28), afPt(-L * 0.40, W * 0.28));
+                            g.DrawLine(thr, afPt(L * 0.40, -W * 0.28), afPt(L * 0.46, -W * 0.28));
+                            g.DrawLine(thr, afPt(L * 0.40, W * 0.28), afPt(L * 0.46, W * 0.28));
+                        }
+                        PointF center = afPt(0, 0);
+                        drawSmartBadge("af_" + afIdx, "🛫 " + af.Label, afFont,
+                            Color.FromArgb(225, 220, 230), Color.FromArgb(170, 200, 215), center.X, center.Y, false, 1.0f);
+                    }
+                }
+            }
         }
 
         // 1.75 Реальные взрывы из eventTrack реплея: короткая вспышка в момент t,
@@ -1556,6 +1661,12 @@ public class DebriefRadarForm : Form
 
                         double fx = bm.FromX, fy = bm.FromY;
                         double tx = bm.ToX, ty = bm.ToY;
+                        double dirTargetAlt = double.NaN;
+                        // Ось NOISE-конуса и её разрешение (выставляются в блоке JAMMER)
+                        double jamDirX = bm.DirX, jamDirY = bm.DirY, jamDirZ = bm.DirZ;
+                        bool jamDirResolved = false;
+                        double maxRay = 250000.0;              // предел поиска цели вдоль оси
+                        double coneLenM = JammerModel.NoiseConeRangeM;
 
                         DebriefSample sFrom = null, sTo = null;
                         if (!string.IsNullOrEmpty(bm.FromId) && liveById.TryGetValue(bm.FromId, out sFrom))
@@ -1575,32 +1686,15 @@ public class DebriefRadarForm : Form
                                     triggeredJamEvents.Add(evId);
                                     lastJamSurgeTime = currentTime;
                                     lastJamBannerActor = ev.Title;
+                                    DebriefSoundPlayer.Play("JAMMER_ON");
                                 }
                             }
                             double horizLen = Math.Sqrt(bm.DirX * bm.DirX + bm.DirY * bm.DirY);
                             double ux2d = horizLen > 1e-4 ? (bm.DirX / horizLen) : 0.0;
                             double uy2d = horizLen > 1e-4 ? (bm.DirY / horizLen) : 0.0;
 
-                            // Обрезаем луч по границам карты, а для DRFM/SAS — останавливаем на подавляемой цели по оси луча
-                            double maxRay = 95000.0;
-                            if (session.MapSizeMeters > 100.0)
-                            {
-                                double minX = session.MapMinX;
-                                double maxX = session.MapMinX + session.MapSizeMeters;
-                                double minY = session.MapMinY;
-                                double maxY = session.MapMinY + session.MapSizeMeters;
-
-                                if (Math.Abs(ux2d) > 1e-5)
-                                {
-                                    double tX = ux2d > 0 ? (maxX - fx) / ux2d : (minX - fx) / ux2d;
-                                    if (tX > 0 && tX < maxRay) maxRay = tX;
-                                }
-                                if (Math.Abs(uy2d) > 1e-5)
-                                {
-                                    double tY = uy2d > 0 ? (maxY - fy) / uy2d : (minY - fy) / uy2d;
-                                    if (tY > 0 && tY < maxRay) maxRay = tY;
-                                }
-                            }
+                            // Дальность станции РЭБ большая — конус не обрезаем по карте
+                            maxRay = 250000.0;
 
                             string jamModeName = bm.JamMode ?? "";
                             if (jamModeName.Length == 0) jamModeName = bm.ToName ?? "";
@@ -1614,58 +1708,118 @@ public class DebriefRadarForm : Form
                             // Логика 0.7.0: DRFM/SAS работают по конкретной цели, поэтому луч обрезаем
                             // на первом радиолокационном юните в коридоре вдоль оси, а бейдж ставим только ему.
                             // NOISE — зона подавления: бейджи на юнитах не ставим (по решению пользователя).
+                            Func<DebriefEntity, bool> hasRadarSystem = (ent) =>
+                            {
+                                if (ent.Class == "Air" || ent.Class == "Chopper") return true;
+                                if (ent.Class != "Ground") return false;
+                                string nm = ent.Name ?? "";
+                                if (nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("Infantry", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    nm.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    return false;
+                                return ent.RoleTag == "SAM" ||
+                                       nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       nm.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0;
+                            };
+
+                            // Ось NOISE-конуса: в игре антенна наведена на подавляемую цель.
+                            // Восстанавливаем цель по оси луча и удерживаем её, чтобы конус не «ехал» за бортом.
+                            jamDirX = bm.DirX; jamDirY = bm.DirY; jamDirZ = bm.DirZ;
+                            jamDirResolved = false;
+
                             if (isDirMode)
                             {
-                                Func<DebriefEntity, bool> hasRadarSystem = (ent) =>
+                                // Цель запоминается по ключу луча, чтобы пунктир не перескакивал
+                                // между юнитами и не уходил с цели при её смещении.
+                                string beamKey = (bm.FromId ?? "") + "|" + bm.StartTime.ToString("F1");
+                                string hitEntityId = null;
+                                string lockedId;
+                                if (dirJamLock.TryGetValue(beamKey, out lockedId))
                                 {
-                                    if (ent.Class == "Air" || ent.Class == "Chopper") return true;
-                                    if (ent.Class != "Ground") return false;
-                                    string nm = ent.Name ?? "";
-                                    if (nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        nm.IndexOf("Infantry", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        nm.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        nm.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        nm.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0)
-                                        return false;
-                                    return ent.RoleTag == "SAM" ||
-                                           nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                           nm.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                           nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                           nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                           nm.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                           nm.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                           nm.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0;
-                                };
-
-                                string hitEntityId = "";
-                                foreach (DebriefEntity cand in session.Entities)
-                                {
-                                    if (cand.Id == bm.FromId || cand.Coalition == srcCoalition || !hasRadarSystem(cand)) continue;
-                                    DebriefSample cs;
-                                    if (!liveById.TryGetValue(cand.Id, out cs)) continue;
-
-                                    double dx = cs.X - fx;
-                                    double dy = cs.Y - fy;
-                                    double proj = dx * ux2d + dy * uy2d;
-                                    if (proj <= 500.0 || proj >= maxRay) continue;
-
-                                    double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
-                                    double hitRadius = Math.Max(1800.0, proj * 0.06);
-                                    if (perp <= hitRadius)
-                                    {
-                                        maxRay = proj;
-                                        hitEntityId = cand.Id;
-                                    }
+                                    if (liveById.ContainsKey(lockedId)) hitEntityId = lockedId;
+                                    else dirJamLock.Remove(beamKey);
                                 }
-                                if (!string.IsNullOrEmpty(hitEntityId))
-                                    jammedTargets[hitEntityId] = jamModeName.ToUpperInvariant();
-                                else
-                                    continue;   // цель не найдена — луч DRFM/SAS «в никуда» не рисуем
-                            }
+                                if (hitEntityId == null)
+                                {
+                                    double bestProj = double.MaxValue;
+                                    foreach (DebriefEntity cand in session.Entities)
+                                    {
+                                        if (cand.Id == bm.FromId || cand.Coalition == srcCoalition || !hasRadarSystem(cand)) continue;
+                                        DebriefSample cs;
+                                        if (!liveById.TryGetValue(cand.Id, out cs)) continue;
 
-                            tx = fx + ux2d * maxRay;
-                            ty = fy + uy2d * maxRay;
+                                        double dx = cs.X - fx;
+                                        double dy = cs.Y - fy;
+                                        double proj = dx * ux2d + dy * uy2d;
+                                        if (proj <= 500.0 || proj >= maxRay) continue;
+
+                                        double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
+                                        double hitRadius = Math.Max(2500.0, proj * 0.10);
+                                        if (perp > hitRadius) continue;
+                                        if (proj < bestProj) { bestProj = proj; hitEntityId = cand.Id; }
+                                    }
+                                    if (hitEntityId != null) dirJamLock[beamKey] = hitEntityId;
+                                }
+                                DebriefSample tgtSmp;
+                                if (hitEntityId == null || !liveById.TryGetValue(hitEntityId, out tgtSmp))
+                                    continue;   // цель не найдена — луч DRFM/SAS «в никуда» не рисуем
+                                tx = tgtSmp.X;
+                                ty = tgtSmp.Y;
+                                dirTargetAlt = tgtSmp.Alt;
+                                jammedTargets[hitEntityId] = jamModeName.ToUpperInvariant();
+                            }
+                            else
+                            {
+                                // NOISE: одна цель на постановщик, пока она жива.
+                                string noiseKey = (bm.FromId ?? "") + "|NOISE";
+                                string noiseTargetId = null;
+                                string lockedNoise;
+                                if (dirJamLock.TryGetValue(noiseKey, out lockedNoise))
+                                {
+                                    if (liveById.ContainsKey(lockedNoise)) noiseTargetId = lockedNoise;
+                                    else dirJamLock.Remove(noiseKey);
+                                }
+                                if (noiseTargetId == null)
+                                {
+                                    double bestProj = double.MaxValue;
+                                    foreach (DebriefEntity cand in session.Entities)
+                                    {
+                                        if (cand.Id == bm.FromId || cand.Coalition == srcCoalition || !hasRadarSystem(cand)) continue;
+                                        DebriefSample cs;
+                                        if (!liveById.TryGetValue(cand.Id, out cs)) continue;
+                                        double dx = cs.X - fx;
+                                        double dy = cs.Y - fy;
+                                        double proj = dx * ux2d + dy * uy2d;
+                                        if (proj <= 500.0 || proj >= maxRay) continue;
+                                        double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
+                                        double hitRadius = Math.Max(3500.0, proj * 0.12);
+                                        if (perp > hitRadius) continue;
+                                        if (proj < bestProj) { bestProj = proj; noiseTargetId = cand.Id; }
+                                    }
+                                    if (noiseTargetId != null) dirJamLock[noiseKey] = noiseTargetId;
+                                }
+                                DebriefSample nTgt;
+                                if (noiseTargetId != null && liveById.TryGetValue(noiseTargetId, out nTgt))
+                                {
+                                    double fz0 = sFrom != null ? sFrom.Alt : session.GetGroundAltitudeAt(fx, fy);
+                                    jamDirX = nTgt.X - fx;
+                                    jamDirY = nTgt.Y - fy;
+                                    jamDirZ = nTgt.Alt - fz0;
+                                    jamDirResolved = true;
+                                    double d3 = Math.Sqrt(jamDirX * jamDirX + jamDirY * jamDirY + jamDirZ * jamDirZ);
+                                    coneLenM = Math.Min(JammerModel.NoiseConeRangeM, Math.Max(8000.0, d3 * 1.25));
+                                }
+                                tx = fx + ux2d * coneLenM;
+                                ty = fy + uy2d * coneLenM;
+                            }
                         }
                         else if (!string.IsNullOrEmpty(bm.ToId) && liveById.TryGetValue(bm.ToId, out sTo))
                         {
@@ -1677,10 +1831,28 @@ public class DebriefRadarForm : Form
                         double tz = fz;
                         if (bm.Kind == "JAMMER")
                         {
-                            double horizLen = Math.Sqrt(bm.DirX * bm.DirX + bm.DirY * bm.DirY);
-                            double rayDist2d = Math.Sqrt(Math.Pow(tx - fx, 2) + Math.Pow(ty - fy, 2));
-                            double ray3dLen = horizLen > 0.05 ? (rayDist2d / horizLen) : rayDist2d;
-                            tz = Math.Max(session.GetGroundAltitudeAt(tx, ty), fz + bm.DirZ * ray3dLen);
+                            if (!double.IsNaN(dirTargetAlt))
+                            {
+                                tz = dirTargetAlt;   // направленный режим: строго в цель
+                            }
+                            else if (jamDirResolved)
+                            {
+                                // NOISE: конец луча — вдоль направления на подавляемую цель
+                                double dl = Math.Sqrt(jamDirX * jamDirX + jamDirY * jamDirY + jamDirZ * jamDirZ);
+                                if (dl > 1e-6)
+                                {
+                                    tx = fx + jamDirX / dl * coneLenM;
+                                    ty = fy + jamDirY / dl * coneLenM;
+                                    tz = fz + jamDirZ / dl * coneLenM;
+                                }
+                            }
+                            else
+                            {
+                                double horizLen = Math.Sqrt(bm.DirX * bm.DirX + bm.DirY * bm.DirY);
+                                double rayDist2d = Math.Sqrt(Math.Pow(tx - fx, 2) + Math.Pow(ty - fy, 2));
+                                double ray3dLen = horizLen > 0.05 ? (rayDist2d / horizLen) : rayDist2d;
+                                tz = Math.Max(session.GetGroundAltitudeAt(tx, ty), fz + bm.DirZ * ray3dLen);
+                            }
                         }
                         else if (!string.IsNullOrEmpty(bm.ToId) && sTo != null)
                         {
@@ -1739,56 +1911,61 @@ public class DebriefRadarForm : Form
                                 }
                                 else
                                 {
-                                    // Лепесток NOISE по реальной формуле: pow(cos, directionalPower).
-                                    // Границы 10% и 50% от осевого сигнала (углы считаются из directionalPower=8).
-                                    float halfAngle10 = (float)(JammerModel.AngleForLevel(0.10) * Math.PI / 180.0);
-                                    float halfAngle50 = (float)(JammerModel.AngleForLevel(0.50) * Math.PI / 180.0);
-                                    float tan10 = (float)Math.Tan(halfAngle10);
-                                    float tan50 = (float)Math.Tan(halfAngle50);
-                                    float endHalfW10 = screenLen * tan10;
-                                    float endHalfW50 = screenLen * tan50;
+                                    // Конус сильного подавления: узкий и длинный, как реальный лепесток РЭБ.
+                                    float tanCone = (float)Math.Tan(JammerModel.NoiseConeHalfAngleDeg * Math.PI / 180.0);
+                                    float endHalfW = screenLen * tanCone;
 
-                                    // Приглушённая, медленная пульсация конуса NOISE (1.6 Гц)
                                     float jamPulse = (float)(0.5 + 0.5 * Math.Sin(currentTime * 1.6));
-                                    int edgeAlpha = (int)(22 + 16 * jamPulse);
-                                    int coreAlpha = (int)(40 + 26 * jamPulse);
+                                    int fillAlpha = (int)(12 + 10 * jamPulse);
+                                    int edgeAlpha = (int)(70 + 30 * jamPulse);
 
-                                    using (Pen edgePen = new Pen(Color.FromArgb(edgeAlpha, 200, 110, 255), 1.0f))
+                                    PointF apex = p1;
+                                    PointF e1 = new PointF(p2.X + px * endHalfW, p2.Y + py * endHalfW);
+                                    PointF e2 = new PointF(p2.X - px * endHalfW, p2.Y - py * endHalfW);
+                                    using (SolidBrush coneFill = new SolidBrush(Color.FromArgb(fillAlpha, 160, 95, 255)))
+                                        g.FillPolygon(coneFill, new PointF[] { apex, e1, e2 });
+
+                                    // Шум внутри конуса: мерцающие штрихи помех.
+                                    // Плотность и яркость падают к кромке (cos(theta)^8) и вдаль.
                                     {
-                                        g.DrawLine(edgePen, p1.X, p1.Y, p2.X + px * endHalfW10, p2.Y + py * endHalfW10);
-                                        g.DrawLine(edgePen, p1.X, p1.Y, p2.X - px * endHalfW10, p2.Y - py * endHalfW10);
-                                    }
-                                    using (Pen coreEdge = new Pen(Color.FromArgb(coreAlpha, 200, 110, 255), 1.1f) { DashStyle = DashStyle.Dot })
-                                    {
-                                        g.DrawLine(coreEdge, p1.X, p1.Y, p2.X + px * endHalfW50, p2.Y + py * endHalfW50);
-                                        g.DrawLine(coreEdge, p1.X, p1.Y, p2.X - px * endHalfW50, p2.Y - py * endHalfW50);
-                                    }
-
-                                    // Медленное обновление засветков (2 Гц) и сниженная яркость, чтобы не рябило
-                                    int tick = (int)(currentTime * 2.0);
-                                    int barsCount = Math.Min(28, Math.Max(8, (int)(screenLen / 26f)));
-                                    for (int i = 0; i < barsCount; i++)
-                                    {
-                                        int hash = ((i * 73856093) ^ (tick * 19349663)) & 0x7FFFFFFF;
-                                        float dist = 20f + ((hash % 1000) / 1000.0f) * (screenLen - 24f);
-                                        float latNorm = (((hash / 1000) % 200) - 100) / 100.0f;
-                                        float latOffset = latNorm * (dist * tan50 * 0.85f);
-
-                                        float bx = p1.X + ux * dist + px * latOffset;
-                                        float by = p1.Y + uy * dist + py * latOffset;
-                                        int alpha = 38 + ((hash / 200000) % 46);
-                                        float barHalfW = Math.Max(1.2f, Math.Min(3.0f, dist * tan50 * 0.12f));
-
-                                        PointF[] bar = new PointF[]
+                                        int aNear = Math.Min(225, (int)(45 + 95 * jamPulse));
+                                        int aFar = Math.Min(150, (int)(22 + 55 * jamPulse));
+                                        using (Pen nzNear = new Pen(Color.FromArgb(aNear, 205, 135, 255), 1.1f))
+                                        using (Pen nzFar = new Pen(Color.FromArgb(aFar, 180, 110, 240), 1.0f))
                                         {
-                                            new PointF(bx - px * barHalfW - ux * 1.8f, by - py * barHalfW - uy * 1.8f),
-                                            new PointF(bx + px * barHalfW - ux * 1.8f, by + py * barHalfW - uy * 1.8f),
-                                            new PointF(bx + px * barHalfW + ux * 1.8f, by + py * barHalfW + uy * 1.8f),
-                                            new PointF(bx - px * barHalfW + ux * 1.8f, by - py * barHalfW + uy * 1.8f)
-                                        };
-                                        using (SolidBrush br = new SolidBrush(Color.FromArgb(alpha, 210, 115, 255)))
-                                            g.FillPolygon(br, bar);
+                                            for (int ni = 0; ni < 90; ni++)
+                                            {
+                                                double nh1 = Hash01(ni * 3 + 11);
+                                                double nh2 = Hash01(ni * 3 + 12);
+                                                double nh3 = Hash01(ni * 3 + 13);
+
+                                                float nt = (float)(0.05 + 0.95 * nh1);
+                                                float nlat = (float)((nh2 * 2.0 - 1.0) * nt);
+                                                float nbx = apex.X + (p2.X - apex.X) * nt + px * nlat * endHalfW;
+                                                float nby = apex.Y + (p2.Y - apex.Y) * nt + py * nlat * endHalfW;
+
+                                                float ncos = (float)(1.0 / Math.Sqrt(1.0 + nlat * nlat * tanCone * tanCone));
+                                                float nsig = (float)Math.Pow(ncos, 8.0) * (1f - 0.40f * nt);
+                                                float nflick = (float)(0.30 + 0.70 * (0.5 + 0.5 * Math.Sin(currentTime * 17.0 + nh2 * 40.0)));
+                                                if (nsig * nflick < 0.05f) continue;
+
+                                                float nlen = 2.5f + 9.0f * (float)nh3 * (0.4f + nt);
+                                                Pen npen = nsig * nflick > 0.40f ? nzNear : nzFar;
+                                                g.DrawLine(npen,
+                                                    nbx - px * nlen * 0.5f, nby - py * nlen * 0.5f,
+                                                    nbx + px * nlen * 0.5f, nby + py * nlen * 0.5f);
+                                            }
+                                        }
                                     }
+
+                                    using (Pen coneEdge = new Pen(Color.FromArgb(edgeAlpha, 205, 130, 255), 1.2f))
+                                    {
+                                        g.DrawLine(coneEdge, apex, e1);
+                                        g.DrawLine(coneEdge, apex, e2);
+                                        g.DrawLine(coneEdge, e1, e2);
+                                    }
+                                    using (Pen axisPen = new Pen(Color.FromArgb(edgeAlpha / 2, 225, 150, 255), 1.0f) { DashStyle = DashStyle.Dot })
+                                        g.DrawLine(axisPen, apex, p2);
                                 }
                             }
                         }
@@ -1874,7 +2051,8 @@ public class DebriefRadarForm : Form
 
                 if (ent.Type == "Ground")
                 {
-                        PointF gp = WorldToScreen3D(cur.X, cur.Y, cur.Alt, w, h);
+                        PointF gp = WorldToScreen3D(cur.X, cur.Y,
+                            Math.Max(cur.Alt, session.GetGroundAltitudeAt(cur.X, cur.Y)), w, h);
                         if (gp.X >= -30 && gp.X <= w + 30 && gp.Y >= -30 && gp.Y <= h + 30)
                     {
                         string uName = ent.Name ?? "";
@@ -1888,7 +2066,8 @@ public class DebriefRadarForm : Form
                                      uName.IndexOf("CIWS", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                      uName.IndexOf("Anti-Air", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                      uName.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0);
-                        bool isShip = uName.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        bool isShip = ent.Class == "Sea" ||
+                                      uName.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                       uName.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                       uName.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                       uName.IndexOf("Boat", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -2106,13 +2285,20 @@ new PointF(pos.X - rSize, pos.Y)
                             }
                         }
 
-                        PointF nose = new PointF(pos.X + dx * 12, pos.Y + dy * 12);
-                        PointF leftWing = new PointF(pos.X - dx * 7 - dy * 7, pos.Y - dy * 7 + dx * 7);
-                        PointF rightWing = new PointF(pos.X - dx * 7 + dy * 7, pos.Y - dy * 7 - dx * 7);
+                        // Силуэт истребителя: нос, стреловидные крылья и хвостовое оперение
+                        Func<float, float, PointF> acPt = (f, r) =>
+                            new PointF(pos.X + dx * f - dy * r, pos.Y + dy * f + dx * r);
+                        PointF[] acSil = new PointF[]
+                        {
+                            acPt(13f, 0f), acPt(-1f, -3.5f), acPt(-2f, -9f), acPt(-10f, -4f),
+                            acPt(-8f, 0f), acPt(-10f, 4f), acPt(-2f, 9f), acPt(-1f, 3.5f)
+                        };
                         using (SolidBrush acBr = new SolidBrush(col))
-                            g.FillPolygon(acBr, new PointF[] { nose, leftWing, rightWing });
-                        using (Pen vecPen = new Pen(col, 1.5f))
-                            g.DrawLine(vecPen, pos.X, pos.Y, pos.X + dx * 22, pos.Y + dy * 22);
+                            g.FillPolygon(acBr, acSil);
+                        using (Pen acPen = new Pen(Color.FromArgb(210, 12, 18, 16), 1f))
+                            g.DrawPolygon(acPen, acSil);
+                        using (Pen vecPen = new Pen(Color.FromArgb(150, col), 1.2f))
+                            g.DrawLine(vecPen, pos.X, pos.Y, pos.X + dx * 24, pos.Y + dy * 24);
                             string jModeTag;
                             if (jammedTargets.TryGetValue(ent.Id, out jModeTag))
                                 drawJamBadge(pos, jModeTag);

@@ -45,6 +45,7 @@ public class OpenGLRadarControl : Control
     [DllImport("opengl32.dll")] private static extern void glClear(uint mask);
     [DllImport("opengl32.dll")] private static extern void glEnable(uint cap);
     [DllImport("opengl32.dll")] private static extern void glDisable(uint cap);
+    [DllImport("opengl32.dll")] private static extern void glDepthMask(bool flag);
     [DllImport("opengl32.dll")] private static extern void glBlendFunc(uint sfactor, uint dfactor);
     [DllImport("opengl32.dll")] private static extern void glLineWidth(float width);
     [DllImport("opengl32.dll")] private static extern void glLineStipple(int factor, ushort pattern);
@@ -108,6 +109,9 @@ public class OpenGLRadarControl : Control
     private DebriefSession cachedSession = null;
     private Dictionary<string, PointF> smoothOffsets = new Dictionary<string, PointF>();
     private HashSet<string> triggeredJams = new HashSet<string>();
+    // Захваченная цель для направленного подавления (DRFM/SAS): ключ луча -> id цели.
+    // Нужно, чтобы пунктир не перескакивал между юнитами и не уходил с цели.
+    private Dictionary<string, string> dirJamLock = new Dictionary<string, string>();
     private double lastJamSurgeT = -99.0;
     private string lastJamBanner = "";
 
@@ -190,26 +194,210 @@ public class OpenGLRadarControl : Control
 
     protected override void OnPaintBackground(PaintEventArgs pevent) { }
 
+    /// <summary>Сбрасывает отметки сыгранных JAMMER-событий, чтобы звук проигрался заново после перемотки.</summary>
+    public void ResetJamTriggers()
+    {
+        triggeredJams.Clear();
+        dirJamLock.Clear();
+    }
+
+    // ---------------------------------------------------------------------
+    // Непрерывный звук NOISE-помех: работает только в 3D-режиме (этот контрол
+    // виден лишь в нём). Громкость зависит от расстояния от камеры до вершины
+    // конуса (позиции носителя глушилки):
+    //   d = |камера - вершина|,  vol = (1 - d/R) * JamContMaxVolume,  d < R
+    // У вершины — громче всего, на расстоянии R и дальше — тишина (пауза).
+    // Вне зоны — пауза (позиция сохраняется), при смене реплея/выходе — стоп.
+    // ---------------------------------------------------------------------
+    private const double JamContRadiusM = 30000.0;   // радиус слышимости NOISE-конуса
+    private const float  JamContMaxVolume = 0.7f;    // громкость у самой вершины
+    private const float  JamContMinVolume = 0.02f;   // ниже — считаем «вне зоны»
+    private bool  jamContInZone = false;             // геометрия: камера в зоне NOISE
+    private bool  jamContAppliedPlaying = false;     // фактически играет (не на паузе)
+    private float jamContAppliedVolume = -1f;        // последняя применённая громкость
+
+    /// <summary>Полная остановка непрерывного звука NOISE (сброс в начало).</summary>
+    public void StopJamContinuous()
+    {
+        jamContInZone = false;
+        jamContAppliedPlaying = false;
+        jamContAppliedVolume = -1f;
+        DebriefSoundPlayer.StopContinuousLoop();
+    }
+
+    /// <summary>Пауза непрерывного звука (для паузы таймлайна / ухода в 2D).</summary>
+    public void PauseJamContinuous()
+    {
+        jamContAppliedPlaying = false;
+        DebriefSoundPlayer.PauseContinuousLoop();
+    }
+
+    /// <summary>Возобновить непрерывный звук, если камера находится в зоне NOISE.</summary>
+    public void ResumeJamContinuous()
+    {
+        if (!jamContInZone) return;
+        jamContAppliedPlaying = true;
+        DebriefSoundPlayer.ResumeContinuousLoop();
+    }
+
+    private void UpdateJamContinuous(DebriefSession s, double curT, bool isPlaying, bool showBeams,
+                                     double camXM, double camYM, double camAltM,
+                                     Dictionary<string, DebriefSample> liveById)
+    {
+        double d2 = double.MaxValue;   // квадрат расстояния до ближайшей вершины конуса
+
+        if (s != null && s.Beams != null && showBeams)
+        {
+            foreach (TacticalBeam bm in s.Beams)
+            {
+                if (bm.Kind != "JAMMER") continue;
+                if (curT < bm.StartTime || curT > bm.EndTime) continue;
+
+                string mode = bm.JamMode ?? "";
+                if (mode.Length == 0) mode = bm.ToName ?? "";
+                // Только NOISE: DRFM/SAS — направленное подавление по цели, а не зона помех
+                if (mode.IndexOf("DRFM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    mode.IndexOf("SAS", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+
+                // Вершина конуса = фактическая позиция носителя в текущий момент
+                double jx = bm.FromX, jy = bm.FromY;
+                DebriefSample st;
+                if (!string.IsNullOrEmpty(bm.FromId) && liveById != null && liveById.TryGetValue(bm.FromId, out st))
+                { jx = st.X; jy = st.Y; }
+                double jz = s.GetGroundAltitudeAt(jx, jy);
+
+                double dx = jx - camXM, dy = jy - camYM, dz = jz - camAltM;
+                double cand = dx * dx + dy * dy + dz * dz;
+                if (cand < d2) d2 = cand;
+            }
+        }
+
+        bool inZone = d2 != double.MaxValue && d2 < JamContRadiusM * JamContRadiusM;
+        float vol = 0f;
+        if (inZone)
+        {
+            vol = (float)((1.0 - Math.Sqrt(d2) / JamContRadiusM) * JamContMaxVolume);
+            if (vol < JamContMinVolume) inZone = false;
+        }
+
+        // --- Применяем только изменения (вызовы идут в отдельный поток — не спамим каждый кадр) ---
+        if (inZone)
+        {
+            bool wasInZone = jamContInZone;
+            jamContInZone = true;
+
+            if (!wasInZone)
+            {
+                // Вход в зону: запускаем (или продолжаем с сохранённой позиции)
+                DebriefSoundPlayer.PlayContinuousLoop("JAMMER_CONTINUOUS");
+                DebriefSoundPlayer.SetContinuousLoopVolume(vol);
+                jamContAppliedVolume = vol;
+                if (isPlaying)
+                {
+                    DebriefSoundPlayer.ResumeContinuousLoop();
+                    jamContAppliedPlaying = true;
+                }
+                else
+                {
+                    DebriefSoundPlayer.PauseContinuousLoop();
+                    jamContAppliedPlaying = false;
+                }
+                return;
+            }
+
+            // Внутри зоны: подстраиваем громкость и play/pause
+            if (Math.Abs(vol - jamContAppliedVolume) > 0.01f)
+            {
+                DebriefSoundPlayer.SetContinuousLoopVolume(vol);
+                jamContAppliedVolume = vol;
+            }
+            if (isPlaying != jamContAppliedPlaying)
+            {
+                if (isPlaying) DebriefSoundPlayer.ResumeContinuousLoop();
+                else DebriefSoundPlayer.PauseContinuousLoop();
+                jamContAppliedPlaying = isPlaying;
+            }
+        }
+        else if (jamContInZone)
+        {
+            // Вышли из зоны: пауза, позиция сохраняется
+            jamContInZone = false;
+            jamContAppliedPlaying = false;
+            DebriefSoundPlayer.PauseContinuousLoop();
+        }
+    }
+
     private void RebuildTerrainOnGpu(DebriefSession s)
     {
         if (terrainListId != 0) { glDeleteLists(terrainListId, 1); terrainListId = 0; }
         cachedSession = s;
         smoothOffsets.Clear();
         triggeredJams.Clear();
+        dirJamLock.Clear();
         lastJamSurgeT = -99.0;
         lastJamBanner = "";
         if (s == null || s.TerrainHeights == null || s.MapSizeMeters <= 100.0) return;
 
-        int srcN = s.TerrainHeights.GetLength(0);
-        int meshN = Math.Min(768, srcN - 1);
-        double stepM = s.MapSizeMeters / meshN;
-        double minX = s.MapMinX;
-        double minY = s.MapMinY;
+        int srcW = s.TerrainHeights.GetLength(0);
+        int srcH = s.TerrainHeights.GetLength(1);
+        // Сетка строится по разрешению исходной heightmap (до 1024 узлов на сторону),
+        // а не по фиксированным 768: иначе рельеф заметно огрубляется.
+        int meshN = Math.Min(1024, Math.Max(2, Math.Max(srcW, srcH) - 1));
+        double terrainSize = s.TerrainSizeMeters > 100.0 ? s.TerrainSizeMeters : s.MapSizeMeters;
+        double stepM = terrainSize / meshN;
+        double minX = s.TerrainSizeMeters > 100.0 ? s.TerrainMinX : s.MapMinX;
+        double minY = s.TerrainSizeMeters > 100.0 ? s.TerrainMinY : s.MapMinY;
 
         double[,] hCache = new double[meshN + 1, meshN + 1];
         for (int iy = 0; iy <= meshN; iy++)
             for (int ix = 0; ix <= meshN; ix++)
                 hCache[ix, iy] = s.GetGroundAltitudeAt(minX + ix * stepM, minY + iy * stepM);
+
+        // Heightmap в реплее квантована (шаг ~24 м по высоте). Без сглаживания это даёт
+        // характерные «террасы». Один проход box-фильтра убирает ступени, сохраняя рельеф.
+        double[,] hSmooth = new double[meshN + 1, meshN + 1];
+        for (int iy = 0; iy <= meshN; iy++)
+        {
+            for (int ix = 0; ix <= meshN; ix++)
+            {
+                double sum = 0.0;
+                int cnt = 0;
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    int yy = iy + dy;
+                    if (yy < 0 || yy > meshN) continue;
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int xx = ix + dx;
+                        if (xx < 0 || xx > meshN) continue;
+                        sum += hCache[xx, yy];
+                        cnt++;
+                    }
+                }
+                // Мягкое смешивание: центр важнее среднего, резкие хребты не размываются
+                hSmooth[ix, iy] = hCache[ix, iy] * 0.55 + (sum / Math.Max(1, cnt)) * 0.45;
+            }
+        }
+        hCache = hSmooth;
+
+        // Плавная палитра по высоте и мягкое освещение по нормали
+        Func<double, double, byte[]> colorAt = (h, shade) =>
+        {
+            if (h <= 1.5) return new byte[] { 10, 26, 42 };
+            double t = Math.Max(0.0, Math.Min(1.0, h / 2600.0));
+            double r = 24 + t * 112 + Math.Max(0.0, h - 1500.0) * 0.020;
+            double g = 52 + t * 92 + Math.Max(0.0, h - 1500.0) * 0.014;
+            double b = 34 + t * 62;
+            if (h < 30.0) { r += 10; g += 26; b += 22; }        // пляж/низменность
+            else if (h < 120.0) { r += 6; g += 16; b += 8; }
+            double k = 1.0 + shade;
+            return new byte[]
+            {
+                (byte)Math.Max(8, Math.Min(245, r * k)),
+                (byte)Math.Max(14, Math.Min(250, g * k)),
+                (byte)Math.Max(14, Math.Min(240, b * k))
+            };
+        };
 
         terrainListId = glGenLists(1);
         glNewList(terrainListId, GL_COMPILE);
@@ -224,30 +412,24 @@ public class OpenGLRadarControl : Control
                 double x0 = (minX + ix * stepM) * 0.001;
                 double h00 = hCache[ix, iy];
                 double h01 = hCache[ix, iy + 1];
-                double h10 = ix < meshN ? hCache[ix + 1, iy] : h00;
+                int ixL = Math.Max(0, ix - 1);
+                int ixR = Math.Min(meshN, ix + 1);
+                int iyD = Math.Max(0, iy - 1);
+                int iyU = Math.Min(meshN, iy + 1);
+                // Нормаль по центральным разностям через две ячейки — мягче и без «мозаики»
+                double dxh = (hCache[ixR, iy] - hCache[ixL, iy]) / Math.Max(1, ixR - ixL);
+                double dyh = (hCache[ix, iyU] - hCache[ix, iyD]) / Math.Max(1, iyU - iyD);
+                double shade0 = Math.Max(-0.42, Math.Min(0.55, (-dxh * 0.72 + dyh * 0.72) / stepM * 2.6));
 
-                if (h00 <= 1.5 && h01 <= 1.5)
-                {
-                    glColor3ub(10, 26, 42);
-                }
-                else
-                {
-                    double slopeX = (h10 - h00) / stepM;
-                    double slopeY = (h01 - h00) / stepM;
-                    double shade = Math.Max(-0.45, Math.Min(0.60, (-slopeX * 0.72 + slopeY * 0.72) * 2.2));
-                    double norm = Math.Min(1.0, h00 / 2400.0);
-                    int r = (int)((22 + norm * 96) * (1.0 + shade));
-                    int gr = (int)((54 + norm * 96) * (1.0 + shade));
-                    int b = (int)((34 + norm * 70) * (1.0 + shade));
-                    if (h00 < 35.0) { r += 8; gr += 24; b += 22; }
-                    if (h00 > 1600.0) { r += 32; gr += 32; b += 36; }
-                    int band0 = (int)(h00 / 250.0);
-                    int band1 = (int)(h10 / 250.0);
-                    int band2 = (int)(h01 / 250.0);
-                    if (band0 != band1 || band0 != band2) { r += 18; gr += 28; b += 18; }
-                    glColor3ub((byte)Math.Max(8, Math.Min(245, r)), (byte)Math.Max(14, Math.Min(250, gr)), (byte)Math.Max(14, Math.Min(240, b)));
-                }
+                double dxh1 = (hCache[ixR, Math.Min(meshN, iy + 1)] - hCache[ixL, Math.Min(meshN, iy + 1)]) / Math.Max(1, ixR - ixL);
+                double dyh1 = (hCache[ix, Math.Min(meshN, iy + 2)] - hCache[ix, iy]) / Math.Max(1, Math.Min(meshN, iy + 2) - iy);
+                double shade1 = Math.Max(-0.42, Math.Min(0.55, (-dxh1 * 0.72 + dyh1 * 0.72) / stepM * 2.6));
+
+                byte[] c0 = colorAt(h00, shade0);
+                byte[] c1 = colorAt(h01, shade1);
+                glColor3ub(c0[0], c0[1], c0[2]);
                 glVertex3d(x0, h00 * 0.001, z0);
+                glColor3ub(c1[0], c1[1], c1[2]);
                 glVertex3d(x0, h01 * 0.001, z1);
             }
             glEnd();
@@ -318,12 +500,19 @@ public class OpenGLRadarControl : Control
         glTranslated(-cx, -(groundCamAlt + 1.2), cy);
         List<Tuple<string, string, PointF, Color>> arlLabels = new List<Tuple<string, string, PointF, Color>>();
         Dictionary<string, string> jammedTargets = new Dictionary<string, string>();
+        // Эти значения нужны и после блока отрисовки 3D-сцены (для непрерывного звука NOISE)
+        double curT = GetCurrentTime != null ? GetCurrentTime() : 0.0;
+        bool showBeams = GetShowBeams == null || GetShowBeams();
+        bool isPlaying = GetIsPlaying != null && GetIsPlaying();
+        Dictionary<string, DebriefSample> liveById = new Dictionary<string, DebriefSample>();
         if (s != null)
         {
             if (s != cachedSession) RebuildTerrainOnGpu(s);
             bool showTerr = GetShowTerrain == null || GetShowTerrain();
             if (showTerr && terrainListId != 0)
                 glCallList(terrainListId);
+            // ВПП аэродромов лежат на рельефе и участвуют в тесте глубины
+            DrawAirfields3D(s, distKm);
             // Сетка координат уровня моря
             glLineWidth(1.0f);
             glColor4ub(0, 220, 130, 32);
@@ -337,11 +526,8 @@ public class OpenGLRadarControl : Control
             for (double gy = Math.Floor(gMinY / 10.0) * 10.0; gy <= gMaxY; gy += 10.0)
             { glVertex3d(gMinX, 0.02, -gy); glVertex3d(gMaxX, 0.02, -gy); }
             glEnd();
-            double curT = GetCurrentTime != null ? GetCurrentTime() : 0.0;
             bool showAllies = GetShowAllies == null || GetShowAllies();
-            bool showBeams = GetShowBeams == null || GetShowBeams();
             string followId = GetFollowId != null ? GetFollowId() : "";
-            bool isPlaying = GetIsPlaying != null && GetIsPlaying();
             // 3D-кольца зон ПВО (SAM) и Bullseye на рельефе
             glEnable(GL_LINE_STIPPLE);
             glLineStipple(2, 0xAAAA);
@@ -367,7 +553,7 @@ public class OpenGLRadarControl : Control
                 }
             }
             glDisable(GL_LINE_STIPPLE);
-            Dictionary<string, DebriefSample> liveById = new Dictionary<string, DebriefSample>();
+            // Заполняем liveById (liveById уже объявлен выше)
             foreach (DebriefEntity ent in s.Entities)
             {
                 DebriefSample st = ent.GetStateAt(curT);
@@ -379,6 +565,9 @@ public class OpenGLRadarControl : Control
             float pulse01 = (float)(0.5 + 0.5 * Math.Sin(curT * 7.0));
             if (showBeams)
             {
+                // Лучи захвата — тактическая разметка поверх рельефа, а не физический объект.
+                // Рисуем их без теста глубины, чтобы пунктир не «уходил под террейн».
+                glDisable(GL_DEPTH_TEST);
                 foreach (TacticalBeam bm in s.Beams)
                 {
                     if (curT < bm.StartTime || curT > bm.EndTime) continue;
@@ -401,12 +590,14 @@ public class OpenGLRadarControl : Control
                                 triggeredJams.Add(evId);
                                 lastJamSurgeT = curT;
                                 lastJamBanner = ev.Title;
+                                DebriefSoundPlayer.Play("JAMMER_ON");
                             }
                         }
                         double horizLen = Math.Sqrt(bm.DirX * bm.DirX + bm.DirY * bm.DirY);
                         double ux2d = horizLen > 1e-4 ? (bm.DirX / horizLen) : 0.0;
                         double uy2d = horizLen > 1e-4 ? (bm.DirY / horizLen) : 0.0;
-                        double maxRay = 95000.0;
+                        // Дальность станции РЭБ большая — не обрезаем по карте
+                        double maxRay = 250000.0;
                         string jamModeName = bm.JamMode ?? "";
                         if (jamModeName.Length == 0) jamModeName = bm.ToName ?? "";
                         bool isDirMode = jamModeName.IndexOf("DRFM", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -418,107 +609,136 @@ public class OpenGLRadarControl : Control
                         // DRFM/SAS работают по конкретной цели: обрезаем луч на первом радиолокационном
                         // юните в коридоре вдоль оси и ставим бейдж только ему (логика 0.7.0).
                         // NOISE — зона подавления, бейджи на юнитах не ставим.
+                        Func<DebriefEntity, bool> hasRadarSystem = (ent) =>
+                        {
+                            if (ent.Class == "Air" || ent.Class == "Chopper") return true;
+                            if (ent.Class != "Ground") return false;
+                            string nm = ent.Name ?? "";
+                            if (nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                nm.IndexOf("Infantry", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                nm.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                nm.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                nm.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0)
+                                return false;
+                            return ent.RoleTag == "SAM" ||
+                                   nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                   nm.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                   nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                   nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                   nm.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                   nm.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                   nm.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0;
+                        };
+
+                        // Ось NOISE-конуса. В игре антенна наведена на подавляемую цель,
+                        // а не смотрит по курсу — восстанавливаем цель по оси луча и удерживаем её.
+                        double jamDirX = bm.DirX, jamDirY = bm.DirY, jamDirZ = bm.DirZ;
+                        double coneLenM = JammerModel.NoiseConeRangeM;
+
                         if (isDirMode)
                         {
-                            Func<DebriefEntity, bool> hasRadarSystem = (ent) =>
+                            // Цель запоминается по ключу луча: пока она существует, луч идёт
+                            // строго в неё, даже если она сместилась в сторону от оси антенны.
+                            string beamKey = (bm.FromId ?? "") + "|" + bm.StartTime.ToString("F1");
+                            string hitId = null;
+                            string lockedId;
+                            if (dirJamLock.TryGetValue(beamKey, out lockedId))
                             {
-                                if (ent.Class == "Air" || ent.Class == "Chopper") return true;
-                                if (ent.Class != "Ground") return false;
-                                string nm = ent.Name ?? "";
-                                if (nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("Infantry", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("IFV", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("Tank", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    nm.IndexOf("APC", StringComparison.OrdinalIgnoreCase) >= 0)
-                                    return false;
-                                return ent.RoleTag == "SAM" ||
-                                       nm.IndexOf("Radar", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("Watchman", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("Ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("Cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       nm.IndexOf("Carrier", StringComparison.OrdinalIgnoreCase) >= 0;
-                            };
-
-                            string hitId = "";
-                            foreach (DebriefEntity cand in s.Entities)
-                            {
-                                if (cand.Id == bm.FromId || cand.Coalition == srcCoal || !hasRadarSystem(cand)) continue;
-                                DebriefSample cs;
-                                if (!liveById.TryGetValue(cand.Id, out cs)) continue;
-                                double dx = cs.X - fx;
-                                double dy = cs.Y - fy;
-                                double proj = dx * ux2d + dy * uy2d;
-                                if (proj <= 500.0 || proj >= maxRay) continue;
-                                double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
-                                double hitRadius = Math.Max(1800.0, proj * 0.06);
-                                if (perp <= hitRadius)
-                                {
-                                    maxRay = proj;
-                                    hitId = cand.Id;
-                                }
+                                if (liveById.ContainsKey(lockedId)) hitId = lockedId;
+                                else dirJamLock.Remove(beamKey);
                             }
-                            if (!string.IsNullOrEmpty(hitId))
-                                jammedTargets[hitId] = jamModeName.ToUpperInvariant();
-                            else
-                                continue;   // цель не найдена — луч DRFM/SAS «в никуда» не рисуем
+                            if (hitId == null)
+                            {
+                                double bestProj = double.MaxValue;
+                                foreach (DebriefEntity cand in s.Entities)
+                                {
+                                    if (cand.Id == bm.FromId || cand.Coalition == srcCoal || !hasRadarSystem(cand)) continue;
+                                    DebriefSample cs;
+                                    if (!liveById.TryGetValue(cand.Id, out cs)) continue;
+                                    double dx = cs.X - fx;
+                                    double dy = cs.Y - fy;
+                                    double proj = dx * ux2d + dy * uy2d;
+                                    if (proj <= 500.0 || proj >= maxRay) continue;
+                                    double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
+                                    double hitRadius = Math.Max(2500.0, proj * 0.10);
+                                    if (perp > hitRadius) continue;
+                                    if (proj < bestProj) { bestProj = proj; hitId = cand.Id; }
+                                }
+                                if (hitId != null) dirJamLock[beamKey] = hitId;
+                            }
+                            DebriefSample tgtSmp;
+                            if (hitId == null || !liveById.TryGetValue(hitId, out tgtSmp))
+                                continue;   // цели нет — луч DRFM/SAS «в никуда» не рисуем
+                            tx = tgtSmp.X;
+                            ty = tgtSmp.Y;
+                            tz = tgtSmp.Alt;
+                            jammedTargets[hitId] = jamModeName.ToUpperInvariant();
                         }
+                        else
+                        {
+                            // NOISE: одна цель на постановщик, пока она жива.
+                            string noiseKey = (bm.FromId ?? "") + "|NOISE";
+                            string noiseTargetId = null;
+                            string lockedNoise;
+                            if (dirJamLock.TryGetValue(noiseKey, out lockedNoise))
+                            {
+                                if (liveById.ContainsKey(lockedNoise)) noiseTargetId = lockedNoise;
+                                else dirJamLock.Remove(noiseKey);
+                            }
+                            if (noiseTargetId == null)
+                            {
+                                double bestProj = double.MaxValue;
+                                foreach (DebriefEntity cand in s.Entities)
+                                {
+                                    if (cand.Id == bm.FromId || cand.Coalition == srcCoal || !hasRadarSystem(cand)) continue;
+                                    DebriefSample cs;
+                                    if (!liveById.TryGetValue(cand.Id, out cs)) continue;
+                                    double dx = cs.X - fx;
+                                    double dy = cs.Y - fy;
+                                    double proj = dx * ux2d + dy * uy2d;
+                                    if (proj <= 500.0 || proj >= maxRay) continue;
+                                    double perp = Math.Abs(dx * (-uy2d) + dy * ux2d);
+                                    double hitRadius = Math.Max(3500.0, proj * 0.12);
+                                    if (perp > hitRadius) continue;
+                                    if (proj < bestProj) { bestProj = proj; noiseTargetId = cand.Id; }
+                                }
+                                if (noiseTargetId != null) dirJamLock[noiseKey] = noiseTargetId;
+                            }
+                            DebriefSample nTgt;
+                            if (noiseTargetId != null && liveById.TryGetValue(noiseTargetId, out nTgt))
+                            {
+                                jamDirX = nTgt.X - fx;
+                                jamDirY = nTgt.Y - fy;
+                                jamDirZ = nTgt.Alt - fz;
+                                double d3 = Math.Sqrt(jamDirX * jamDirX + jamDirY * jamDirY + jamDirZ * jamDirZ);
+                                // Конус дотягивается до цели с запасом, но не выходит за предел станции
+                                coneLenM = Math.Min(JammerModel.NoiseConeRangeM, Math.Max(8000.0, d3 * 1.25));
+                            }
 
-                        tx = fx + ux2d * maxRay;
-                        ty = fy + uy2d * maxRay;
-                        double ray3d = horizLen > 0.05 ? (maxRay / horizLen) : maxRay;
-                        tz = Math.Max(s.GetGroundAltitudeAt(tx, ty), fz + bm.DirZ * ray3d);
+                            double dl = Math.Sqrt(jamDirX * jamDirX + jamDirY * jamDirY + jamDirZ * jamDirZ);
+                            if (dl > 1e-6)
+                            {
+                                tx = fx + jamDirX / dl * coneLenM;
+                                ty = fy + jamDirY / dl * coneLenM;
+                                tz = fz + jamDirZ / dl * coneLenM;
+                            }
+                            else
+                            {
+                                tx = fx + ux2d * coneLenM;
+                                ty = fy + uy2d * coneLenM;
+                                tz = fz;
+                            }
+                        }
 
                         if (!isDirMode)
                         {
-                            // Приглушённая медленная пульсация конуса NOISE (1.6 Гц)
-                            double jamPulse = 0.5 + 0.5 * Math.Sin(curT * 1.6);
-                            byte edgeAlpha = (byte)(22 + 16 * jamPulse);
-                            byte coreAlpha = (byte)(40 + 26 * jamPulse);
-
-                            // Границы лепестка 10% и 50% от осевого сигнала (углы из directionalPower=8)
-                            double px2d = -uy2d, py2d = ux2d;
-                            double halfW10 = maxRay * Math.Tan(JammerModel.AngleForLevel(0.10) * Math.PI / 180.0);
-                            double halfW = maxRay * Math.Tan(JammerModel.AngleForLevel(0.50) * Math.PI / 180.0);
-                            glLineWidth(1.1f);
-                            glColor4ub(200, 110, 255, coreAlpha);
-                            glBegin(GL_LINES);
-                            glVertex3d(fx * 0.001, fz * 0.001, -fy * 0.001);
-                            glVertex3d((tx + px2d * halfW) * 0.001, tz * 0.001, -(ty + py2d * halfW) * 0.001);
-                            glVertex3d(fx * 0.001, fz * 0.001, -fy * 0.001);
-                            glVertex3d((tx - px2d * halfW) * 0.001, tz * 0.001, -(ty - py2d * halfW) * 0.001);
-                            glEnd();
-                            // Внешняя граница лепестка — уровень 10%
-                            glLineWidth(1.0f);
-                            glColor4ub(200, 110, 255, edgeAlpha);
-                            glBegin(GL_LINES);
-                            glVertex3d(fx * 0.001, fz * 0.001, -fy * 0.001);
-                            glVertex3d((tx + px2d * halfW10) * 0.001, tz * 0.001, -(ty + py2d * halfW10) * 0.001);
-                            glVertex3d(fx * 0.001, fz * 0.001, -fy * 0.001);
-                            glVertex3d((tx - px2d * halfW10) * 0.001, tz * 0.001, -(ty - py2d * halfW10) * 0.001);
-                            glEnd();
-                            // Медленное обновление засветков (2 Гц) и сниженная яркость
-                            int tick = (int)(curT * 2.0);
-                            glBegin(GL_QUADS);
-                            for (int i = 0; i < 20; i++)
-                            {
-                                int hash = ((i * 73856093) ^ (tick * 19349663)) & 0x7FFFFFFF;
-                                double frac = 0.05 + ((hash % 1000) / 1000.0) * 0.90;
-                                double lat = (((hash / 1000) % 200) - 100) / 100.0;
-                                double bx = fx + ux2d * (maxRay * frac) + px2d * (halfW * frac * lat * 0.85);
-                                double by = fy + uy2d * (maxRay * frac) + py2d * (halfW * frac * lat * 0.85);
-                                double bz = fz + (tz - fz) * frac;
-                                byte al = (byte)(38 + ((hash / 200000) % 46));
-                                double bw = Math.Max(0.04, halfW * frac * 0.06 * 0.001);
-                                glColor4ub(210, 115, 255, al);
-                                glVertex3d(bx * 0.001 - px2d * bw, bz * 0.001, -(by * 0.001 - py2d * bw));
-                                glVertex3d(bx * 0.001 + px2d * bw, bz * 0.001, -(by * 0.001 + py2d * bw));
-                                glVertex3d((bx + ux2d * 250) * 0.001 + px2d * bw, bz * 0.001, -((by + uy2d * 250) * 0.001 + py2d * bw));
-                                glVertex3d((bx + ux2d * 250) * 0.001 - px2d * bw, bz * 0.001, -((by + uy2d * 250) * 0.001 - py2d * bw));
-                            }
-                            glEnd();
+                            // Настоящий объёмный конус помех: поверхность вращения вокруг оси антенны
+                            // по той же диаграмме направленности, что в игре (pow(cos, 8)).
+                            // Конус — физический объём, поэтому он корректно прячется за рельефом.
+                            glEnable(GL_DEPTH_TEST);
+                            DrawNoiseCone(s, fx, fy, fz, jamDirX, jamDirY, jamDirZ, coneLenM, curT);
+                            glDisable(GL_DEPTH_TEST);
                         }
                         else
                         {
@@ -573,6 +793,7 @@ public class OpenGLRadarControl : Control
                         }
                     }
                 }
+                glEnable(GL_DEPTH_TEST);
             }
             // 3D-траектории, стойки высоты и силуэты бортов/ракет
             foreach (DebriefEntity ent in s.Entities)
@@ -586,30 +807,7 @@ public class OpenGLRadarControl : Control
                 byte cb = isMine ? (byte)95 : (ent.Coalition == "Enemies" ? (byte)40 : (byte)255);
                 if (ent.Type == "Ground")
                 {
-                    double gz = Math.Max(cur.Alt, s.GetGroundAltitudeAt(cur.X, cur.Y));
-                    double gx = cur.X * 0.001, gy = gz * 0.001, gzz = -cur.Y * 0.001;
-                    double r = 0.28, topY = gy + 0.36;
-
-                    // Объёмная 4-гранная 3D-пирамида наземного юнита со светотенью граней
-                    glBegin(GL_TRIANGLES);
-                    glColor4ub(cr, cg, cb, 245);
-                    glVertex3d(gx, topY, gzz); glVertex3d(gx - r, gy, gzz - r); glVertex3d(gx + r, gy, gzz - r);
-                    glColor4ub((byte)(cr * 0.8), (byte)(cg * 0.8), (byte)(cb * 0.8), 245);
-                    glVertex3d(gx, topY, gzz); glVertex3d(gx + r, gy, gzz - r); glVertex3d(gx + r, gy, gzz + r);
-                    glColor4ub((byte)(cr * 0.65), (byte)(cg * 0.65), (byte)(cb * 0.65), 245);
-                    glVertex3d(gx, topY, gzz); glVertex3d(gx + r, gy, gzz + r); glVertex3d(gx - r, gy, gzz + r);
-                    glColor4ub((byte)(cr * 0.85), (byte)(cg * 0.85), (byte)(cb * 0.85), 245);
-                    glVertex3d(gx, topY, gzz); glVertex3d(gx - r, gy, gzz + r); glVertex3d(gx - r, gy, gzz - r);
-                    glEnd();
-
-                    glLineWidth(1.1f);
-                    glColor4ub(255, 255, 255, 90);
-                    glBegin(GL_LINE_LOOP);
-                    glVertex3d(gx - r, gy + 0.01, gzz - r);
-                    glVertex3d(gx + r, gy + 0.01, gzz - r);
-                    glVertex3d(gx + r, gy + 0.01, gzz + r);
-                    glVertex3d(gx - r, gy + 0.01, gzz + r);
-                    glEnd();
+                    DrawGroundUnit3D(s, ent, cur, cr, cg, cb, distKm, curT);
                     continue;
                 }
 
@@ -668,8 +866,8 @@ public class OpenGLRadarControl : Control
                 double uy = ry0 * sinR + uy0 * cosR;
                 double uz = rz0 * sinR + uz0 * cosR;
 
-                double zoomScale = Math.Max(0.32, Math.Min(1.0, distKm / 18.0));
-                double sc = (ent.Type == "Missile" ? 0.14 : 0.24) * zoomScale;
+                double zoomScale = Math.Max(0.30, Math.Min(1.0, distKm / 22.0));
+                double sc = (ent.Type == "Missile" ? 0.10 : 0.16) * zoomScale;
                 double px = cur.X * 0.001, py = cur.Alt * 0.001, pz = -cur.Y * 0.001;
 
                 Func<double, double, double, double[]> toWorld = (lf, lr, lu) => new double[]
@@ -730,37 +928,68 @@ public class OpenGLRadarControl : Control
                 }
                 else
                 {
-                    // Объёмный 3D-истребитель с крыльями, брюхом и двумя килями
-                    double[] vNose = toWorld(1.75, 0.0, 0.0);
-                    double[] vTop = toWorld(-0.25, 0.0, 0.24);
-                    double[] vBot = toWorld(-0.25, 0.0, -0.14);
-                    double[] vTail = toWorld(-1.15, 0.0, 0.04);
-                    double[] vWingL = toWorld(-0.85, -1.15, -0.04);
-                    double[] vWingR = toWorld(-0.85, 1.15, -0.04);
+                    // Узнаваемый силуэт истребителя: острый нос, объёмный фюзеляж,
+                    // стреловидные крылья, стабилизаторы и два киля.
+                    double[] nose = toWorld(2.05, 0.0, 0.02);
+                    double[] bodyTop = toWorld(0.30, 0.0, 0.20);
+                    double[] bot = toWorld(0.30, 0.0, -0.13);
+                    double[] tail = toWorld(-1.05, 0.0, 0.06);
 
+                    double[] wlF = toWorld(0.32, -0.12, 0.03);
+                    double[] wlT = toWorld(-0.52, -1.30, -0.01);
+                    double[] wlB = toWorld(-0.98, -0.30, 0.03);
+                    double[] wrF = toWorld(0.32, 0.12, 0.03);
+                    double[] wrT = toWorld(-0.52, 1.30, -0.01);
+                    double[] wrB = toWorld(-0.98, 0.30, 0.03);
+
+                    double[] stL0 = toWorld(-0.72, -0.10, 0.05);
+                    double[] stL1 = toWorld(-1.02, -0.58, 0.05);
+                    double[] stL2 = toWorld(-1.06, -0.16, 0.05);
+                    double[] stR0 = toWorld(-0.72, 0.10, 0.05);
+                    double[] stR1 = toWorld(-1.02, 0.58, 0.05);
+                    double[] stR2 = toWorld(-1.06, 0.16, 0.05);
+
+                    double[] finL0 = toWorld(-0.50, -0.26, 0.10);
+                    double[] finL1 = toWorld(-0.92, -0.28, 0.58);
+                    double[] finL2 = toWorld(-1.00, -0.24, 0.10);
+                    double[] finR0 = toWorld(-0.50, 0.26, 0.10);
+                    double[] finR1 = toWorld(-0.92, 0.28, 0.58);
+                    double[] finR2 = toWorld(-1.00, 0.24, 0.10);
+
+                    // Верх фюзеляжа и крыльев
                     glColor4ub(cr, cg, cb, 255);
-                    glVertex3d(vNose[0], vNose[1], vNose[2]); glVertex3d(vTop[0], vTop[1], vTop[2]); glVertex3d(vWingL[0], vWingL[1], vWingL[2]);
-                    glVertex3d(vNose[0], vNose[1], vNose[2]); glVertex3d(vWingR[0], vWingR[1], vWingR[2]); glVertex3d(vTop[0], vTop[1], vTop[2]);
-                    glVertex3d(vTop[0], vTop[1], vTop[2]); glVertex3d(vTail[0], vTail[1], vTail[2]); glVertex3d(vWingL[0], vWingL[1], vWingL[2]);
-                    glVertex3d(vTop[0], vTop[1], vTop[2]); glVertex3d(vWingR[0], vWingR[1], vWingR[2]); glVertex3d(vTail[0], vTail[1], vTail[2]);
+                    glVertex3d(nose[0], nose[1], nose[2]); glVertex3d(bodyTop[0], bodyTop[1], bodyTop[2]); glVertex3d(wlF[0], wlF[1], wlF[2]);
+                    glVertex3d(nose[0], nose[1], nose[2]); glVertex3d(wrF[0], wrF[1], wrF[2]); glVertex3d(bodyTop[0], bodyTop[1], bodyTop[2]);
+                    glVertex3d(bodyTop[0], bodyTop[1], bodyTop[2]); glVertex3d(tail[0], tail[1], tail[2]); glVertex3d(wlB[0], wlB[1], wlB[2]);
+                    glVertex3d(bodyTop[0], bodyTop[1], bodyTop[2]); glVertex3d(wrB[0], wrB[1], wrB[2]); glVertex3d(tail[0], tail[1], tail[2]);
 
-                    glColor4ub((byte)(cr * 0.55), (byte)(cg * 0.55), (byte)(cb * 0.55), 255);
-                    glVertex3d(vNose[0], vNose[1], vNose[2]); glVertex3d(vWingL[0], vWingL[1], vWingL[2]); glVertex3d(vBot[0], vBot[1], vBot[2]);
-                    glVertex3d(vNose[0], vNose[1], vNose[2]); glVertex3d(vBot[0], vBot[1], vBot[2]); glVertex3d(vWingR[0], vWingR[1], vWingR[2]);
-                    glVertex3d(vBot[0], vBot[1], vBot[2]); glVertex3d(vWingL[0], vWingL[1], vWingL[2]); glVertex3d(vTail[0], vTail[1], vTail[2]);
-                    glVertex3d(vBot[0], vBot[1], vBot[2]); glVertex3d(vTail[0], vTail[1], vTail[2]); glVertex3d(vWingR[0], vWingR[1], vWingR[2]);
+                    glColor4ub((byte)(cr * 0.92), (byte)(cg * 0.92), (byte)(cb * 0.92), 255);
+                    glVertex3d(wlF[0], wlF[1], wlF[2]); glVertex3d(wlT[0], wlT[1], wlT[2]); glVertex3d(wlB[0], wlB[1], wlB[2]);
+                    glVertex3d(wrF[0], wrF[1], wrF[2]); glVertex3d(wrB[0], wrB[1], wrB[2]); glVertex3d(wrT[0], wrT[1], wrT[2]);
+                    glVertex3d(stL0[0], stL0[1], stL0[2]); glVertex3d(stL1[0], stL1[1], stL1[2]); glVertex3d(stL2[0], stL2[1], stL2[2]);
+                    glVertex3d(stR0[0], stR0[1], stR0[2]); glVertex3d(stR2[0], stR2[1], stR2[2]); glVertex3d(stR1[0], stR1[1], stR1[2]);
 
-                    double[] vFinLBase = toWorld(-0.55, -0.22, 0.06);
-                    double[] vFinLTop = toWorld(-1.05, -0.34, 0.48);
-                    double[] vFinLBack = toWorld(-1.12, -0.22, 0.06);
+                    // Брюхо и нижние плоскости
+                    glColor4ub((byte)(cr * 0.52), (byte)(cg * 0.52), (byte)(cb * 0.52), 255);
+                    glVertex3d(nose[0], nose[1], nose[2]); glVertex3d(wlF[0], wlF[1], wlF[2]); glVertex3d(bot[0], bot[1], bot[2]);
+                    glVertex3d(nose[0], nose[1], nose[2]); glVertex3d(bot[0], bot[1], bot[2]); glVertex3d(wrF[0], wrF[1], wrF[2]);
+                    glVertex3d(bot[0], bot[1], bot[2]); glVertex3d(wlB[0], wlB[1], wlB[2]); glVertex3d(tail[0], tail[1], tail[2]);
+                    glVertex3d(bot[0], bot[1], bot[2]); glVertex3d(tail[0], tail[1], tail[2]); glVertex3d(wrB[0], wrB[1], wrB[2]);
+                    glVertex3d(wlF[0], wlF[1], wlF[2]); glVertex3d(wlB[0], wlB[1], wlB[2]); glVertex3d(wlT[0], wlT[1], wlT[2]);
+                    glVertex3d(wrF[0], wrF[1], wrF[2]); glVertex3d(wrT[0], wrT[1], wrT[2]); glVertex3d(wrB[0], wrB[1], wrB[2]);
+                    glVertex3d(stL0[0], stL0[1], stL0[2]); glVertex3d(stL2[0], stL2[1], stL2[2]); glVertex3d(stL1[0], stL1[1], stL1[2]);
+                    glVertex3d(stR0[0], stR0[1], stR0[2]); glVertex3d(stR1[0], stR1[1], stR1[2]); glVertex3d(stR2[0], stR2[1], stR2[2]);
 
-                    double[] vFinRBase = toWorld(-0.55, 0.22, 0.06);
-                    double[] vFinRTop = toWorld(-1.05, 0.34, 0.48);
-                    double[] vFinRBack = toWorld(-1.12, 0.22, 0.06);
-
-                    glColor4ub((byte)Math.Min(255, cr + 30), (byte)Math.Min(255, cg + 30), (byte)Math.Min(255, cb + 30), 255);
-                    glVertex3d(vFinLBase[0], vFinLBase[1], vFinLBase[2]); glVertex3d(vFinLTop[0], vFinLTop[1], vFinLTop[2]); glVertex3d(vFinLBack[0], vFinLBack[1], vFinLBack[2]);
-                    glVertex3d(vFinRBase[0], vFinRBase[1], vFinRBase[2]); glVertex3d(vFinRTop[0], vFinRTop[1], vFinRTop[2]); glVertex3d(vFinRBack[0], vFinRBack[1], vFinRBack[2]);
+                    // Кили
+                    glColor4ub((byte)Math.Min(255, cr + 28), (byte)Math.Min(255, cg + 28), (byte)Math.Min(255, cb + 28), 255);
+                    glVertex3d(finL0[0], finL0[1], finL0[2]); glVertex3d(finL1[0], finL1[1], finL1[2]); glVertex3d(finL2[0], finL2[1], finL2[2]);
+                    glVertex3d(finR0[0], finR0[1], finR0[2]); glVertex3d(finR1[0], finR1[1], finR1[2]); glVertex3d(finR2[0], finR2[1], finR2[2]);
+                    // Фонарь кабины
+                    double[] canopyF = toWorld(0.95, 0.0, 0.10);
+                    double[] canopyL = toWorld(0.45, -0.10, 0.22);
+                    double[] canopyR = toWorld(0.45, 0.10, 0.22);
+                    glColor4ub((byte)Math.Min(255, cr + 45), (byte)Math.Min(255, cg + 45), (byte)Math.Min(255, cb + 45), 255);
+                    glVertex3d(canopyF[0], canopyF[1], canopyF[2]); glVertex3d(canopyL[0], canopyL[1], canopyL[2]); glVertex3d(canopyR[0], canopyR[1], canopyR[2]);
                 }
                 glEnd();
             }
@@ -800,8 +1029,423 @@ public class OpenGLRadarControl : Control
             // Атомарный рендер всех 2D-плашек, HUD и баннеров в текстуру OpenGL ДО SwapBuffers (0% мерцания!)
             RenderZeroFlickerHudTexture(w, h, s, cx, cy, groundCamAlt, distKm, yaw, pitch, arlLabels, jammedTargets);
         }
+        // --- Непрерывный звук NOISE-помех (только 3D) ---
+        // Позиция камеры в мировых координатах (метры): обход цели (cx,cy) на distKm с углом pitch
+        {
+            double pitchR = pitch * Math.PI / 180.0;
+            double yawR   = yaw   * Math.PI / 180.0;
+            double distM  = distKm * 1000.0;
+            double camXM  = cx * 1000.0 - distM * Math.Cos(pitchR) * Math.Sin(yawR);
+            double camYM  = cy * 1000.0 - distM * Math.Cos(pitchR) * Math.Cos(yawR);
+            double camAltM = (groundCamAlt + 1.2) * 1000.0 + distM * Math.Sin(pitchR);
+            UpdateJamContinuous(s, curT, isPlaying, showBeams, camXM, camYM, camAltM, liveById);
+        }
         SwapBuffers(hdc);
     }
+    // Аэродром на рельефе: ВПП, осевая, пороги и перрон. Данных о полосах в реплее нет,
+    // поэтому геометрия типовая, а положение и курс берутся из восстановленных точек взлёта/посадки.
+    private void DrawAirfields3D(DebriefSession s, double distKm)
+    {
+        if (s.Airfields == null || s.Airfields.Count == 0) return;
+        foreach (MapPoiMarker af in s.Airfields)
+        {
+            double hdg = af.Heading * Math.PI / 180.0;
+            double fwdX = Math.Sin(hdg), fwdZ = -Math.Cos(hdg);
+            double rgtX = Math.Cos(hdg), rgtZ = Math.Sin(hdg);
+            double L = 2400.0;
+            // Ширина чуть растёт с удалением камеры, иначе полоса не читается на общем плане
+            double W = Math.Max(70.0, distKm * 5.5);
+
+            Func<double, double, double[]> P = (along, side) =>
+            {
+                double wx = af.X + fwdX * along + rgtX * side;
+                double wy = af.Y + fwdZ * along + rgtZ * side;
+                double g = s.GetGroundAltitudeAt(wx, wy) + 3.0;
+                return new double[] { wx * 0.001, g * 0.001, -wy * 0.001 };
+            };
+
+            double[] p0 = P(-L * 0.5, -W * 0.5);
+            double[] p1 = P(L * 0.5, -W * 0.5);
+            double[] p2 = P(L * 0.5, W * 0.5);
+            double[] p3 = P(-L * 0.5, W * 0.5);
+
+            glBegin(GL_QUADS);
+            glColor4ub(52, 56, 58, 235);
+            glVertex3d(p0[0], p0[1], p0[2]);
+            glVertex3d(p1[0], p1[1], p1[2]);
+            glVertex3d(p2[0], p2[1], p2[2]);
+            glVertex3d(p3[0], p3[1], p3[2]);
+            glEnd();
+
+            glLineWidth(1.4f);
+            glColor4ub(200, 210, 205, 175);
+            glBegin(GL_LINE_LOOP);
+            glVertex3d(p0[0], p0[1], p0[2]);
+            glVertex3d(p1[0], p1[1], p1[2]);
+            glVertex3d(p2[0], p2[1], p2[2]);
+            glVertex3d(p3[0], p3[1], p3[2]);
+            glEnd();
+
+            // Осевая линия пунктиром
+            glLineWidth(1.2f);
+            glColor4ub(235, 240, 235, 160);
+            glBegin(GL_LINES);
+            for (int seg = 0; seg < 12; seg++)
+            {
+                double t0 = -0.46 + seg * (0.92 / 12.0);
+                double t1 = t0 + (0.92 / 12.0) * 0.55;
+                double[] a = P(t0 * L, 0.0);
+                double[] b = P(t1 * L, 0.0);
+                glVertex3d(a[0], a[1], a[2]);
+                glVertex3d(b[0], b[1], b[2]);
+            }
+            glEnd();
+
+            // Пороги (по три полосы с каждого торца)
+            glLineWidth(1.6f);
+            glColor4ub(240, 245, 240, 190);
+            glBegin(GL_LINES);
+            for (int k = -1; k <= 1; k++)
+            {
+                double side = k * W * 0.22;
+                double[] t0a = P(-L * 0.47, side);
+                double[] t0b = P(-L * 0.40, side);
+                double[] t1a = P(L * 0.40, side);
+                double[] t1b = P(L * 0.47, side);
+                glVertex3d(t0a[0], t0a[1], t0a[2]); glVertex3d(t0b[0], t0b[1], t0b[2]);
+                glVertex3d(t1a[0], t1a[1], t1a[2]); glVertex3d(t1b[0], t1b[1], t1b[2]);
+            }
+            glEnd();
+
+            // Перрон сбоку от середины полосы
+            double pW = W * 1.9, pL = L * 0.22;
+            double[] q0 = P(-pL * 0.5, W * 0.5 + W * 0.25);
+            double[] q1 = P(pL * 0.5, W * 0.5 + W * 0.25);
+            double[] q2 = P(pL * 0.5, W * 0.5 + W * 0.25 + pW);
+            double[] q3 = P(-pL * 0.5, W * 0.5 + W * 0.25 + pW);
+            glBegin(GL_QUADS);
+            glColor4ub(64, 68, 70, 215);
+            glVertex3d(q0[0], q0[1], q0[2]);
+            glVertex3d(q1[0], q1[1], q1[2]);
+            glVertex3d(q2[0], q2[1], q2[2]);
+            glVertex3d(q3[0], q3[1], q3[2]);
+            glEnd();
+            glColor4ub(170, 180, 176, 130);
+            glBegin(GL_LINE_LOOP);
+            glVertex3d(q0[0], q0[1], q0[2]);
+            glVertex3d(q1[0], q1[1], q1[2]);
+            glVertex3d(q2[0], q2[1], q2[2]);
+            glVertex3d(q3[0], q3[1], q3[2]);
+            glEnd();
+        }
+    }
+
+    // Параллелепипед в мировых километрах. yawRad: 0 — «нос» на север (-Z).
+    // Грани затеняются вручную — фиксированный конвейер OpenGL без освещения.
+    private static void DrawBox3D(double cx, double cy, double cz,
+        double sx, double sy, double sz, double yawRad, byte r, byte g, byte b, byte a)
+    {
+        double hx = sx * 0.5, hy = sy * 0.5, hz = sz * 0.5;
+        double ch = Math.Cos(yawRad), sh = Math.Sin(yawRad);
+        Func<double, double, double, double[]> w = (lx, ly, lz) => new double[]
+        {
+            cx + lx * ch + lz * sh,
+            cy + ly,
+            cz + lx * sh - lz * ch
+        };
+        double[] b0 = w(-hx, -hy, -hz), b1 = w(hx, -hy, -hz), b2 = w(hx, -hy, hz), b3 = w(-hx, -hy, hz);
+        double[] t0 = w(-hx, hy, -hz), t1 = w(hx, hy, -hz), t2 = w(hx, hy, hz), t3 = w(-hx, hy, hz);
+
+        glBegin(GL_QUADS);
+        glColor4ub((byte)Math.Min(255, r + 22), (byte)Math.Min(255, g + 22), (byte)Math.Min(255, b + 22), a);
+        glVertex3d(t0[0], t0[1], t0[2]); glVertex3d(t1[0], t1[1], t1[2]); glVertex3d(t2[0], t2[1], t2[2]); glVertex3d(t3[0], t3[1], t3[2]);
+
+        glColor4ub((byte)(r * 0.45), (byte)(g * 0.45), (byte)(b * 0.45), a);
+        glVertex3d(b3[0], b3[1], b3[2]); glVertex3d(b2[0], b2[1], b2[2]); glVertex3d(b1[0], b1[1], b1[2]); glVertex3d(b0[0], b0[1], b0[2]);
+
+        glColor4ub((byte)(r * 0.90), (byte)(g * 0.90), (byte)(b * 0.90), a);
+        glVertex3d(b2[0], b2[1], b2[2]); glVertex3d(t2[0], t2[1], t2[2]); glVertex3d(t3[0], t3[1], t3[2]); glVertex3d(b3[0], b3[1], b3[2]);
+
+        glColor4ub((byte)(r * 0.65), (byte)(g * 0.65), (byte)(b * 0.65), a);
+        glVertex3d(b0[0], b0[1], b0[2]); glVertex3d(t0[0], t0[1], t0[2]); glVertex3d(t1[0], t1[1], t1[2]); glVertex3d(b1[0], b1[1], b1[2]);
+
+        glColor4ub((byte)(r * 0.78), (byte)(g * 0.78), (byte)(b * 0.78), a);
+        glVertex3d(b3[0], b3[1], b3[2]); glVertex3d(t3[0], t3[1], t3[2]); glVertex3d(t0[0], t0[1], t0[2]); glVertex3d(b0[0], b0[1], b0[2]);
+
+        glColor4ub((byte)(r * 0.84), (byte)(g * 0.84), (byte)(b * 0.84), a);
+        glVertex3d(b1[0], b1[1], b1[2]); glVertex3d(t1[0], t1[1], t1[2]); glVertex3d(t2[0], t2[1], t2[2]); glVertex3d(b2[0], b2[1], b2[2]);
+        glEnd();
+    }
+
+    // Наземка/корабль: вместо безликой пирамиды — узнаваемый силуэт по типу юнита.
+    private void DrawGroundUnit3D(DebriefSession s, DebriefEntity ent, DebriefSample cur,
+        byte cr, byte cg, byte cb, double distKm, double curT)
+    {
+        double gz = Math.Max(cur.Alt, s.GetGroundAltitudeAt(cur.X, cur.Y));
+        double bx = cur.X * 0.001, by = gz * 0.001, bz = -cur.Y * 0.001;
+        double sc = Math.Max(0.05, Math.Min(0.35, distKm * 0.010));
+        double yaw = cur.Heading * Math.PI / 180.0;
+        double fwdX = Math.Sin(yaw), fwdZ = -Math.Cos(yaw);
+        double rgtX = Math.Cos(yaw), rgtZ = Math.Sin(yaw);
+        string nm = ent.Name ?? "";
+        Func<string, bool> has = (kw) => nm.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0;
+
+        bool isSea = ent.Class == "Sea" || has("Ship") || has("Cruiser") || has("Carrier") ||
+                     has("Boat") || has("Destroyer") || has("Frigate");
+        bool isRadar = !isSea && (has("Radar") || has("Watchman") || has("EWR"));
+        bool isSam = !isSea && !isRadar && (ent.RoleTag == "SAM" || has("SAM") || has("SAAW") ||
+                     has("SLAM") || has("SRAD") || has("CIWS") || has("Phalanx") || has("C-RAM") ||
+                     has("VLS") || has("Launcher") || has("Turret") || has("Anti-Air") || has("MANPADS"));
+        bool isArmor = !isSea && !isRadar && !isSam && (has("Tank") || has("IFV") || has("APC"));
+        bool isArty = !isSea && !isRadar && !isSam && !isArmor && (has("Artillery") || has("Howitzer") || has("Mortar"));
+        bool isTruck = !isSea && !isRadar && !isSam && !isArmor && !isArty &&
+                       (has("Truck") || has("Supply") || has("Logistic") || has("Transport"));
+
+        if (isSea)
+        {
+            double L = 1.70 * sc, W = 0.42 * sc, H = 0.20 * sc;
+            DrawBox3D(bx, by + H * 0.5, bz, W, H, L, yaw, cr, cg, cb, 245);
+            // Надстройка ближе к носу
+            DrawBox3D(bx + fwdX * L * 0.12, by + H + 0.13 * sc, bz + fwdZ * L * 0.12,
+                W * 0.55, 0.26 * sc, L * 0.28, yaw, cr, cg, cb, 245);
+            // Мачта
+            DrawBox3D(bx + fwdX * L * 0.10, by + H + 0.38 * sc, bz + fwdZ * L * 0.10,
+                0.045 * sc, 0.42 * sc, 0.045 * sc, yaw, cr, cg, cb, 235);
+            // Палуба/полоса
+            DrawBox3D(bx - fwdX * L * 0.22, by + H + 0.03 * sc, bz - fwdZ * L * 0.22,
+                W * 0.72, 0.035 * sc, L * 0.34, yaw, (byte)Math.Min(255, cr + 20), (byte)Math.Min(255, cg + 20), (byte)Math.Min(255, cb + 20), 240);
+            return;
+        }
+
+        if (isRadar)
+        {
+            DrawBox3D(bx, by + 0.10 * sc, bz, 0.55 * sc, 0.20 * sc, 0.55 * sc, yaw, cr, cg, cb, 245);
+            DrawBox3D(bx, by + 0.30 * sc, bz, 0.30 * sc, 0.22 * sc, 0.30 * sc, yaw, cr, cg, cb, 245);
+            DrawBox3D(bx, by + 0.56 * sc, bz, 0.05 * sc, 0.38 * sc, 0.05 * sc, yaw, cr, cg, cb, 235);
+            // Вращающаяся антенна-тарелка
+            double dishYaw = curT * 1.35 + (ent.Id != null ? ent.Id.Length : 0);
+            DrawBox3D(bx, by + 0.78 * sc, bz, 0.50 * sc, 0.07 * sc, 0.15 * sc, dishYaw, cr, cg, cb, 240);
+            return;
+        }
+
+        if (isSam)
+        {
+            DrawBox3D(bx, by + 0.09 * sc, bz, 0.55 * sc, 0.18 * sc, 0.95 * sc, yaw, cr, cg, cb, 245);
+            DrawBox3D(bx - fwdX * 0.30 * sc, by + 0.23 * sc, bz - fwdZ * 0.30 * sc,
+                0.32 * sc, 0.20 * sc, 0.28 * sc, yaw, cr, cg, cb, 245);
+            // Три транспортно-пусковых контейнера
+            for (int i = -1; i <= 1; i++)
+            {
+                DrawBox3D(bx + fwdX * 0.16 * sc + rgtX * i * 0.14 * sc,
+                          by + 0.40 * sc,
+                          bz + fwdZ * 0.16 * sc + rgtZ * i * 0.14 * sc,
+                          0.10 * sc, 0.38 * sc, 0.55 * sc, yaw, cr, cg, cb, 250);
+            }
+            return;
+        }
+
+        if (isArmor)
+        {
+            DrawBox3D(bx, by + 0.10 * sc, bz, 0.34 * sc, 0.16 * sc, 0.72 * sc, yaw, cr, cg, cb, 245);
+            DrawBox3D(bx + rgtX * 0.19 * sc, by + 0.07 * sc, bz + rgtZ * 0.19 * sc,
+                0.10 * sc, 0.12 * sc, 0.76 * sc, yaw, (byte)(cr * 0.5), (byte)(cg * 0.5), (byte)(cb * 0.5), 245);
+            DrawBox3D(bx - rgtX * 0.19 * sc, by + 0.07 * sc, bz - rgtZ * 0.19 * sc,
+                0.10 * sc, 0.12 * sc, 0.76 * sc, yaw, (byte)(cr * 0.5), (byte)(cg * 0.5), (byte)(cb * 0.5), 245);
+            DrawBox3D(bx, by + 0.23 * sc, bz, 0.24 * sc, 0.14 * sc, 0.28 * sc, yaw, cr, cg, cb, 250);
+            DrawBox3D(bx + fwdX * 0.36 * sc, by + 0.25 * sc, bz + fwdZ * 0.36 * sc,
+                0.04 * sc, 0.04 * sc, 0.52 * sc, yaw, cr, cg, cb, 240);
+            return;
+        }
+
+        if (isArty)
+        {
+            DrawBox3D(bx, by + 0.09 * sc, bz, 0.46 * sc, 0.16 * sc, 0.58 * sc, yaw, cr, cg, cb, 245);
+            DrawBox3D(bx - fwdX * 0.18 * sc, by + 0.22 * sc, bz - fwdZ * 0.18 * sc,
+                0.26 * sc, 0.16 * sc, 0.24 * sc, yaw, cr, cg, cb, 245);
+            // Длинный ствол
+            DrawBox3D(bx + fwdX * 0.48 * sc, by + 0.30 * sc, bz + fwdZ * 0.48 * sc,
+                0.045 * sc, 0.045 * sc, 0.85 * sc, yaw, cr, cg, cb, 240);
+            return;
+        }
+
+        if (isTruck)
+        {
+            DrawBox3D(bx, by + 0.10 * sc, bz, 0.34 * sc, 0.16 * sc, 0.85 * sc, yaw, cr, cg, cb, 245);
+            DrawBox3D(bx + fwdX * 0.30 * sc, by + 0.24 * sc, bz + fwdZ * 0.30 * sc,
+                0.30 * sc, 0.20 * sc, 0.22 * sc, yaw, cr, cg, cb, 245);
+            DrawBox3D(bx - fwdX * 0.18 * sc, by + 0.26 * sc, bz - fwdZ * 0.18 * sc,
+                0.32 * sc, 0.24 * sc, 0.42 * sc, yaw, cr, cg, cb, 245);
+            return;
+        }
+
+        // Здание/укрепление/прочее
+        DrawBox3D(bx, by + 0.22 * sc, bz, 0.55 * sc, 0.44 * sc, 0.55 * sc, yaw, cr, cg, cb, 245);
+        DrawBox3D(bx, by + 0.47 * sc, bz, 0.62 * sc, 0.06 * sc, 0.62 * sc, yaw,
+            (byte)(cr * 0.8), (byte)(cg * 0.8), (byte)(cb * 0.8), 240);
+    }
+
+    // Объёмный конус помех NOISE. Ось и углы — из реальной модели RadarJammer:
+    // относительный сигнал = cos(theta)^8, поэтому границы 10% и 50% считаются
+    // через JammerModel.AngleForLevel. Поверхность прижимается к рельефу.
+    private void DrawNoiseCone(DebriefSession s, double ox, double oy, double oz,
+        double dirX, double dirY, double dirZ, double lenMeters, double curT)
+    {
+        double alen = Math.Sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+        if (alen < 1e-6) return;
+        double ax = dirX / alen, ay = dirY / alen, az = dirZ / alen;
+
+        double hx = Math.Abs(ax) < 0.9 ? 1.0 : 0.0;
+        double hz = Math.Abs(ax) < 0.9 ? 0.0 : 1.0;
+        double uX = ay * hz, uY = az * hx - ax * hz, uZ = -ay * hx;
+        double ul = Math.Sqrt(uX * uX + uY * uY + uZ * uZ);
+        if (ul < 1e-6) return;
+        uX /= ul; uY /= ul; uZ /= ul;
+        double vX = ay * uZ - az * uY;
+        double vY = az * uX - ax * uZ;
+        double vZ = ax * uY - ay * uX;
+
+        double lenM = Math.Min(lenMeters, JammerModel.NoiseConeRangeM);
+        if (lenM < 600.0) return;
+        double tanOuter = Math.Tan(JammerModel.NoiseConeHalfAngleDeg * Math.PI / 180.0);
+        double pulse = 0.5 + 0.5 * Math.Sin(curT * 1.6);
+
+        Func<double, double, double, double[]> pt = (frac, ang, tanA) =>
+        {
+            double d = frac * lenM;
+            double r = d * tanA;
+            double ca = Math.Cos(ang), sa = Math.Sin(ang);
+            double wx = ox + ax * d + (uX * ca + vX * sa) * r;
+            double wy = oy + ay * d + (uY * ca + vY * sa) * r;
+            double wz = oz + az * d + (uZ * ca + vZ * sa) * r;
+            return new double[] { wx, wy, wz };
+        };
+
+        const int rings = 8;
+        const int segs = 20;
+
+        // Только конус: полупрозрачная поверхность сильного подавления
+        glDepthMask(false);
+        DrawConeSurface(pt, rings, segs, tanOuter, 150, 90, 255, (int)(10 + 8 * pulse));
+
+        // Шум внутри конуса. Яркость штриха пропорциональна реальному сигналу
+        // подавления cos(theta)^8, поэтому помехи гуще у оси и у источника,
+        // а к кромке конуса и вдаль затухают.
+        glLineWidth(1.0f);
+        glBegin(GL_LINES);
+        for (int i = 0; i < 320; i++)
+        {
+            double h1 = Hash01(i * 3 + 1);
+            double h2 = Hash01(i * 3 + 2);
+            double h3 = Hash01(i * 3 + 3);
+
+            double frac = 0.05 + 0.95 * h1;      // положение вдоль оси
+            double radial = Math.Sqrt(h2);        // 0 — ось, 1 — кромка
+            double ang = h3 * 2.0 * Math.PI;
+
+            double d = frac * lenM;
+            double r = radial * d * tanOuter;
+            double cosT = 1.0 / Math.Sqrt(1.0 + radial * radial * tanOuter * tanOuter);
+            double sig = Math.Pow(cosT, 8.0);
+            double flick = 0.30 + 0.70 * (0.5 + 0.5 * Math.Sin(curT * 17.0 + h2 * 40.0));
+            int alpha = (int)(16.0 + 165.0 * sig * flick * (1.0 - 0.35 * frac));
+            if (alpha < 7) continue;
+
+            double ca = Math.Cos(ang), sa = Math.Sin(ang);
+            double bx = ox + ax * d + (uX * ca + vX * sa) * r;
+            double by = oy + ay * d + (uY * ca + vY * sa) * r;
+            double bz = oz + az * d + (uZ * ca + vZ * sa) * r;
+
+            double segLen = Math.Max(300.0, d * 0.020);
+            double tAng = h1 * 6.283185307;
+            double tcx = Math.Cos(tAng), tsx = Math.Sin(tAng);
+            double ex = bx + (uX * tcx + vX * tsx) * segLen;
+            double ey = by + (uY * tcx + vY * tsx) * segLen;
+            double ez = bz + (uZ * tcx + vZ * tsx) * segLen;
+
+            glColor4ub(205, 135, 255, (byte)Math.Min(235, alpha));
+            glVertex3d(bx * 0.001, bz * 0.001, -by * 0.001);
+            glVertex3d(ex * 0.001, ez * 0.001, -ey * 0.001);
+        }
+        glEnd();
+        glDepthMask(true);
+
+        // Кромка конуса и образующие
+        glLineWidth(1.2f);
+        glColor4ub(205, 130, 255, (byte)(60 + 25 * pulse));
+        glBegin(GL_LINE_LOOP);
+        for (int j = 0; j < segs; j++)
+        {
+            double[] p = pt(1.0, j * 2.0 * Math.PI / segs, tanOuter);
+            glVertex3d(p[0] * 0.001, p[2] * 0.001, -p[1] * 0.001);
+        }
+        glEnd();
+
+        glLineWidth(1.0f);
+        glColor4ub(195, 120, 255, (byte)(34 + 18 * pulse));
+        glBegin(GL_LINES);
+        for (int j = 0; j < 6; j++)
+        {
+            double a = j * Math.PI / 3.0;
+            double[] p0 = pt(0.0, a, tanOuter);
+            double[] p1 = pt(1.0, a, tanOuter);
+            glVertex3d(p0[0] * 0.001, p0[2] * 0.001, -p0[1] * 0.001);
+            glVertex3d(p1[0] * 0.001, p1[2] * 0.001, -p1[1] * 0.001);
+        }
+        glEnd();
+
+        // Ось антенны
+        glLineWidth(1.4f);
+        glColor4ub(225, 150, 255, (byte)(70 + 25 * pulse));
+        glBegin(GL_LINES);
+        double[] o0 = pt(0.0, 0.0, 0.0);
+        double[] o1 = pt(1.0, 0.0, 0.0);
+        glVertex3d(o0[0] * 0.001, o0[2] * 0.001, -o0[1] * 0.001);
+        glVertex3d(o1[0] * 0.001, o1[2] * 0.001, -o1[1] * 0.001);
+        glEnd();
+    }
+
+    // Детерминированный псевдослучайный шум 0..1 для визуализации помех
+    private static double Hash01(int k)
+    {
+        unchecked
+        {
+            uint x = (uint)(k * 747796405 + 2891336453);
+            x ^= x >> 15;
+            x *= 2246822519u;
+            x ^= x >> 13;
+            x *= 3266489917u;
+            x ^= x >> 16;
+            return (x & 0xFFFFFF) / 16777216.0;
+        }
+    }
+
+    private static void DrawConeSurface(Func<double, double, double, double[]> pt,
+        int rings, int segs, double tanA, byte r, byte g, byte b, int alpha)
+    {
+        glBegin(GL_QUADS);
+        for (int i = 0; i < rings; i++)
+        {
+            double f0 = (double)i / rings;
+            double f1 = (double)(i + 1) / rings;
+            int a = Math.Max(0, Math.Min(255, alpha - (int)(f0 * alpha * 0.45)));
+            glColor4ub(r, g, b, (byte)a);
+            for (int j = 0; j < segs; j++)
+            {
+                double a0 = j * 2.0 * Math.PI / segs;
+                double a1 = (j + 1) * 2.0 * Math.PI / segs;
+                double[] p00 = pt(f0, a0, tanA);
+                double[] p01 = pt(f0, a1, tanA);
+                double[] p11 = pt(f1, a1, tanA);
+                double[] p10 = pt(f1, a0, tanA);
+                glVertex3d(p00[0] * 0.001, p00[2] * 0.001, -p00[1] * 0.001);
+                glVertex3d(p01[0] * 0.001, p01[2] * 0.001, -p01[1] * 0.001);
+                glVertex3d(p11[0] * 0.001, p11[2] * 0.001, -p11[1] * 0.001);
+                glVertex3d(p10[0] * 0.001, p10[2] * 0.001, -p10[1] * 0.001);
+            }
+        }
+        glEnd();
+    }
+
     private void RenderZeroFlickerHudTexture(
     int w, int h, DebriefSession s, double cx, double cy, double groundCamAlt, double distKm, double yaw, double pitch,
     List<Tuple<string, string, PointF, Color>> arlLabels, Dictionary<string, string> jammedTargets)
@@ -990,6 +1634,19 @@ public class OpenGLRadarControl : Control
                         PointF pSp = Project3DToScreen(poi.X, poi.Y, pz, cx, cy, groundCamAlt, distKm, yaw, pitch, w, h);
                         Color pc = poi.Kind == "Bullseye" ? Color.Gold : (poi.Coalition == "Enemies" ? Color.FromArgb(255, 155, 35) : Color.DeepSkyBlue);
                         drawBadge("poi_" + pIdx, poi.Label, wpnFont, pc, pc, pSp.X, pSp.Y, false);
+                    }
+                }
+
+                // 0.1 Подписи восстановленных аэродромов
+                if (s.Airfields != null)
+                {
+                    for (int ai = 0; ai < s.Airfields.Count; ai++)
+                    {
+                        MapPoiMarker af = s.Airfields[ai];
+                        double az = s.GetGroundAltitudeAt(af.X, af.Y);
+                        PointF ap = Project3DToScreen(af.X, af.Y, az, cx, cy, groundCamAlt, distKm, yaw, pitch, w, h);
+                        drawBadge("af_" + ai, "🛫 " + af.Label, wpnFont,
+                            Color.FromArgb(225, 220, 230), Color.FromArgb(170, 200, 215), ap.X, ap.Y, false);
                     }
                 }
 

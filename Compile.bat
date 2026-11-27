@@ -39,6 +39,8 @@ copy /Y "%PROJ%\icon.ico" . >nul
   /resource:%ASSETS%\Sounds\6_monsterkill.mp3,6_monsterkill.mp3 ^
   /resource:%ASSETS%\Sounds\7_ludicrouskill.mp3,7_ludicrouskill.mp3 ^
   /resource:%ASSETS%\Sounds\8_holyshit.mp3,8_holyshit.mp3 ^
+  /resource:%ASSETS%\Sounds\JAMMER_ON.mp3,JAMMER_ON.mp3 ^
+  /resource:%ASSETS%\Sounds\JAMMER_CONTINUOUS.mp3,JAMMER_CONTINUOUS.mp3 ^
   %PROJ%\Core\*.cs %PROJ%\Audio\*.cs %PROJ%\Workshop\*.cs ^
   %PROJ%\Viewer\*.cs %PROJ%\App\*.cs %PROJ%\Debrief\*.cs
 

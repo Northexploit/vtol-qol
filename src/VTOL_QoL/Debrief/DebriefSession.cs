@@ -40,19 +40,32 @@ public class DebriefSession
     public double MapMinX;
     public double MapMinY;
     public double MapSizeMeters;
+    // Heightmap не всегда покрывает всю карту: на больших картах она может занимать
+    // только один квадрант. Поэтому у рельефа свои границы.
+    public double TerrainMinX;
+    public double TerrainMinY;
+    public double TerrainSizeMeters;
 
     public double GetGroundAltitudeAt(double wx, double wy)
     {
-        if (TerrainHeights == null || MapSizeMeters <= 100.0) return 0.0;
-        int n = TerrainHeights.GetLength(0);
-        double u = (wx - MapMinX) / MapSizeMeters;
-        double v = (wy - MapMinY) / MapSizeMeters;
+        if (TerrainHeights == null) return 0.0;
+        double tMinX = TerrainSizeMeters > 100.0 ? TerrainMinX : MapMinX;
+        double tMinY = TerrainSizeMeters > 100.0 ? TerrainMinY : MapMinY;
+        double tSize = TerrainSizeMeters > 100.0 ? TerrainSizeMeters : MapSizeMeters;
+        if (tSize <= 100.0) return 0.0;
+        // Высотная карта может быть не квадратной: X и Y масштабируются независимо,
+        // иначе рельеф «съезжает» по одной из осей.
+        int nW = TerrainHeights.GetLength(0);
+        int nH = TerrainHeights.GetLength(1);
+        if (nW < 2 || nH < 2) return 0.0;
+        double u = (wx - tMinX) / tSize;
+        double v = (wy - tMinY) / tSize;
         if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) return 0.0;
 
-        double fx = u * (n - 1);
-        double fy = v * (n - 1);
-        int x0 = Math.Max(0, Math.Min(n - 2, (int)fx));
-        int y0 = Math.Max(0, Math.Min(n - 2, (int)fy));
+        double fx = u * (nW - 1);
+        double fy = v * (nH - 1);
+        int x0 = Math.Max(0, Math.Min(nW - 2, (int)fx));
+        int y0 = Math.Max(0, Math.Min(nH - 2, (int)fy));
         double tx = fx - x0;
         double ty = fy - y0;
 
@@ -64,6 +77,8 @@ public class DebriefSession
         return (h00 * (1.0 - tx) + h10 * tx) * (1.0 - ty) + (h01 * (1.0 - tx) + h11 * tx) * ty;
     }
     public List<MapPoiMarker> MapMarkers = new List<MapPoiMarker>();
+    // Аэродромы, восстановленные по взлётам/посадкам бортов (в .vtr их нет)
+    public List<MapPoiMarker> Airfields = new List<MapPoiMarker>();
 
     public List<DebriefEntity> Entities = new List<DebriefEntity>();
     public List<TacticalBeam> Beams = new List<TacticalBeam>();

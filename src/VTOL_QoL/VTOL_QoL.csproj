@@ -47,6 +47,8 @@
     <EmbeddedResource Include="Assets\Sounds\6_monsterkill.mp3" Condition="Exists('Assets\Sounds\6_monsterkill.mp3')" LogicalName="6_monsterkill.mp3" />
     <EmbeddedResource Include="Assets\Sounds\7_ludicrouskill.mp3" Condition="Exists('Assets\Sounds\7_ludicrouskill.mp3')" LogicalName="7_ludicrouskill.mp3" />
     <EmbeddedResource Include="Assets\Sounds\8_holyshit.mp3" Condition="Exists('Assets\Sounds\8_holyshit.mp3')" LogicalName="8_holyshit.mp3" />
+    <EmbeddedResource Include="Assets\Sounds\JAMMER_ON.mp3" Condition="Exists('Assets\Sounds\JAMMER_ON.mp3')" LogicalName="JAMMER_ON.mp3" />
+    <EmbeddedResource Include="Assets\Sounds\JAMMER_CONTINUOUS.mp3" Condition="Exists('Assets\Sounds\JAMMER_CONTINUOUS.mp3')" LogicalName="JAMMER_CONTINUOUS.mp3" />
   </ItemGroup>
 
   <ItemGroup>
