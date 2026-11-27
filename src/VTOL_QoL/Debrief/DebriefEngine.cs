@@ -3020,22 +3020,24 @@ public static class DebriefEngine
                     isGround = entTypeCode == 2 || entTypeCode == 3 || entTypeCode == 4 || entTypeCode == 5;
                 }
 
-                bool isExplicitAlly = isMe ||
-                      name.IndexOf("Allied", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                      name.IndexOf("TasherMan", StringComparison.OrdinalIgnoreCase) >= 0;
-                bool isExplicitEnemy = !isExplicitAlly && (
-                                       IsEnemyUnitType(name) ||
-                                       name.IndexOf("aerograch", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       name.IndexOf("moso", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       name.IndexOf("arnie", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       name.IndexOf("idk", StringComparison.OrdinalIgnoreCase) >= 0);
-
-                // entityType: чётные = сторона A (союзники), нечётные = сторона B (противник)
+                // Сторона юнита берётся ТОЛЬКО из entityType файла реплея (см. Actor::StartRecordingReplay:
+                // тип = базовый + (team==Enemy ? 1 : 0), базы 0/2/4/6/7 для Air/Ground/Sea/Missile/Chopper).
+                // Никаких эвристик по никам и названиям — в PvP они врут.
                 string coalition;
-                if (entTypeCode >= 0 && entTypeCode != 6)
-                    coalition = (entTypeCode % 2 == 0) ? "Allies" : "Enemies";
+                if (entTypeCode >= 0)
+                {
+                    switch (entTypeCode)
+                    {
+                        case 0: case 2: case 4: case 7: coalition = "Allies"; break;
+                        case 1: case 3: case 5: case 8: coalition = "Enemies"; break;
+                        default: coalition = "Neutral"; break;
+                    }
+                }
                 else
-                    coalition = isExplicitEnemy ? "Enemies" : "Allies";
+                {
+                    // Фолбэк: для каких-то редких случаев без entityType.
+                    coalition = "Neutral";
+                }
 
                 string unitType = isMissile ? "Missile" : (isGround ? "Ground" : "Air");
                 string unitClass = isMissile ? "Missile"
@@ -3198,36 +3200,11 @@ public static class DebriefEngine
                 }
             }
 
-            // 1. Определяем базовую точку спавна игрока и центр вражеской базы для 100% точного разделения свой/чужой на любой карте!
-            double myBaseX = double.NaN, myBaseY = double.NaN;
-            double enemySumX = 0, enemySumY = 0;
-            int enemyCount = 0;
+            // В нативном .vtr коалиция определена выше по entityType (чётность = сторона).
+            // Пространственный хук из .rep-лога здесь не нужен и ломает данные — убран.
+            // SAM-маркеры всё ещё добавляем.
             foreach (DebriefEntity e in session.Entities)
             {
-                if (e.Type == "Missile" || e.Track.Count == 0) continue;
-                DebriefSample fs = e.Track[0];
-                if (e.IsPlayer && double.IsNaN(myBaseX)) { myBaseX = fs.X; myBaseY = fs.Y; }
-                if (e.Coalition == "Enemies") { enemySumX += fs.X; enemySumY += fs.Y; enemyCount++; }
-            }
-            double enemyBaseX = enemyCount > 0 ? (enemySumX / enemyCount) : double.NaN;
-            double enemyBaseY = enemyCount > 0 ? (enemySumY / enemyCount) : double.NaN;
-
-            foreach (DebriefEntity e in session.Entities)
-            {
-                if (e.Type == "Missile" || e.Track.Count == 0) continue;
-                bool isProtectedAlly = e.IsPlayer ||
-                                       e.Name.IndexOf("Allied", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                       e.Name.IndexOf("TasherMan", StringComparison.OrdinalIgnoreCase) >= 0;
-                if (!isProtectedAlly && !double.IsNaN(myBaseX) && !double.IsNaN(enemyBaseX))
-                {
-                    DebriefSample fs = e.Track[0];
-                    double distToMe = Math.Sqrt(Math.Pow(fs.X - myBaseX, 2) + Math.Pow(fs.Y - myBaseY, 2));
-                    double distToEnemy = Math.Sqrt(Math.Pow(fs.X - enemyBaseX, 2) + Math.Pow(fs.Y - enemyBaseY, 2));
-                    // Если юнит/корабль/ЗРК/игрок появился на вражеской половине карты — он противник!
-                    if (distToEnemy < distToMe * 0.85)
-                        e.Coalition = "Enemies";
-                }
-
                 if (e.Type == "Ground" && DetectUnitRole(e.Name) == "SAM")
                 {
                     DebriefSample fs = e.Track[0];
@@ -3243,24 +3220,39 @@ public static class DebriefEngine
                 }
             }
 
-            // 2. Определяем носителя каждой ракеты по ближайшему борту/ЗРК/кораблю в точке пуска (3D)
+            // 2. Коалиция ракеты — от носителя. В файле у ракет entityType = 6 без стороны,
+            // поэтому берём родителя (parent id из реплея), иначе ближайший борт/ЗРК/корабль
+            // в точке пуска: ракета физически стартует с носителя.
             foreach (DebriefEntity msl in session.Entities)
             {
                 if (msl.Type != "Missile" || msl.Track.Count == 0) continue;
                 DebriefSample mStart = msl.Track[0];
 
                 DebriefEntity bestLauncher = null;
-                double bestDist = 1500.0;
-                foreach (DebriefEntity cand in session.Entities)
+                int mslNumId;
+                if (msl.Id != null && msl.Id.StartsWith("vtr_") &&
+                    int.TryParse(msl.Id.Substring(4), out mslNumId))
                 {
-                    if (cand == msl || cand.Type == "Missile") continue;
-                    DebriefSample cPos = cand.GetStateAt(msl.FirstTime);
-                    if (cPos == null) continue;
-                    double d = Math.Sqrt(Math.Pow(cPos.X - mStart.X, 2) + Math.Pow(cPos.Y - mStart.Y, 2) + Math.Pow(cPos.Alt - mStart.Alt, 2));
-                    if (d < bestDist)
+                    int parentId;
+                    if (idToParentId.TryGetValue(mslNumId, out parentId))
+                        idToEntity.TryGetValue(parentId, out bestLauncher);
+                }
+
+                if (bestLauncher == null || bestLauncher.Type == "Missile")
+                {
+                    bestLauncher = null;
+                    double bestDist = 4000.0;
+                    foreach (DebriefEntity cand in session.Entities)
                     {
-                        bestDist = d;
-                        bestLauncher = cand;
+                        if (cand == msl || cand.Type == "Missile") continue;
+                        DebriefSample cPos = cand.GetStateAt(msl.FirstTime);
+                        if (cPos == null) continue;
+                        double d = Math.Sqrt(Math.Pow(cPos.X - mStart.X, 2) + Math.Pow(cPos.Y - mStart.Y, 2) + Math.Pow(cPos.Alt - mStart.Alt, 2));
+                        if (d < bestDist)
+                        {
+                            bestDist = d;
+                            bestLauncher = cand;
+                        }
                     }
                 }
 
@@ -3433,8 +3425,7 @@ public static class DebriefEngine
                             idToEntity.TryGetValue(targetId, out dstEnt);
                             if (dstEnt == null) continue;
 
-                            if (dstEnt.Coalition == "Allies" && srcEnt.Coalition != "Allies")
-                                srcEnt.Coalition = "Enemies";
+                            // Коалиция обоих уже известна из entityType — не переопределяем.
 
                             float endKt = (float)Math.Min(srcEnt.LastTime, dstEnt.LastTime);
                             if (k + 1 < kfList.Count && kfList[k + 1] != null)

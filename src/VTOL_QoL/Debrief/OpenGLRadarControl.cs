@@ -802,9 +802,10 @@ public class OpenGLRadarControl : Control
                 DebriefSample cur = ent.GetStateAt(curT);
                 if (cur == null) continue;
                 bool isMine = ent.IsPlayer || (ent.Type == "Missile" && ent.Pilot != null && ent.Pilot.StartsWith("MY_MISSILE:"));
-                byte cr = isMine ? (byte)65 : (ent.Coalition == "Enemies" ? (byte)255 : (byte)40);
-                byte cg = isMine ? (byte)255 : (ent.Coalition == "Enemies" ? (byte)155 : (byte)200);
-                byte cb = isMine ? (byte)95 : (ent.Coalition == "Enemies" ? (byte)40 : (byte)255);
+                bool isNeutral = ent.Coalition == "Neutral";
+                byte cr = isMine ? (byte)65 : (isNeutral ? (byte)185 : (ent.Coalition == "Enemies" ? (byte)255 : (byte)40));
+                byte cg = isMine ? (byte)255 : (isNeutral ? (byte)185 : (ent.Coalition == "Enemies" ? (byte)155 : (byte)200));
+                byte cb = isMine ? (byte)95 : (isNeutral ? (byte)185 : (ent.Coalition == "Enemies" ? (byte)40 : (byte)255));
                 if (ent.Type == "Ground")
                 {
                     DrawGroundUnit3D(s, ent, cur, cr, cg, cb, distKm, curT);
@@ -1848,7 +1849,7 @@ public class OpenGLRadarControl : Control
                 if (activeSample != null)
                 {
                     double mach = activeSample.Speed / 315.0;
-                    string role = activeTracked.IsPlayer ? "[ВЫ]" : (activeTracked.Coalition == "Allies" ? "[СОЮЗ]" : "[ВРАГ]");
+                    string role = activeTracked.IsPlayer ? "[ВЫ]" : (activeTracked.Coalition == "Allies" ? "[СОЮЗ]" : (activeTracked.Coalition == "Enemies" ? "[ВРАГ]" : "[?]"));
                     using (SolidBrush b1 = new SolidBrush(Color.FromArgb(225, 240, 230)))
                         g.DrawString(string.Format("БОРТ {0}: {1}", role, activeTracked.Name), wpnFont, b1, 22, cyHud);
                     using (SolidBrush b2 = new SolidBrush(Color.FromArgb(170, 235, 195)))

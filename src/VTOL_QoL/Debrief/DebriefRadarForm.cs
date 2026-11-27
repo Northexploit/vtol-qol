@@ -945,7 +945,7 @@ public class DebriefRadarForm : Form
             {
                 if (ent.Type == "Air")
                 {
-                    string side = ent.IsPlayer ? "ВЫ" : (ent.Coalition == "Allies" ? "СОЮЗ" : "ВРАГ");
+                    string side = ent.IsPlayer ? "ВЫ" : (ent.Coalition == "Allies" ? "СОЮЗ" : (ent.Coalition == "Enemies" ? "ВРАГ" : "?"));
                     cmbFollowTarget.Items.Add(string.Format("[{0}] {1} [{2}]", side, ent.Name, ent.Id));
                 }
             }
@@ -2045,9 +2045,11 @@ public class DebriefRadarForm : Form
                 bool isMyMissile = (ent.Type == "Missile" && ent.Pilot != null && ent.Pilot.StartsWith("MY_MISSILE:"));
                 Color col = ent.IsPlayer || isMyMissile
                     ? Color.FromArgb(55, 255, 85)
-                    : (ent.Type == "Missile"
-                        ? (ent.Coalition == "Enemies" ? Color.FromArgb(255, 175, 50) : Color.FromArgb(0, 215, 255))
-                        : (ent.Coalition == "Enemies" ? Color.FromArgb(255, 155, 35) : Color.DeepSkyBlue));
+                    : (ent.Coalition == "Neutral"
+                        ? Color.FromArgb(185, 185, 185)
+                        : (ent.Type == "Missile"
+                            ? (ent.Coalition == "Enemies" ? Color.FromArgb(255, 175, 50) : Color.FromArgb(0, 215, 255))
+                            : (ent.Coalition == "Enemies" ? Color.FromArgb(255, 155, 35) : Color.DeepSkyBlue)));
 
                 if (ent.Type == "Ground")
                 {
@@ -2391,7 +2393,7 @@ new PointF(pos.X - rSize, pos.Y)
             {
                 double mach = activeTrackedSample.Speed / 315.0;
                 string machStr = mach.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
-                string roleTag = activeTracked.IsPlayer ? "[ВЫ]" : (activeTracked.Coalition == "Allies" ? "[СОЮЗ]" : "[ВРАГ]");
+                string roleTag = activeTracked.IsPlayer ? "[ВЫ]" : (activeTracked.Coalition == "Allies" ? "[СОЮЗ]" : (activeTracked.Coalition == "Enemies" ? "[ВРАГ]" : "[?]"));
                 string line1 = string.Format("БОРТ {0}: {1}", roleTag, activeTracked.Name);
                 string line2 = string.Format("HDG {0:000}° · ALT {1:F0}m · {2:F0}km/h (M{3})",
                     activeTrackedSample.Heading, activeTrackedSample.Alt, activeTrackedSample.Speed * 3.6, machStr);
