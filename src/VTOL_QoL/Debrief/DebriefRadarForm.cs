@@ -1816,6 +1816,9 @@ public class DebriefRadarForm : Form
                                     jamDirResolved = true;
                                     double d3 = Math.Sqrt(jamDirX * jamDirX + jamDirY * jamDirY + jamDirZ * jamDirZ);
                                     coneLenM = Math.Min(JammerModel.NoiseConeRangeM, Math.Max(8000.0, d3 * 1.25));
+                                    jammedTargets[noiseTargetId] = string.IsNullOrEmpty(bm.JamBand)
+                                        ? "NOISE"
+                                        : "NOISE (" + bm.JamBand + ")";
                                 }
                                 tx = fx + ux2d * coneLenM;
                                 ty = fy + uy2d * coneLenM;

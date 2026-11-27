@@ -714,6 +714,9 @@ public class OpenGLRadarControl : Control
                                 double d3 = Math.Sqrt(jamDirX * jamDirX + jamDirY * jamDirY + jamDirZ * jamDirZ);
                                 // Конус дотягивается до цели с запасом, но не выходит за предел станции
                                 coneLenM = Math.Min(JammerModel.NoiseConeRangeM, Math.Max(8000.0, d3 * 1.25));
+                                jammedTargets[noiseTargetId] = string.IsNullOrEmpty(bm.JamBand)
+                                    ? "NOISE"
+                                    : "NOISE (" + bm.JamBand + ")";
                             }
 
                             double dl = Math.Sqrt(jamDirX * jamDirX + jamDirY * jamDirY + jamDirZ * jamDirZ);
