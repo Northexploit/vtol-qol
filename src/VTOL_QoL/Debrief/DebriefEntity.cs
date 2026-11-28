@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -21,6 +21,9 @@ public class DebriefEntity
     public string Coalition;  // "Allies", "Enemies", "Neutral"
     public string RoleTag;    // "AWACS", "Tanker", "Fighter", "Bomber", "SAM", "Missile"
     public bool IsPlayer;
+    // Сырой код типа из файла реплея (ReplayEntity.entityType) — для диагностики стороны.
+    // -1 = неизвестно (не нативный .vtr).
+    public int NativeType = -1;
     public double FirstTime = double.MaxValue;
     public double LastTime = double.MinValue;
     public List<DebriefSample> Track = new List<DebriefSample>();

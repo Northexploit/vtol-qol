@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -27,7 +27,17 @@ public static class SettingsManager
     public static void Load()
     {
         string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL");
-        try { Directory.CreateDirectory(dir); } catch { }
+        // Основной каталог недоступен (ограниченный режим, песочница, чужой профиль) —
+        // берём запасной, иначе каждая настройка терялась бы с ошибкой в лог.
+        if (!TryPrepareDirectory(dir))
+        {
+            string alt = Path.Combine(Path.GetTempPath(), "VTOL_QoL");
+            if (TryPrepareDirectory(alt))
+            {
+                AppLogger.Log("SETTINGS", "Каталог " + dir + " недоступен, настройки берутся из " + alt);
+                dir = alt;
+            }
+        }
         filePath = Path.Combine(dir, "settings.ini");
         data.Clear();
         if (File.Exists(filePath))
@@ -51,7 +61,22 @@ public static class SettingsManager
         }
     }
 
+    // Каталог существует и в него действительно можно писать.
+    private static bool TryPrepareDirectory(string dir)
+    {
+        try
+        {
+            Directory.CreateDirectory(dir);
+            string probe = Path.Combine(dir, "write_probe.tmp");
+            File.WriteAllText(probe, "1");
+            File.Delete(probe);
+            return true;
+        }
+        catch { return false; }
+    }
+
     private static readonly object saveLock = new object();
+    private static bool saveErrorLogged = false;
 
     public static void Save()
     {
@@ -74,7 +99,12 @@ public static class SettingsManager
             }
             catch (Exception ex)
             {
-                AppLogger.Error("SETTINGS", "Save", ex);
+                // Повторяющиеся ошибки в лог не сыплем: причина обычно одна и внешняя.
+                if (!saveErrorLogged)
+                {
+                    saveErrorLogged = true;
+                    AppLogger.Error("SETTINGS", "Save (" + filePath + ")", ex);
+                }
                 try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
             }
         }

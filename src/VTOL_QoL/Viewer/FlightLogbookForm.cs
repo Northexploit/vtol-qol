@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -155,7 +155,14 @@ public class FlightLogbookForm : Form
 
         if (File.Exists(path))
         {
-            string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+            string[] lines = null;
+            try { lines = File.ReadAllLines(path, Encoding.UTF8); }
+            catch { lines = null; }
+            if (lines == null)
+            {
+                lblSummary.Text = "Не удалось прочитать журнал (файл занят или недоступен).";
+                return;
+            }
             for (int i = lines.Length - 1; i >= 0; i--)
             {
                 string line = lines[i];

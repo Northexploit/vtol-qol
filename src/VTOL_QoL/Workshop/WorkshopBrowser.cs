@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -312,21 +312,58 @@ public static class WorkshopBrowser
     private static IntPtr GetNativeUgcInterface(string gameRoot, out IntPtr hModOut)
     {
         hModOut = IntPtr.Zero;
-        if (Process.GetProcessesByName("steam").Length == 0) return IntPtr.Zero;
+        if (Process.GetProcessesByName("steam").Length == 0)
+        {
+            AppLogger.Log("WORKSHOP", "Steam API: клиент Steam не запущен");
+            return IntPtr.Zero;
+        }
 
         string dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\x86_64\steam_api64.dll");
         if (!File.Exists(dllPath))
             dllPath = Path.Combine(gameRoot, @"VTOLVR_Data\Plugins\steam_api64.dll");
-        if (!File.Exists(dllPath)) return IntPtr.Zero;
+        if (!File.Exists(dllPath))
+        {
+            AppLogger.Log("WORKSHOP", "Steam API: не найден steam_api64.dll в " + gameRoot);
+            return IntPtr.Zero;
+        }
 
         Environment.SetEnvironmentVariable("SteamAppId", "667970");
         Environment.SetEnvironmentVariable("SteamGameId", "667970");
 
         IntPtr hMod = LoadLibrary(dllPath);
-        if (hMod == IntPtr.Zero) return IntPtr.Zero;
+        if (hMod == IntPtr.Zero)
+        {
+            AppLogger.Log("WORKSHOP", "Steam API: LoadLibrary не удался для " + dllPath);
+            return IntPtr.Zero;
+        }
 
         SteamAPI_InitDelegate fnInit = GetUgcExport<SteamAPI_InitDelegate>(hMod, "SteamAPI_Init");
-        if (fnInit == null || !fnInit()) return IntPtr.Zero;
+        if (fnInit == null)
+        {
+            AppLogger.Log("WORKSHOP", "Steam API: не найдена функция SteamAPI_Init");
+            return IntPtr.Zero;
+        }
+
+        // SteamAPI_Init ищет steam_appid.txt в ТЕКУЩЕЙ папке процесса. Наша папка — папка
+        // программы, а файл лежит в папке игры. Без этого Init молча падает и отписка
+        // от Workshop не работает («прога не чинит»).
+        string prevCwd = null;
+        bool initOk = false;
+        try
+        {
+            try { prevCwd = Directory.GetCurrentDirectory(); } catch { }
+            try { Directory.SetCurrentDirectory(gameRoot); } catch { }
+            initOk = fnInit();
+        }
+        finally
+        {
+            if (prevCwd != null) { try { Directory.SetCurrentDirectory(prevCwd); } catch { } }
+        }
+        if (!initOk)
+        {
+            AppLogger.Log("WORKSHOP", "Steam API: SteamAPI_Init вернул false (Steam запущен? аккаунт залогинен?)");
+            return IntPtr.Zero;
+        }
 
         string[] ugcExports = new string[] {
             "SteamAPI_SteamUGC_v021", "SteamAPI_SteamUGC_v020", "SteamAPI_SteamUGC_v018",
@@ -464,6 +501,16 @@ public static class WorkshopBrowser
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ulong Flat_UGC_UnsubscribeItem(IntPtr self, ulong nPublishedFileID);
+
+    // Отписка по одному publishedFileId — нужна для «висячих» подписок,
+// у которых нет папки с содержимым (из-за них меню ливрей в игре зависает).
+    public static bool UnsubscribeById(string publishedFileId, string gameRoot)
+    {
+        ulong id;
+        if (!ulong.TryParse(publishedFileId, out id)) return false;
+        try { return TryNativeSteamUnsubscribe(gameRoot, id); }
+        catch (Exception ex) { AppLogger.Error("WORKSHOP", "UnsubscribeById", ex); return false; }
+    }
 
     private static bool TryNativeSteamUnsubscribe(string gameRoot, ulong fileId)
     {

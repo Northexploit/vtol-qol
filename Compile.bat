@@ -1,6 +1,6 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0."
 
 set CSC=C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 set WPF=C:\Windows\Microsoft.NET\Framework64\v4.0.30319\WPF
@@ -49,5 +49,16 @@ if errorlevel 1 (
   exit /b 1
 )
 echo BUILD_OK
+
+rem Готовая программа не должна запускаться из папки агента/песочницы:
+rem оттуда Windows даёт процессу урезанный токен, и Steam, запущенный из неё,
+rem падает с ошибкой «Путь к разделу Steam в реестре недоступен для записи».
+rem Поэтому кладём рабочую копию рядом на Рабочий стол — оттуда всё в порядке.
+set RUN=..\VTOL QoL
+if not exist "%RUN%" mkdir "%RUN%"
+copy /Y "VTOL_QoL.exe" "%RUN%\VTOL_QoL.exe" >nul
+copy /Y "icon.ico" "%RUN%\icon.ico" >nul 2>nul
+echo RUN_COPY=%RUN%\VTOL_QoL.exe
+
 if /I not "%~1"=="nopause" pause
 endlocal

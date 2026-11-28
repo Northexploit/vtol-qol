@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -58,7 +58,6 @@ public class GameTracker
     private bool running = false;
     private string lastSentActivityKey = "";
     private DateTime lastActivitySentUtc = DateTime.MinValue;
-    private static bool elevationAttempted = false;
     private LogPatterns patterns;
 
     private string originalPlaybackId = null;
@@ -218,6 +217,8 @@ public class GameTracker
         long startEpoch = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
         long lastSeekPos = 0;
         bool wasRunning = false;
+        // Один шафл на одну сессию игры (ставится при старте игры, срабатывает при выходе).
+        bool shuffleOnExitPending = false;
 
         Stream pipe = null;
         string aircraftRegexStr = patterns.BuildAircraftRegex();
@@ -288,6 +289,27 @@ public class GameTracker
                     kills = 0;
                     inSortie = false;
                     wasRunning = false;
+
+                    // Шафл при выходе из игры. Заменяет прежний механизм через Shuffle.bat
+                    // в параметрах запуска Steam (их сейчас нет вообще). Игра уже закрыта,
+                    // поэтому гонки за файлы музыки нет, а следующий запуск получит новый порядок.
+                    // ВАЖНО: строго один раз за сессию — этот блок выполняется каждую итерацию,
+                    // поэтому без флага музыка перемешивалась бы каждые 1.5 секунды.
+                    if (shuffleOnExitPending && SettingsManager.GetBool("Shuffle", true))
+                    {
+                        shuffleOnExitPending = false;
+                        string musicDirExit = SettingsManager.Get("RadioMusicDir", "");
+                        if (!string.IsNullOrEmpty(musicDirExit) && Directory.Exists(musicDirExit))
+                        {
+                            bool shuffledExit = MusicShuffler.ShuffleNow(musicDirExit, true, true);
+                            AppLogger.Log("MUSIC", "Перемешивание треков после выхода из игры: " + shuffledExit);
+                        }
+                        else
+                        {
+                            AppLogger.Log("MUSIC", "Шафл при выходе: не задана/не найдена папка RadioMusic ('" + musicDirExit + "')");
+                        }
+                    }
+
                     Thread.Sleep(1500);
                     startEpoch = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
                     continue;
@@ -297,6 +319,7 @@ public class GameTracker
                 {
                     // Игра только что запустилась
                     wasRunning = true;
+                    shuffleOnExitPending = true;   // при выходе перемешаем треки один раз
                     AudioSessionDucking.SetDuck(false, "VTOLVR");
                     AppLogger.Log("TRACKER", "Обнаружен запуск VTOLVR.exe! Файл лога: " + logPath + " (существует: " + File.Exists(logPath) + ")");
                     if (File.Exists(logPath))
@@ -644,6 +667,9 @@ public class GameTracker
                                     foreach (Match mEng in Regex.Matches(chunk, @"Failed engine\s+(?<part>[^\r\n]+)", RegexOptions.IgnoreCase))
                                     {
                                         string part = mEng.Groups["part"].Value.Trim();
+                                        // "Failed engine remotely ..." — отказ двигателя у ДРУГОГО борта по сети,
+                                        // а не у игрока. Учитываем только собственный борт.
+                                        if (part.StartsWith("remotely", StringComparison.OrdinalIgnoreCase)) continue;
                                         if (part.IndexOf("(Clone)", StringComparison.OrdinalIgnoreCase) >= 0)
                                             RecordReplayEvent("DAMAGE", "PLAYER", "Отказ двигателя: " + part);
                                         else
@@ -841,6 +867,9 @@ public class GameTracker
                                 try
                                 {
                                     FileStream fsPipe = new FileStream(hPipe, FileAccess.ReadWrite, 4096, false);
+                                    // Таймаут на чтение/запись канала Discord: если Discord завис/занят,
+                                    // ReadExact вернёт null (по таймауту), а не заблокирует весь трекер навсегда.
+                                    try { fsPipe.ReadTimeout = 8000; fsPipe.WriteTimeout = 8000; } catch { }
                                     pipe = fsPipe;
                                     string hs = "{\"v\":1,\"client_id\":\"" + DiscordClientId + "\"}";
                                     SendPacket(pipe, 0, hs);
@@ -885,27 +914,14 @@ public class GameTracker
                                 hPipe.Dispose();
                                 if (err != 2)
                                 {
+                                    // Код 5 = доступ к каналу Discord запрещён (Discord запущен от админа).
+                                    // Раньше здесь был АВТОМАТИЧЕСКИЙ самоперезапуск программы с runas + Exit.
+                                    // Это делало ВСЮ программу администраторской, и всё, что она запускала
+                                    // (в т.ч. Steam), получало повышенные права — из-за чего у пользователей
+                                    // ломался Steam («путь к разделу Steam в реестре недоступен для записи»).
+                                    // Автоматический перезапуск убран: только помечаем состояние,
+                                    // а решение об elevation принимает пользователь явно (кнопка Discord).
                                     if (err == 5) IsDiscordAccessDenied = true;
-                                    if (err == 5 && !elevationAttempted)
-                                    {
-                                        elevationAttempted = true;
-                                        bool isAdmin = new System.Security.Principal.WindowsPrincipal(
-                                            System.Security.Principal.WindowsIdentity.GetCurrent()
-                                        ).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
-
-                                        if (!isAdmin)
-                                        {
-                                            try
-                                            {
-                                                ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath);
-                                                psi.Verb = "runas";
-                                                psi.UseShellExecute = true;
-                                                Process.Start(psi);
-                                                Environment.Exit(0);
-                                            }
-                                            catch { }
-                                        }
-                                    }
                                 }
                             }
                         }

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -31,6 +31,7 @@ public class LiveryManagerForm : Form
     private TextBox txtSearch;
     private Button btnSearchOrRefresh;
     private CheckBox chkWorkshop;
+    private Button btnLiveryInt;
     private Button btnPrevPage;
     private Button btnNextPage;
     private Label lblPage;
@@ -98,6 +99,22 @@ public class LiveryManagerForm : Form
         chkWorkshop = new CheckBox() { Text = "Показывать скачанный Workshop", Left = 20, Top = 82, AutoSize = true, ForeColor = Color.FromArgb(210, 240, 220), Checked = true };
         chkWorkshop.CheckedChanged += (s, e) => LoadLiveries();
         this.Controls.Add(chkWorkshop);
+
+        // Кнопка проверки целостности ливрей — правее чекбокса Workshop.
+        btnLiveryInt = new Button()
+        {
+            Text = "Проверить целостность ливрей",
+            Top = 79,
+            Width = 196,
+            Height = 25,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(60, 50, 40),
+            ForeColor = Color.White
+        };
+        btnLiveryInt.Click += BtnLiveryIntegrity_Click;
+        this.Controls.Add(btnLiveryInt);
+        // Ставим точно справа от чекбокса (его ширина зависит от шрифта/AutoSize).
+        btnLiveryInt.Left = chkWorkshop.Right + 12;
 
         btnPrevPage = new Button() { Text = "< Пред.", Left = 20, Top = 80, Width = 80, Height = 24, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(35, 45, 40), ForeColor = Color.White, Visible = false };
         btnPrevPage.Click += (s, e) => { if (catalogPage > 1) { catalogPage--; SearchCatalogAsync(); } };
@@ -253,6 +270,7 @@ public class LiveryManagerForm : Form
         btnTabCatalog.ForeColor = catalog ? Color.White : Color.LightGray;
 
         chkWorkshop.Visible = !catalog;
+        btnLiveryInt.Visible = !catalog;
         btnPrevPage.Visible = catalog;
         lblPage.Visible = catalog;
         btnNextPage.Visible = catalog;
@@ -624,7 +642,11 @@ public class LiveryManagerForm : Form
                             SetPreviewLoaderText(null);
                             using (MemoryStream ms = new MemoryStream(data))
                             using (Image tmpImg = Image.FromStream(ms))
+                            {
+                                Image old = picPreview.Image;
                                 picPreview.Image = new Bitmap(tmpImg);
+                                if (old != null) old.Dispose();
+                            }
                         }));
                     }
                 }
@@ -654,7 +676,11 @@ public class LiveryManagerForm : Form
                 byte[] bytes = File.ReadAllBytes(entry.PreviewPath);
                 using (MemoryStream ms = new MemoryStream(bytes))
                 using (Image tmpImg = Image.FromStream(ms))
+                {
+                    Image old = picPreview.Image;
                     picPreview.Image = new Bitmap(tmpImg);
+                    if (old != null) old.Dispose();
+                }
             }
             catch { SetPreviewLoaderText("Ошибка чтения превью"); }
         }
@@ -664,6 +690,522 @@ public class LiveryManagerForm : Form
         }
     }
 
+
+    // =====================================================================
+    // === ПРОВЕРКА ЦЕЛОСТНОСТИ ЛИВРЕЙ =====================================
+    // Только ЧИТАЕТ и рапортует. Ничего не удаляет и не переименовывает,
+    // чтобы не сломать ни игру, ни этот менеджер.
+    // Проверяем:
+    //   1) пустые папки ливрей;
+    //   2) папки без текстуры (texture.*) и без описания (.vtlb / livery.cfg);
+    //   3) дубликаты одного workshop-id в CustomLiveries и CustomLivery\<борт>;
+    //   4) подписки Steam Workshop, у которых нет папки с содержимым
+    //      (из-за них игра падает с DirectoryNotFoundException и меню ливрей висит).
+    // =====================================================================
+    private void BtnLiveryIntegrity_Click(object sender, EventArgs e)
+    {
+        Cursor = Cursors.WaitCursor;
+        try
+        {
+            StringBuilder report = new StringBuilder();
+            int problems = 0;
+
+            List<string> liveryDirs = new List<string>();
+
+            string customLiveries = GetLiveriesRootDir();
+            if (Directory.Exists(customLiveries))
+                foreach (string d in Directory.GetDirectories(customLiveries)) liveryDirs.Add(d);
+
+            if (!string.IsNullOrEmpty(gameRoot) && Directory.Exists(gameRoot))
+            {
+                string perAircraft = Path.Combine(gameRoot, "CustomLivery");
+                if (Directory.Exists(perAircraft))
+                {
+                    foreach (string acDir in Directory.GetDirectories(perAircraft))
+                        foreach (string d in Directory.GetDirectories(acDir)) liveryDirs.Add(d);
+                }
+            }
+
+            // 1-2: проверка содержимого каждой папки
+            List<string> emptyDirs = new List<string>();
+            List<string> noTexture = new List<string>();
+            List<string> noDescriptor = new List<string>();
+            foreach (string d in liveryDirs)
+            {
+                string[] files;
+                try { files = Directory.GetFiles(d, "*", SearchOption.AllDirectories); }
+                catch { continue; }
+                if (files.Length == 0) { emptyDirs.Add(d); continue; }
+
+                bool hasTexture = false, hasDescriptor = false;
+                foreach (string f in files)
+                {
+                    string fn = Path.GetFileName(f).ToLowerInvariant();
+                    string ext = Path.GetExtension(f).ToLowerInvariant();
+                    if (fn.StartsWith("texture") || ext == ".jpgb" || ext == ".png" || ext == ".jpg" || ext == ".dds") hasTexture = true;
+                    if (ext == ".vtlb" || fn == "livery.cfg") hasDescriptor = true;
+                }
+                if (!hasTexture) noTexture.Add(d);
+                if (!hasDescriptor) noDescriptor.Add(d);
+            }
+
+            // 3: дубликаты по имени папки (workshop id) в двух местах
+            Dictionary<string, List<string>> byName = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (string d in liveryDirs)
+            {
+                string nm = Path.GetFileName(d);
+                if (!byName.ContainsKey(nm)) byName[nm] = new List<string>();
+                byName[nm].Add(d);
+            }
+            List<string> dupes = new List<string>();
+            foreach (KeyValuePair<string, List<string>> kv in byName)
+                if (kv.Value.Count > 1) dupes.Add(kv.Key + "  →  " + kv.Value.Count + " копии");
+
+            // 4: подписки воркшопа без содержимого
+            List<string> missingSubs = new List<string>();
+            if (!string.IsNullOrEmpty(gameRoot))
+            {
+                try
+                {
+                    string steamLibRoot = Path.GetFullPath(Path.Combine(gameRoot, @"..\..\.."));
+                    string contentDir = Path.Combine(steamLibRoot, @"steamapps\workshop\content\667970");
+                    string acf = Path.Combine(steamLibRoot, @"steamapps\workshop\appworkshop_667970.acf");
+                    if (File.Exists(acf))
+                    {
+                        string text = File.ReadAllText(acf);
+                        MatchCollection ms = Regex.Matches(text, "\"(\\d{9,11})\"\\s*[\\r\\n]+\\s*\\{");
+                        HashSet<string> seen = new HashSet<string>();
+                        foreach (Match m in ms)
+                        {
+                            string id = m.Groups[1].Value;
+                            if (!seen.Add(id)) continue;
+                            if (!Directory.Exists(Path.Combine(contentDir, id))) missingSubs.Add(id);
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if (emptyDirs.Count > 0)
+            {
+                problems += emptyDirs.Count;
+                report.AppendLine("ПУСТЫЕ ПАПКИ ЛИВРЕЙ (" + emptyDirs.Count + "):");
+                foreach (string d in emptyDirs) report.AppendLine("   " + RelPath(d));
+                report.AppendLine();
+            }
+            if (noTexture.Count > 0)
+            {
+                problems += noTexture.Count;
+                report.AppendLine("БЕЗ ТЕКСТУРЫ (" + noTexture.Count + "):");
+                foreach (string d in noTexture) report.AppendLine("   " + RelPath(d));
+                report.AppendLine();
+            }
+            if (noDescriptor.Count > 0)
+            {
+                problems += noDescriptor.Count;
+                report.AppendLine("БЕЗ ОПИСАНИЯ .vtlb/livery.cfg (" + noDescriptor.Count + "):");
+                foreach (string d in noDescriptor) report.AppendLine("   " + RelPath(d));
+                report.AppendLine();
+            }
+            if (dupes.Count > 0)
+            {
+                problems += dupes.Count;
+                report.AppendLine("ДУБЛИКАТЫ (" + dupes.Count + "):");
+                foreach (string s in dupes) report.AppendLine("   " + s);
+                report.AppendLine();
+            }
+            if (missingSubs.Count > 0)
+            {
+                problems += missingSubs.Count;
+                report.AppendLine("ПОДПИСКИ WORKSHOP БЕЗ ФАЙЛОВ (" + missingSubs.Count + ") — из-за них меню ливрей в игре может висеть:");
+                foreach (string id in missingSubs)
+                    report.AppendLine("   " + id + "   steam://url/CommunityFilePage/" + id);
+                report.AppendLine();
+            }
+
+            report.AppendLine("Проверено папок ливрей: " + liveryDirs.Count);
+            report.AppendLine("Подписок Workshop в манифесте проверено: см. выше");
+            if (problems == 0) report.AppendLine("ПРОБЛЕМ НЕ НАЙДЕНО.");
+
+            string outPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "livery_integrity.txt");
+            try { File.WriteAllText(outPath, report.ToString(), Encoding.UTF8); } catch { outPath = null; }
+
+            string head = problems == 0
+                ? "Проверка целостности ливрей: проблем не найдено.\n\nПапок ливрей проверено: " + liveryDirs.Count
+                : "Проверка целостности ливрей: найдено проблем — " + problems + ".\n\n" + FirstLines(report.ToString(), 18);
+
+            if (outPath != null) head += "\n\nПолный отчёт: " + outPath;
+
+            MessageBox.Show(this, head, "Целостность ливрей", MessageBoxButtons.OK,
+                problems == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+
+            lblStatus.Text = problems == 0 ? "Ливреи: проблем не найдено" : ("Ливреи: найдено проблем — " + problems);
+
+            // === Автопочинка (только с согласия пользователя) ===
+            if (problems > 0) OfferAutoFix(emptyDirs, byName, noTexture, noDescriptor, missingSubs);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Не удалось выполнить проверку: " + ex.Message, "Целостность ливрей", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally { Cursor = Cursors.Default; }
+    }
+
+    // Автопочинка ливрей по согласию пользователя.
+    // Ничего не делается без нажатия «Исправить» и без включённой галочки.
+    private void OfferAutoFix(List<string> emptyDirs, Dictionary<string, List<string>> byName,
+                              List<string> noTexture, List<string> noDescriptor, List<string> missingSubs)
+    {
+        List<string> dupeKeys = new List<string>();
+        foreach (KeyValuePair<string, List<string>> kv in byName)
+            if (kv.Value.Count > 1) dupeKeys.Add(kv.Key);
+
+        List<string> brokenDirs = new List<string>();
+        HashSet<string> seenBroken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string d in noTexture) if (seenBroken.Add(d)) brokenDirs.Add(d);
+        foreach (string d in noDescriptor) if (seenBroken.Add(d)) brokenDirs.Add(d);
+
+        List<LiveryFixOption> options = new List<LiveryFixOption>();
+
+        if (missingSubs.Count > 0)
+            options.Add(new LiveryFixOption
+            {
+                Key = "subs",
+                Title = "Отписаться в Steam Workshop от подписок без файлов (лечит зависание меню ливрей в игре)",
+                Count = missingSubs.Count,
+                Checked = true
+            });
+
+        if (emptyDirs.Count > 0)
+            options.Add(new LiveryFixOption
+            {
+                Key = "empty",
+                Title = "Удалить пустые папки ливрей",
+                Count = emptyDirs.Count,
+                Checked = true
+            });
+
+        if (brokenDirs.Count > 0)
+            options.Add(new LiveryFixOption
+            {
+                Key = "broken",
+                Title = "Удалить ливреи без текстуры или без описания (.vtlb / livery.cfg)",
+                Count = brokenDirs.Count,
+                Checked = false
+            });
+
+        if (dupeKeys.Count > 0)
+            options.Add(new LiveryFixOption
+            {
+                Key = "dupe",
+                Title = "Удалить дубликаты (оставить копию в CustomLiveries)",
+                Count = dupeKeys.Count,
+                Checked = false
+            });
+
+        if (options.Count == 0) return;
+
+        List<string> accepted;
+        using (LiveryFixForm dlg = new LiveryFixForm(options))
+        {
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            accepted = new List<string>(dlg.AcceptedKeys);
+        }
+        if (accepted.Count == 0) return;
+
+        Cursor = Cursors.WaitCursor;
+        StringBuilder log = new StringBuilder();
+        int done = 0, failed = 0;
+
+        try
+        {
+            if (accepted.Contains("subs"))
+            {
+                foreach (string id in missingSubs)
+                {
+                    bool ok = false;
+                    try { ok = WorkshopBrowser.UnsubscribeById(id, gameRoot); }
+                    catch (Exception ex) { AppLogger.Error("LIVERY", "Отписка " + id, ex); }
+                    if (ok) { done++; log.AppendLine("Отписка от Workshop: " + id + " — ок"); }
+                    else { failed++; log.AppendLine("Отписка от Workshop: " + id + " — НЕ удалось (закрой VTOL VR / Steam должен быть запущен)"); }
+                }
+            }
+
+            if (accepted.Contains("empty"))
+            {
+                foreach (string d in emptyDirs)
+                {
+                    try { Directory.Delete(d, true); done++; log.AppendLine("Удалена пустая папка: " + RelPath(d)); }
+                    catch (Exception ex) { failed++; log.AppendLine("Не удалось удалить " + RelPath(d) + ": " + ex.Message); }
+                }
+            }
+
+            if (accepted.Contains("broken"))
+            {
+                foreach (string d in brokenDirs)
+                {
+                    try { Directory.Delete(d, true); done++; log.AppendLine("Удалена неполная ливрея: " + RelPath(d)); }
+                    catch (Exception ex) { failed++; log.AppendLine("Не удалось удалить " + RelPath(d) + ": " + ex.Message); }
+                }
+            }
+
+            if (accepted.Contains("dupe"))
+            {
+                foreach (string key in dupeKeys)
+                {
+                    List<string> copies = byName[key];
+                    // Оставляем копию в CustomLiveries (стандартное место), удаляем остальные.
+                    string keep = copies[0];
+                    foreach (string c in copies)
+                        if (c.IndexOf(@"\CustomLiveries\", StringComparison.OrdinalIgnoreCase) >= 0) { keep = c; break; }
+
+                    foreach (string c in copies)
+                    {
+                        if (string.Equals(c, keep, StringComparison.OrdinalIgnoreCase)) continue;
+                        try { Directory.Delete(c, true); done++; log.AppendLine("Удалён дубликат: " + RelPath(c) + " (оставлен " + RelPath(keep) + ")"); }
+                        catch (Exception ex) { failed++; log.AppendLine("Не удалось удалить дубликат " + RelPath(c) + ": " + ex.Message); }
+                    }
+                }
+            }
+        }
+        finally { Cursor = Cursors.Default; }
+
+        // Файлы в "Program Files" обычный процесс удалить не может — нужны права администратора.
+        // Если что-то осталось на диске, предлагаем выполнить удаление с повышением (один запрос UAC).
+        List<string> remaining = new List<string>();
+        if (accepted.Contains("empty")) foreach (string d in emptyDirs) if (Directory.Exists(d)) remaining.Add(d);
+        if (accepted.Contains("broken")) foreach (string d in brokenDirs) if (Directory.Exists(d)) remaining.Add(d);
+        if (accepted.Contains("dupe"))
+        {
+            foreach (string key in dupeKeys)
+            {
+                List<string> copies = byName[key];
+                string keep = copies[0];
+                foreach (string c in copies)
+                    if (c.IndexOf(@"\CustomLiveries\", StringComparison.OrdinalIgnoreCase) >= 0) { keep = c; break; }
+                foreach (string c in copies)
+                    if (!string.Equals(c, keep, StringComparison.OrdinalIgnoreCase) && Directory.Exists(c)) remaining.Add(c);
+            }
+        }
+
+        if (remaining.Count > 0)
+        {
+            DialogResult dr = MessageBox.Show(this,
+                "Часть папок находится в защищённой папке игры (Program Files) — обычный запуск не имеет прав их удалить.\n\n"
+                + "Осталось удалить: " + remaining.Count + "\n\n"
+                + "Выполнить удаление с правами администратора? Появится запрос Windows (UAC).",
+                "Нужны права администратора", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (dr == DialogResult.Yes)
+            {
+                int okElev = DeleteElevated(remaining);
+                if (okElev > 0)
+                {
+                    int left = 0;
+                    foreach (string d in remaining) if (Directory.Exists(d)) left++;
+                    done += (remaining.Count - left);
+                    failed += left;
+                    log.AppendLine("Удалено с правами администратора: " + (remaining.Count - left) + ", осталось: " + left);
+                }
+                else
+                {
+                    log.AppendLine("Повышение прав отклонено или не удалось; удаление не выполнено.");
+                }
+            }
+            else
+            {
+                log.AppendLine("Пользователь отказался от повышения прав; удаление не выполнено (" + remaining.Count + ").");
+            }
+        }
+
+        string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "livery_fix.log");
+        try { File.AppendAllText(logPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + Environment.NewLine + log.ToString() + Environment.NewLine, Encoding.UTF8); } catch { logPath = null; }
+
+        MessageBox.Show(this,
+            "Автопочинка завершена.\n\nУспешно: " + done + "   Не удалось: " + failed
+            + (logPath != null ? "\n\nПодробности: " + logPath : ""),
+            "Автопочинка ливрей", MessageBoxButtons.OK,
+            failed == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+
+        lblStatus.Text = "Автопочинка: успешно " + done + ", ошибок " + failed;
+        LoadLiveries();
+    }
+
+    // Удаление списка папок одним приподнятым процессом (один запрос UAC).
+    // Возвращает количество папок, которых после этого не стало.
+    private int DeleteElevated(List<string> dirs)
+    {
+        if (dirs == null || dirs.Count == 0) return 0;
+        string bat = Path.Combine(Path.GetTempPath(), "vtolqol_livery_fix_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".bat");
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine("@echo off");
+        sb.AppendLine("chcp 65001 >nul");
+        foreach (string d in dirs)
+        {
+            // /f — снять read-only у файлов, /q — без вопросов
+            sb.AppendLine("rd /s /q \"" + d + "\"");
+        }
+        sb.AppendLine("exit /b 0");
+
+        try
+        {
+            File.WriteAllText(bat, sb.ToString(), Encoding.Default);
+            ProcessStartInfo psi = new ProcessStartInfo(bat);
+            psi.Verb = "runas";
+            psi.UseShellExecute = true;
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
+            using (Process p = Process.Start(psi))
+            {
+                if (p != null) p.WaitForExit(60000);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("LIVERY", "DeleteElevated", ex);
+            return 0;
+        }
+        finally
+        {
+            try { File.Delete(bat); } catch { }
+        }
+
+        int gone = 0;
+        foreach (string d in dirs) if (!Directory.Exists(d)) gone++;
+        return gone;
+    }
+
+    // =====================================================================
+    // === АВТОПОЧИНКА БЕЗ GUI (для самопроверки через CLI) ==================
+    // Выполняет безопасный набор: пустые папки, дубликаты, ливреи без
+    // текстуры/описания, отписка от подписок Workshop без файлов.
+    // Возвращает текстовый отчёт.
+    // =====================================================================
+    public static string RunAutoFix(string gameRoot, out string logPath)
+    {
+        StringBuilder log = new StringBuilder();
+        int done = 0, failed = 0;
+        logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "livery_fix.log");
+        log.AppendLine("=== АВТОПОЧИНКА " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===");
+        log.AppendLine("gameRoot = " + gameRoot);
+
+        try
+        {
+            string customLiveries = Path.Combine(gameRoot, "CustomLiveries");
+            List<string> liveryDirs = new List<string>();
+            if (Directory.Exists(customLiveries))
+                foreach (string d in Directory.GetDirectories(customLiveries)) liveryDirs.Add(d);
+            string perAircraft = Path.Combine(gameRoot, "CustomLivery");
+            if (Directory.Exists(perAircraft))
+                foreach (string acDir in Directory.GetDirectories(perAircraft))
+                    foreach (string d in Directory.GetDirectories(acDir)) liveryDirs.Add(d);
+            log.AppendLine("папок ливрей найдено: " + liveryDirs.Count);
+
+            // 1. Пустые папки
+            foreach (string d in liveryDirs)
+            {
+                try
+                {
+                    string[] files = Directory.GetFiles(d, "*", SearchOption.AllDirectories);
+                    if (files.Length == 0)
+                    {
+                        Directory.Delete(d, true);
+                        done++;
+                        log.AppendLine("УДАЛЕНА пустая папка: " + d);
+                    }
+                }
+                catch (Exception ex) { failed++; log.AppendLine("ошибка пустой " + d + ": " + ex.GetType().Name + " " + ex.Message); }
+            }
+
+            // 2. Дубликаты: оставляем копию в CustomLiveries
+            Dictionary<string, List<string>> byName = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (string d in liveryDirs)
+            {
+                if (!Directory.Exists(d)) continue;
+                string nm = Path.GetFileName(d);
+                if (!byName.ContainsKey(nm)) byName[nm] = new List<string>();
+                byName[nm].Add(d);
+            }
+            foreach (KeyValuePair<string, List<string>> kv in byName)
+            {
+                if (kv.Value.Count < 2) continue;
+                string keep = kv.Value[0];
+                foreach (string c in kv.Value)
+                    if (c.IndexOf(@"\CustomLiveries\", StringComparison.OrdinalIgnoreCase) >= 0) { keep = c; break; }
+                foreach (string c in kv.Value)
+                {
+                    if (string.Equals(c, keep, StringComparison.OrdinalIgnoreCase)) continue;
+                    try { Directory.Delete(c, true); done++; log.AppendLine("УДАЛЁН дубликат: " + c + " (оставлен " + keep + ")"); }
+                    catch (Exception ex) { failed++; log.AppendLine("ошибка дубликата " + c + ": " + ex.GetType().Name + " " + ex.Message); }
+                }
+            }
+
+            // 3. Подписки без файлов
+            string steamLibRoot = Path.GetFullPath(Path.Combine(gameRoot, @"..\..\.."));
+            string contentDir = Path.Combine(steamLibRoot, @"steamapps\workshop\content\667970");
+            string acf = Path.Combine(steamLibRoot, @"steamapps\workshop\appworkshop_667970.acf");
+            log.AppendLine("Steam запущен: " + (Process.GetProcessesByName("steam").Length > 0));
+            if (File.Exists(acf))
+            {
+                string text = File.ReadAllText(acf);
+                MatchCollection ms = Regex.Matches(text, "\"(\\d{9,11})\"\\s*[\\r\\n]+\\s*\\{");
+                HashSet<string> seen = new HashSet<string>();
+                foreach (Match m in ms)
+                {
+                    string id = m.Groups[1].Value;
+                    if (!seen.Add(id)) continue;
+                    if (Directory.Exists(Path.Combine(contentDir, id))) continue;
+                    bool ok = false;
+                    try { ok = WorkshopBrowser.UnsubscribeById(id, gameRoot); }
+                    catch (Exception ex) { log.AppendLine("исключение отписки " + id + ": " + ex.Message); }
+                    if (ok)
+                    {
+                        done++;
+                        log.AppendLine("ОТПИСАЛИСЬ от Workshop: " + id);
+                    }
+                    else
+                    {
+                        // Steam недоступен — локальный обход: создаём папку, чтобы игра не падала
+                        // с DirectoryNotFoundException. Потом Steam сам её наполнит при загрузке.
+                        try
+                        {
+                            Directory.CreateDirectory(Path.Combine(contentDir, id));
+                            done++;
+                            log.AppendLine("СОЗДАНА папка для подписки (Steam недоступен): " + id);
+                        }
+                        catch (Exception ex2)
+                        {
+                            failed++;
+                            log.AppendLine("не удалось ни отписаться, ни создать папку " + id + ": " + ex2.Message);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { log.AppendLine("ОБЩАЯ ОШИБКА: " + ex.GetType().Name + " " + ex.Message); }
+
+        log.AppendLine("ИТОГО: успешно " + done + ", неудач " + failed);
+        try { File.AppendAllText(logPath, log.ToString() + Environment.NewLine, Encoding.UTF8); } catch { }
+        return log.ToString();
+    }
+
+    private string RelPath(string full)
+    {
+        try
+        {
+            if (!string.IsNullOrEmpty(gameRoot) && full.StartsWith(gameRoot, StringComparison.OrdinalIgnoreCase))
+                return full.Substring(gameRoot.Length).TrimStart('\\');
+        }
+        catch { }
+        return full;
+    }
+
+    private static string FirstLines(string text, int count)
+    {
+        string[] parts = text.Replace("\r\n", "\n").Split('\n');
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parts.Length && i < count; i++) sb.AppendLine(parts[i]);
+        if (parts.Length > count) sb.AppendLine("...");
+        return sb.ToString();
+    }
 
     private string GetLiveriesRootDir()
     {

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -112,6 +112,20 @@ public static class DebriefEngine
         return s;
     }
 
+    // Загрузка реплея и выгрузка диагностического отчёта в файл (для CLI-проверки).
+    public static void DumpReplay(string replayPath, string preferredPilot, string outPath)
+    {
+        try
+        {
+            DebriefSession s = LoadSession(replayPath, preferredPilot ?? "");
+            File.WriteAllText(outPath, BuildDebugReport(s), Encoding.UTF8);
+        }
+        catch (Exception ex)
+        {
+            try { File.WriteAllText(outPath, "ERR " + ex.ToString(), Encoding.UTF8); } catch { }
+        }
+    }
+
     public static string BuildDebugReport(DebriefSession s)
     {
         if (s == null) return "Сессия не загружена.";
@@ -149,6 +163,29 @@ public static class DebriefEngine
         {
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "[{0:F1}s] [{1}/{2}] {3} | pos=({4:F0}, {5:F0}) | {6}",
                 ev.Time, ev.Kind, ev.Severity, ev.Title, ev.WorldX, ev.WorldY, ev.Description));
+        }
+        sb.AppendLine();
+        sb.AppendLine("--- ЛУЧИ РЛС/АРЛ/РЭБ (" + s.Beams.Count + ") ---");
+        foreach (TacticalBeam bm in s.Beams)
+        {
+            sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "[{0:F1}..{1:F1}s] {2} | {3} (id={4}) -> {5} (id={6}) | From=({7:F0},{8:F0}) To=({9:F0},{10:F0})",
+                bm.StartTime, bm.EndTime, bm.Kind, bm.FromName ?? "-", bm.FromId ?? "-", bm.ToName ?? "-", bm.ToId ?? "-",
+                bm.FromX, bm.FromY, bm.ToX, bm.ToY));
+        }
+        sb.AppendLine();
+        sb.AppendLine("--- АЭРОДРОМЫ (" + s.Airfields.Count + ") ---");
+        foreach (MapPoiMarker af in s.Airfields)
+        {
+            sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "[{0}] {1} | pos=({2:F0}, {3:F0}) | hdg={4:F0}",
+                af.Kind, af.Label, af.X, af.Y, af.Heading));
+        }
+        sb.AppendLine();
+        sb.AppendLine("--- КАРТОГРАФИЧЕСКИЕ МАРКЕРЫ (" + s.MapMarkers.Count + ") ---");
+        foreach (MapPoiMarker poi in s.MapMarkers)
+        {
+            sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "[{0} | {1}] {2} | pos=({3:F0}, {4:F0}) | r={5:F0}",
+                poi.Kind, poi.Coalition ?? "-", poi.Label, poi.X, poi.Y, poi.RadiusMeters));
         }
         return sb.ToString();
     }
@@ -1805,6 +1842,22 @@ public static class DebriefEngine
         return false;
     }
 
+    // Абсолютная команда юнита из entityType штатного реплея:
+    //   0 — команда A (чётные типы: 0/2/4 — авиация/наземка/корабли, 7 — вертолёты),
+    //   1 — команда B (нечётные: 1/3/5 и 8),
+    //  -1 — стороны нет (6 — ракеты).
+    // ВАЖНО: это НЕ «свой/чужой» — в многопользовательской миссии игрок может быть
+    // в любой из команд, поэтому сторону нужно сравнивать со стороной игрока.
+    private static int TeamBitOfEntityType(int entTypeCode)
+    {
+        switch (entTypeCode)
+        {
+            case 0: case 2: case 4: case 7: return 0;
+            case 1: case 3: case 5: case 8: return 1;
+            default: return -1;
+        }
+    }
+
     public static string ImportFromPlayerLog(string logFilePath, string fallbackNick)
     {
         if (string.IsNullOrEmpty(logFilePath) || !File.Exists(logFilePath))
@@ -2308,6 +2361,9 @@ public static class DebriefEngine
                 if (line.StartsWith("Failed engine ", StringComparison.OrdinalIgnoreCase))
                 {
                     string part = line.Substring("Failed engine ".Length).Trim();
+                    // "Failed engine remotely ..." — отказ двигателя у ДРУГОГО борта по сети.
+                    // Учитываем только собственный борт (без "remotely").
+                    if (part.StartsWith("remotely", StringComparison.OrdinalIgnoreCase)) continue;
                     string myAcShort = currentPlayerVeh.Replace("/", "");
                     if (part.IndexOf(myAcShort, StringComparison.OrdinalIgnoreCase) >= 0 && (curT - lastEngineFailLogT) > 15.0)
                     {
@@ -2439,43 +2495,41 @@ public static class DebriefEngine
                         s.PlayerLaunches = logSession.PlayerLaunches;
                         s.RwrSpikesCount = logSession.RwrSpikesCount;
                         s.ThreatMissilesCount = logSession.ThreatMissilesCount;
-                        s.RwrSpikesCount = logSession.RwrSpikesCount;
                         s.HasExactTelemetry = true;
                         s.IsReconstructedFromLog = false;
+
+                        // К 3D-трекам VTR прикладываем только внутренние отказы систем (DAMAGE) из лога;
+                        // пуски/угрозы/попадания/гибель строятся позже в BuildNativeVtrEvents по 3D-трекам.
                         s.Events.Clear();
                         s.Mistakes.Clear();
-                        s.HasExactTelemetry = true;
-                        s.IsReconstructedFromLog = false;
 
                         List<DebriefEntity> playerSorties = new List<DebriefEntity>();
                         foreach (DebriefEntity e in s.Entities)
                             if (e.IsPlayer) playerSorties.Add(e);
                         playerSorties.Sort((a, b) => a.FirstTime.CompareTo(b.FirstTime));
 
-                        double timeOffset = 0;
-                        if (s.Events.Count > 0 && s.Duration > 10 && s.Events[s.Events.Count - 1].Time > s.Duration + 30.0)
-                            timeOffset = s.Events[s.Events.Count - 1].Time - s.Duration;
-
-                        int kiaIdx = 0;
-                        int respawnIdx = 1;
                         List<TacticalEvent> validLogEvents = new List<TacticalEvent>();
-
-                        foreach (TacticalEvent ev in s.Events)
+                        if (logSession != null)
                         {
-                            // Все пуски, угрозы, попадания ракет и гибель бортов строим строго по 3D-трекам VTR;
-                            // из лога берём только внутренние отказы систем самолёта (DAMAGE)
-                            if (ev.Kind != "DAMAGE") continue;
+                            double timeOffset = 0;
+                            if (logSession.Events.Count > 0 && s.Duration > 10 && logSession.Events[logSession.Events.Count - 1].Time > s.Duration + 30.0)
+                                timeOffset = logSession.Events[logSession.Events.Count - 1].Time - s.Duration;
 
-                            if (timeOffset > 0 && ev.Time > timeOffset)
-                                ev.Time = ev.Time - timeOffset;
-                            if (ev.Time < 2.0 || ev.Time > s.Duration) continue;
-
-                            foreach (DebriefEntity e in playerSorties)
+                            foreach (TacticalEvent ev in logSession.Events)
                             {
-                                DebriefSample ps = e.GetStateAt(ev.Time);
-                                if (ps != null) { ev.WorldX = ps.X; ev.WorldY = ps.Y; break; }
+                                if (ev.Kind != "DAMAGE") continue;
+
+                                if (timeOffset > 0 && ev.Time > timeOffset)
+                                    ev.Time = ev.Time - timeOffset;
+                                if (ev.Time < 2.0 || ev.Time > s.Duration) continue;
+
+                                foreach (DebriefEntity e in playerSorties)
+                                {
+                                    DebriefSample ps = e.GetStateAt(ev.Time);
+                                    if (ps != null) { ev.WorldX = ps.X; ev.WorldY = ps.Y; break; }
+                                }
+                                validLogEvents.Add(ev);
                             }
-                            validLogEvents.Add(ev);
                         }
                         s.Events = validLogEvents;
                         s.Mistakes.Clear();
@@ -2510,9 +2564,6 @@ public static class DebriefEngine
         string hmPath = Path.Combine(repDir, "heightmap.pngb");
         if (File.Exists(hmPath))
             TryBuildTerrainFromHeightmapPngb(s, hmPath, mapSize);
-
-        // Аэродромы определяем после рельефа: нужно отсеять точки над водой
-        DetectAirfields(s);
 
         return s;
     }
@@ -2871,10 +2922,19 @@ public static class DebriefEngine
                 return false;
             }
 
-            // Извлекаем 100% точные имена, родные команды (Teams.Allied / Teams.Enemy) и parentId носителей из объектов ReplayEntity
+            // Извлекаем 100% точное имя юнита из ReplayEntity.metaData.label.
+            //
+            // ВАЖНО (проверено дампом реальных реплеев через --dump-vtr):
+            //   ReplayEntity  = { id, trackable(=null), entityType, metaData }
+            //   TrackMetadata = { identity, label }
+            // Полей "team" / "parent" в файле реплея НЕТ вообще, поэтому нативную команду
+            // через рефлексию получить невозможно (прежние idToNativeTeam/idToParentId
+            // всегда оставались пустыми). Единственный авторитетный признак стороны —
+            // entityType (проверено по всем 377 юнитам реального реплея, 0 расхождений):
+            //   0/1 авиация (союз/враг), 2/3 наземка, 4/5 корабли, 6 ракеты (без стороны),
+            //   7/8 вертолёты. Имена подтверждают: ET=2 «Allied Infantry», ET=3 «Enemy Infantry»,
+            //   ET=4 «Carrier», ET=5 «Gun Boat», ET=0 «AV-42C», ET=1 «T-55 Tyro», ET=7 «AH-94».
             Dictionary<int, string> idToRealName = new Dictionary<int, string>();
-            Dictionary<int, string> idToNativeTeam = new Dictionary<int, string>();
-            Dictionary<int, int> idToParentId = new Dictionary<int, int>();
 
             try
             {
@@ -2911,16 +2971,6 @@ public static class DebriefEngine
                         int eid = (int)fId.GetValue(cur);
                         object metaObj = fMeta.GetValue(cur);
 
-                        foreach (System.Reflection.FieldInfo ef in ct.GetFields(bf))
-                        {
-                            object ev = ef.GetValue(cur);
-                            if (ev == null) continue;
-                            if (ef.Name.Equals("team", StringComparison.OrdinalIgnoreCase) || ef.FieldType.Name == "Teams")
-                                idToNativeTeam[eid] = ev.ToString().IndexOf("Enemy", StringComparison.OrdinalIgnoreCase) >= 0 ? "Enemies" : "Allies";
-                            else if (ef.FieldType == typeof(int) && ef.Name.IndexOf("parent", StringComparison.OrdinalIgnoreCase) >= 0)
-                                idToParentId[eid] = (int)ev;
-                        }
-
                         if (metaObj != null && !idToRealName.ContainsKey(eid))
                         {
                             foreach (System.Reflection.FieldInfo mf in metaObj.GetType().GetFields(bf))
@@ -2929,10 +2979,6 @@ public static class DebriefEngine
                                 if (mv == null) continue;
                                 if (mf.FieldType == typeof(string) && !string.IsNullOrEmpty(mv as string))
                                     idToRealName[eid] = mv as string;
-                                else if (mf.Name.Equals("team", StringComparison.OrdinalIgnoreCase) || mf.FieldType.Name == "Teams")
-                                    idToNativeTeam[eid] = mv.ToString().IndexOf("Enemy", StringComparison.OrdinalIgnoreCase) >= 0 ? "Enemies" : "Allies";
-                                else if (mf.FieldType == typeof(int) && mf.Name.IndexOf("parent", StringComparison.OrdinalIgnoreCase) >= 0)
-                                    idToParentId[eid] = (int)mv;
                             }
                         }
                     }
@@ -2982,6 +3028,29 @@ public static class DebriefEngine
             }
             catch { }
 
+            // Сторона, за которую играет пилот. entityType хранит АБСОЛЮТНУЮ команду A/B,
+            // а не «свой/чужой»: в многопользовательской миссии пилот может зайти за
+            // команду B (нечётные типы), и тогда прежняя жёсткая таблица рисовала его
+            // союзников как «противников», а противников — как «союзников».
+            // Поэтому сначала находим борт самого пилота и берём его команду за «свою».
+            int playerTeamBit = -1;
+            if (!string.IsNullOrEmpty(myNick))
+            {
+                foreach (System.Collections.DictionaryEntry deP in trackDict)
+                {
+                    int pid;
+                    try { pid = Convert.ToInt32(deP.Key); } catch { continue; }
+                    string pname;
+                    if (!idToRealName.TryGetValue(pid, out pname) || string.IsNullOrEmpty(pname)) continue;
+                    if (!IsPlayerInBracketTag(pname, myNick)) continue;
+                    int ptype;
+                    if (!idToEntityType.TryGetValue(pid, out ptype)) continue;
+                    int pbit = TeamBitOfEntityType(ptype);
+                    if (pbit >= 0) { playerTeamBit = pbit; break; }
+                }
+            }
+            log.AppendFormat("playerTeamBit={0}; ", playerTeamBit);
+
             foreach (System.Collections.DictionaryEntry de in trackDict)
             {
                 int entId = Convert.ToInt32(de.Key);
@@ -3026,11 +3095,20 @@ public static class DebriefEngine
                 string coalition;
                 if (entTypeCode >= 0)
                 {
-                    switch (entTypeCode)
+                    int teamBit = TeamBitOfEntityType(entTypeCode);
+                    if (teamBit < 0)
                     {
-                        case 0: case 2: case 4: case 7: coalition = "Allies"; break;
-                        case 1: case 3: case 5: case 8: coalition = "Enemies"; break;
-                        default: coalition = "Neutral"; break;
+                        coalition = "Neutral";                       // ракеты и прочее без стороны
+                    }
+                    else if (playerTeamBit < 0)
+                    {
+                        // Сторона игрока неизвестна — прежнее поведение (не переворачиваем).
+                        coalition = teamBit == 0 ? "Allies" : "Enemies";
+                    }
+                    else
+                    {
+                        // «Союзники» = команда игрока, «противники» = противоположная.
+                        coalition = teamBit == playerTeamBit ? "Allies" : "Enemies";
                     }
                 }
                 else
@@ -3049,6 +3127,7 @@ public static class DebriefEngine
                 else if (unitClass == "Sea") roleTag = "Ship";
                 else if (unitClass == "Ground")
                     roleTag = Regex.IsMatch(name, @"(?:SAM|Radar|SAAW|Phalanx|C-RAM|CIWS|VLS|Launcher|Turret)", RegexOptions.IgnoreCase) ? "SAM" : "Ground";
+                else if (unitClass == "Chopper") roleTag = "Chopper";
                 else roleTag = DetectUnitRole(name);
 
                 DebriefEntity ent = new DebriefEntity
@@ -3060,7 +3139,8 @@ public static class DebriefEngine
                     Class = unitClass,
                     Coalition = coalition,
                     RoleTag = roleTag,
-                    IsPlayer = isMe
+                    IsPlayer = isMe,
+                    NativeType = entTypeCode
                 };
 
                 foreach (object kf in keys)
@@ -3220,56 +3300,84 @@ public static class DebriefEngine
                 }
             }
 
-            // 2. Коалиция ракеты — от носителя. В файле у ракет entityType = 6 без стороны,
-            // поэтому берём родителя (parent id из реплея), иначе ближайший борт/ЗРК/корабль
-            // в точке пуска: ракета физически стартует с носителя.
+            // 2. Авторитетное уточнение стороны по записанным локам (LockingRadar) — ДО позиционных догадок.
+            // Ракета/борт захватывает ТОЛЬКО противника, поэтому сторона цели = противоположная
+            // стороне локатора. Это закрывает ракеты, которые на момент старта записи уже были
+            // в воздухе (их носителя в реплее нет и позиционно его не найти).
+            ResolveCoalitionByLocks(session, recType, bf, recorder);
+
+            // 2.1 Ракеты, сторона которых всё ещё неизвестна, — по носителю.
+            // В файле реплея у ракет entityType = 6 (без бита стороны) и НЕТ поля parent,
+            // поэтому единственный физический признак носителя — совпадение позиции старта
+            // ракеты с позицией юнита в момент пуска (ракета стартует с носителя).
+            //
+            // ВАЖНО: «ближайший в радиусе 4 км» — недостоверно, если рядом оказался кто-то ещё
+            // (плотные скопления наземки, союзные и вражеские рядом). Поэтому:
+            //   * близкая посадка (<= 800 м) считается однозначной — ракета физически на носителе;
+            //   * при дальней посадке выбор отбрасывается, если в сопоставимой близости
+            //     присутствует юнит ПРОТИВОПОЛОЖНОЙ стороны (иначе сторона не определяется).
             foreach (DebriefEntity msl in session.Entities)
             {
                 if (msl.Type != "Missile" || msl.Track.Count == 0) continue;
                 DebriefSample mStart = msl.Track[0];
 
-                DebriefEntity bestLauncher = null;
-                int mslNumId;
-                if (msl.Id != null && msl.Id.StartsWith("vtr_") &&
-                    int.TryParse(msl.Id.Substring(4), out mslNumId))
+                // Кандидаты в носители с дистанциями (только известная сторона).
+                List<DebriefEntity> cands = new List<DebriefEntity>();
+                List<double> candDist = new List<double>();
+                foreach (DebriefEntity cand in session.Entities)
                 {
-                    int parentId;
-                    if (idToParentId.TryGetValue(mslNumId, out parentId))
-                        idToEntity.TryGetValue(parentId, out bestLauncher);
+                    if (cand == msl || cand.Type == "Missile") continue;
+                    if (string.IsNullOrEmpty(cand.Coalition) || cand.Coalition == "Neutral") continue;
+                    // Носителем может быть только реальная пусковая платформа. Иначе в плотном
+                    // скоплении наземки «ближайшим» оказывается танк/БТР/бункер/палатка,
+                    // и ракета получает ЧУЖУЮ сторону и чужое имя (9M311 -> IR APC и т.п.).
+                    if (!IsWeaponPlatform(cand)) continue;
+                    DebriefSample cPos = cand.GetStateAt(msl.FirstTime);
+                    if (cPos == null) continue;
+                    double d = Math.Sqrt(Math.Pow(cPos.X - mStart.X, 2) + Math.Pow(cPos.Y - mStart.Y, 2) + Math.Pow(cPos.Alt - mStart.Alt, 2));
+                    if (d > 4000.0) continue;
+                    cands.Add(cand);
+                    candDist.Add(d);
                 }
+                if (cands.Count == 0) continue;
 
-                if (bestLauncher == null || bestLauncher.Type == "Missile")
+                int bi = 0;
+                for (int i = 1; i < candDist.Count; i++) if (candDist[i] < candDist[bi]) bi = i;
+                DebriefEntity bestLauncher = cands[bi];
+                double bestDist = candDist[bi];
+
+                // Защита от неоднозначности: дальняя посадка + рядом юнит другой стороны => не угадываем.
+                if (bestDist > 800.0)
                 {
-                    bestLauncher = null;
-                    double bestDist = 4000.0;
-                    foreach (DebriefEntity cand in session.Entities)
+                    bool ambiguous = false;
+                    for (int i = 0; i < cands.Count; i++)
                     {
-                        if (cand == msl || cand.Type == "Missile") continue;
-                        DebriefSample cPos = cand.GetStateAt(msl.FirstTime);
-                        if (cPos == null) continue;
-                        double d = Math.Sqrt(Math.Pow(cPos.X - mStart.X, 2) + Math.Pow(cPos.Y - mStart.Y, 2) + Math.Pow(cPos.Alt - mStart.Alt, 2));
-                        if (d < bestDist)
-                        {
-                            bestDist = d;
-                            bestLauncher = cand;
-                        }
+                        if (i == bi) continue;
+                        if (cands[i].Coalition == bestLauncher.Coalition) continue;
+                        if (candDist[i] <= bestDist * 1.4 + 200.0) { ambiguous = true; break; }
                     }
+                    if (ambiguous) bestLauncher = null;
                 }
 
-                if (bestLauncher != null)
-                {
+                if (bestLauncher == null) continue;
+
+                if (string.IsNullOrEmpty(msl.Coalition) || msl.Coalition == "Neutral")
                     msl.Coalition = bestLauncher.Coalition;
-                    if (bestLauncher.IsPlayer)
-                    {
-                        msl.Pilot = "MY_MISSILE:" + bestLauncher.Name;
-                        session.PlayerLaunches++;
-                    }
-                    else
-                    {
-                        msl.Pilot = bestLauncher.Name;
-                    }
+
+                if (bestLauncher.IsPlayer)
+                {
+                    msl.Pilot = "MY_MISSILE:" + bestLauncher.Name;
+                    session.PlayerLaunches++;
+                }
+                else
+                {
+                    msl.Pilot = bestLauncher.Name;
                 }
             }
+
+            // 2.5 Повторный проход по локам: после привязки носителей стали известны стороны
+            // ещё части ракет, поэтому цепочки «ракета локала цель» теперь могут разрешиться.
+            ResolveCoalitionByLocks(session, recType, bf, recorder);
 
             // Декодируем реальные дорожки из customTracks (радарные захваты БРЛС/ЗРК/АРЛ-ракет и станции РЭБ EF-24G)
             int decodedBeams = 0;
@@ -3769,69 +3877,6 @@ public static class DebriefEngine
                     WorldY = ms.Y
                 });
             }
-            else if (ent.Coalition == "Enemies")
-            {
-                // Определяем цель вражеской ракеты строго по факту захвата из session.Beams (без дистанций)
-                DebriefEntity lockedTarget = null;
-                foreach (TacticalBeam bm in s.Beams)
-                {
-                    if (bm.Kind != "RWR_SPIKE") continue;
-                    bool fromThisMsl = bm.FromName.IndexOf(ent.Name, StringComparison.OrdinalIgnoreCase) >= 0 &&
-                                       bm.StartTime >= ent.FirstTime - 1.0 && bm.StartTime <= ent.LastTime + 1.0;
-                    bool fromLauncher = !string.IsNullOrEmpty(ent.Pilot) &&
-                                        bm.FromName.IndexOf(ent.Pilot, StringComparison.OrdinalIgnoreCase) >= 0 &&
-                                        Math.Abs(bm.StartTime - ent.FirstTime) <= 3.0;
-                    if (fromThisMsl || fromLauncher)
-                    {
-                        foreach (DebriefEntity cand in s.Entities)
-                        {
-                            if (cand.Coalition == "Allies" && cand.Name.Equals(bm.ToName, StringComparison.OrdinalIgnoreCase) &&
-                                cand.FirstTime <= ent.FirstTime && cand.LastTime >= ent.FirstTime)
-                            {
-                                lockedTarget = cand;
-                                break;
-                            }
-                        }
-                        if (lockedTarget != null) break;
-                    }
-                }
-
-                if (lockedTarget != null && lockedTarget.IsPlayer)
-                {
-                    s.ThreatMissilesCount++;
-                    TacticalEvent thr = new TacticalEvent
-                    {
-                        Time = ent.FirstTime,
-                        Kind = "THREAT",
-                        Severity = "CRITICAL",
-                        Title = string.Format("УГРОЗА: пуск {0} ({1}) по вам", ent.Name, ent.Pilot),
-                        Description = string.Format("Противник ({0}) выполнил пуск ракеты {1} с захватом вашего борта!", ent.Pilot, ent.Name),
-                        Advice = "Выполните отворот на 90° (Notch) с отстрелом ДО (Chaff) и снижением.",
-                        WorldX = ms.X,
-                        WorldY = ms.Y
-                    };
-                    s.Events.Add(thr);
-                    s.Mistakes.Add(thr);
-                }
-                else if (lockedTarget != null)
-                {
-                    bool isAntiMissile = (lockedTarget.Type == "Missile");
-                    s.Events.Add(new TacticalEvent
-                    {
-                        Time = ent.FirstTime,
-                        Kind = "THREAT",
-                        Severity = isAntiMissile ? "INFO" : "WARNING",
-                        Title = isAntiMissile
-                            ? string.Format("ПВО врага ({0}): перехват {1} ракетой {2}", ent.Pilot, lockedTarget.Name, ent.Name)
-                            : string.Format("Пуск врага ({0}): {1} по {2}", ent.Pilot, ent.Name, lockedTarget.Name),
-                        Description = isAntiMissile
-                            ? string.Format("ЗРК/корабль противника ({0}) выпустил {1} на перехват ракеты {2}.", ent.Pilot, ent.Name, lockedTarget.Name)
-                            : string.Format("Противник ({0}) выпустил {1} по союзнику {2}.", ent.Pilot, ent.Name, lockedTarget.Name),
-                        WorldX = ms.X,
-                        WorldY = ms.Y
-                    });
-                }
-            }
         }
 
         // 2. Все попадания ракет и гибель юнитов (трек цели должен оборваться в пределах +-2.5 сек от взрыва ракеты)
@@ -3873,6 +3918,12 @@ public static class DebriefEngine
             {
                 killedIds.Add(hitVictim.Id);
                 hitByMissile[msl.Id] = hitVictim.Name;
+
+                // Сторона ракеты, которая на момент старта записи уже была в воздухе
+                // (ни носителя, ни лока в реплее нет): попадание возможно только по противнику,
+                // значит сторона ракеты противоположна стороне поражённой цели.
+                if (msl.Coalition == "Neutral" && !string.IsNullOrEmpty(hitVictim.Coalition) && hitVictim.Coalition != "Neutral")
+                    msl.Coalition = hitVictim.Coalition == "Enemies" ? "Allies" : "Enemies";
                 double hitTime = msl.LastTime;
                 DebriefSample hitPos = hitVictim.GetStateAt(Math.Min(hitTime, hitVictim.LastTime)) ?? mEnd;
 
@@ -4113,16 +4164,228 @@ public static class DebriefEngine
         // Восстанавливаем недостающие лучи по кинематике треков — это не зависит от типа техники,
         // стороны конфликта и версии игры.
         SynthesizeMissingLockBeams(s);
+
+        // 7. УГРОЗЫ и предупреждения СПО строим ПОСЛЕ того, как собраны ВСЕ лучи
+        //    (нативные customTracks + синтетические). Раньше этот блок стоял в секции 1
+        //    ДО синтеза лучей, поэтому «пуск по вам» не определялся вовсе (Угроз=0).
+        AddEnemyThreatAndRwrEvents(s);
     }
 
-    private static readonly Regex RadarGuidedMissilePattern = new Regex(
-        @"AIM-120|AIM-54|AIM-7|RIM-67|ASM-66|BSM-66|HARM|AGM-188|FLKM|SEA-900|9M311|SAAW|CAGM",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled);
-
-    private static bool IsRadarGuidedMissile(DebriefEntity e)
+    // Угрозы (вражеская ракета с захватом вашего борта) и облучение СПО (RWR) по игроку.
+    private static void AddEnemyThreatAndRwrEvents(DebriefSession s)
     {
-        if (e == null || e.Type != "Missile") return false;
-        return RadarGuidedMissilePattern.IsMatch(e.Name ?? "");
+        if (s == null || s.Entities.Count == 0) return;
+
+        // RWR: вражеский захват/подсветка именно ВАШЕГО борта — отдельное предупреждение.
+        HashSet<string> rwrSpikeTargets = new HashSet<string>();
+        foreach (TacticalBeam bm in s.Beams)
+        {
+            if (bm.Kind != "RWR_SPIKE") continue;
+            if (string.IsNullOrEmpty(bm.ToId)) continue;
+            DebriefEntity tgt = null;
+            foreach (DebriefEntity e in s.Entities)
+                if (e.Id == bm.ToId) { tgt = e; break; }
+            if (tgt == null || !tgt.IsPlayer) continue;
+            if (!rwrSpikeTargets.Add(bm.ToId + "|" + bm.StartTime.ToString("F0"))) continue;
+
+            s.RwrSpikesCount++;
+            s.Events.Add(new TacticalEvent
+            {
+                Time = bm.StartTime,
+                Kind = "RWR",
+                Severity = "WARNING",
+                Title = string.Format("СПО (RWR): захват вашего борта — {0}", bm.FromName),
+                Description = string.Format("Радар/ГСН противника ({0}) взял ваш борт на сопровождение. Цель: {1}.", bm.FromName, bm.ToName),
+                WorldX = bm.FromX,
+                WorldY = bm.FromY
+            });
+        }
+
+        // THREAT: вражеские ракеты, чья цель — ваш борт или союзник.
+        foreach (DebriefEntity ent in s.Entities)
+        {
+            if (ent.Type != "Missile" || ent.Track.Count == 0) continue;
+            if (ent.Coalition != "Enemies") continue;
+            DebriefSample ms = ent.Track[0];
+
+            DebriefEntity lockedTarget = null;
+            foreach (TacticalBeam bm in s.Beams)
+            {
+                if (bm.Kind != "RWR_SPIKE") continue;
+                if (string.IsNullOrEmpty(bm.ToId)) continue;
+                bool fromThisMsl = (bm.FromId == ent.Id);
+                bool fromLauncher = !string.IsNullOrEmpty(ent.Pilot) &&
+                                    bm.FromName.IndexOf(ent.Pilot, StringComparison.OrdinalIgnoreCase) >= 0 &&
+                                    Math.Abs(bm.StartTime - ent.FirstTime) <= 3.0;
+                if (!fromThisMsl && !fromLauncher) continue;
+
+                DebriefEntity cand = null;
+                foreach (DebriefEntity e in s.Entities)
+                    if (e.Id == bm.ToId) { cand = e; break; }
+                if (cand == null || cand.Type == "Missile") continue;
+                if (cand.Coalition != "Allies") continue;   // вражеская ракета целится только в наших
+                lockedTarget = cand;
+                break;
+            }
+            if (lockedTarget == null) continue;
+
+            if (lockedTarget.IsPlayer)
+            {
+                s.ThreatMissilesCount++;
+                TacticalEvent thr = new TacticalEvent
+                {
+                    Time = ent.FirstTime,
+                    Kind = "THREAT",
+                    Severity = "CRITICAL",
+                    Title = string.Format("УГРОЗА: пуск {0} ({1}) по вам", ent.Name, ent.Pilot),
+                    Description = string.Format("Противник ({0}) выполнил пуск ракеты {1} с захватом вашего борта!", ent.Pilot, ent.Name),
+                    Advice = "Выполните отворот на 90° (Notch) с отстрелом ДО (Chaff) и снижением.",
+                    WorldX = ms.X,
+                    WorldY = ms.Y
+                };
+                s.Events.Add(thr);
+                s.Mistakes.Add(thr);
+            }
+            else
+            {
+                bool isAntiMissile = (lockedTarget.Type == "Missile");
+                s.Events.Add(new TacticalEvent
+                {
+                    Time = ent.FirstTime,
+                    Kind = "THREAT",
+                    Severity = isAntiMissile ? "INFO" : "WARNING",
+                    Title = isAntiMissile
+                        ? string.Format("ПВО врага ({0}): перехват {1} ракетой {2}", ent.Pilot, lockedTarget.Name, ent.Name)
+                        : string.Format("Пуск врага ({0}): {1} по {2}", ent.Pilot, ent.Name, lockedTarget.Name),
+                    Description = isAntiMissile
+                        ? string.Format("ЗРК/корабль противника ({0}) выпустил {1} на перехват ракеты {2}.", ent.Pilot, ent.Name, lockedTarget.Name)
+                        : string.Format("Противник ({0}) выпустил {1} по союзнику {2}.", ent.Pilot, ent.Name, lockedTarget.Name),
+                    WorldX = ms.X,
+                    WorldY = ms.Y
+                });
+            }
+        }
+    }
+
+    // =====================================================================
+    // === Уточнение стороны по записанным локам (LockingRadar) ============
+    // RadarLockReplayMetadata.actorId - кто локает, RadarLockKeyframe.targetId - кого.
+    // Захват всегда направлен на противника => сторона цели противоположна стороне локатора.
+    // Никаких эвристик по именам/дальности: используются только факты из файла реплея.
+    // =====================================================================
+    private static void ResolveCoalitionByLocks(DebriefSession s, Type recType,
+        System.Reflection.BindingFlags bf, object recorder)
+    {
+        if (s == null || s.Entities.Count == 0) return;
+
+        System.Collections.IDictionary customDict = null;
+        try
+        {
+            System.Reflection.FieldInfo fCustom = recType.GetField("customTracks", bf);
+            customDict = fCustom != null ? fCustom.GetValue(recorder) as System.Collections.IDictionary : null;
+        }
+        catch { }
+        if (customDict == null) return;
+
+        Dictionary<int, DebriefEntity> byId = new Dictionary<int, DebriefEntity>();
+        foreach (DebriefEntity e in s.Entities)
+        {
+            if (e.Id == null || !e.Id.StartsWith("vtr_")) continue;
+            int n;
+            if (int.TryParse(e.Id.Substring(4), out n) && !byId.ContainsKey(n)) byId[n] = e;
+        }
+
+        List<int[]> pairs = new List<int[]>();
+        foreach (System.Collections.DictionaryEntry cde in customDict)
+        {
+            object ct = cde.Value;
+            if (ct == null) continue;
+            object meta = null;
+            System.Collections.IList kfs = null;
+            try
+            {
+                for (Type w = ct.GetType(); w != null && w != typeof(object); w = w.BaseType)
+                    foreach (System.Reflection.FieldInfo fi in w.GetFields(bf | System.Reflection.BindingFlags.DeclaredOnly))
+                    {
+                        object v = fi.GetValue(ct);
+                        if (fi.Name == "metadata" || fi.Name == "meta") meta = v;
+                        else if (v is System.Collections.IList) kfs = (System.Collections.IList)v;
+                    }
+            }
+            catch { continue; }
+            if (meta == null || kfs == null || kfs.Count == 0) continue;
+            if (meta.GetType().Name != "RadarLockReplayMetadata") continue;
+
+            int actorId = -1;
+            try
+            {
+                System.Reflection.FieldInfo fa = meta.GetType().GetField("actorId", bf);
+                if (fa != null) actorId = Convert.ToInt32(fa.GetValue(meta));
+            }
+            catch { }
+            if (actorId < 0 || !byId.ContainsKey(actorId)) continue;
+
+            System.Reflection.FieldInfo ft = null;
+            for (int i = 0; i < kfs.Count; i++)
+            {
+                if (kfs[i] == null) continue;
+                if (ft == null) ft = kfs[i].GetType().GetField("targetId", bf);
+                if (ft == null) break;
+                int tid = -1;
+                try { tid = Convert.ToInt32(ft.GetValue(kfs[i])); } catch { continue; }
+                if (tid >= 0 && byId.ContainsKey(tid)) pairs.Add(new int[] { actorId, tid });
+            }
+        }
+        if (pairs.Count == 0) return;
+
+        // Фиксированная точка: неизвестная сторона берётся противоположной известной стороне локатора.
+        // Несколько проходов — цепочки «борт локал ракету, ракета локала цель».
+        for (int pass = 0; pass < 6; pass++)
+        {
+            bool changed = false;
+            for (int i = 0; i < pairs.Count; i++)
+            {
+                DebriefEntity act, tgt;
+                if (!byId.TryGetValue(pairs[i][0], out act)) continue;
+                if (!byId.TryGetValue(pairs[i][1], out tgt)) continue;
+                if (act == null || tgt == null || act == tgt) continue;
+
+                if (tgt.Coalition == "Neutral" && act.Coalition != "Neutral" && act.Coalition != null)
+                {
+                    tgt.Coalition = act.Coalition == "Enemies" ? "Allies" : "Enemies";
+                    changed = true;
+                }
+                else if (act.Coalition == "Neutral" && tgt.Coalition != "Neutral" && tgt.Coalition != null)
+                {
+                    act.Coalition = tgt.Coalition == "Enemies" ? "Allies" : "Enemies";
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+    }
+
+    // Может ли этот юнит вообще быть носителем оружия (пусковой платформой)?
+    // Авиация/вертолёты/корабли — всегда. Наземка — только пусковые установки,
+    // ЗРК/ЗРК-батареи, ПВО-турели, ПУ, MANPADS. Танки, БТР, пехота, бункеры, палатки,
+    // радары и грузовики ракет не пускают — они не должны становиться «носителем».
+    private static bool IsWeaponPlatform(DebriefEntity e)
+    {
+        if (e == null) return false;
+        if (e.Class == "Air" || e.Class == "Chopper" || e.Class == "Sea") return true;
+        if (e.Class != "Ground" && e.Class != "Base") return false;
+        string nm = e.Name ?? "";
+        return nm.IndexOf("Launcher", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("Battery", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("MANPADS", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("Turret", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("VLS", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("SAAW", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("CIWS", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("Phalanx", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("SAM", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("Anti-Air", StringComparison.OrdinalIgnoreCase) >= 0
+            || nm.IndexOf("Artillery", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     // Наземный/надводный носитель РЛС: ЗРК, корабль, РЛС обнаружения.
@@ -4171,6 +4434,24 @@ public static class DebriefEngine
         return null;
     }
 
+    // Поиск сущности по имени с приоритетом экземпляра, живого в момент t.
+    // Респавн порождает несколько сущностей с одним именем; «первый по списку»
+    // может оказаться уже мёртвым, и луч ракеты улетит в его старую точку спавна.
+    private static DebriefEntity FindEntityByNameAtTime(DebriefSession s, string name, double t)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        DebriefEntity fallback = null;
+        double bestGap = double.MaxValue;
+        foreach (DebriefEntity e in s.Entities)
+        {
+            if (!string.Equals(e.Name, name, StringComparison.OrdinalIgnoreCase)) continue;
+            if (t >= e.FirstTime - 0.5 && t <= e.LastTime + 0.5) return e;   // жив в этот момент
+            double gap = Math.Min(Math.Abs(e.FirstTime - t), Math.Abs(e.LastTime - t));
+            if (gap < bestGap) { bestGap = gap; fallback = e; }
+        }
+        return fallback;
+    }
+
     private static string BeamKindFor(DebriefEntity src)
     {
         if (src == null) return "ALLY_LOCK";
@@ -4210,252 +4491,12 @@ public static class DebriefEngine
         });
     }
 
-    // Цель ракеты: сначала подтверждённое попадание из аналитики пусков,
-    // затем — ближайший противник в конце трека, затем — минимальное сближение.
-    private static DebriefEntity FindMissileTarget(DebriefSession s, DebriefEntity msl)
-    {
-        foreach (DebriefLaunch dl in s.Launches)
-        {
-            if (dl.MissileId != msl.Id || string.IsNullOrEmpty(dl.TargetName)) continue;
-            DebriefEntity hit = FindEntityByName(s, dl.TargetName);
-            if (hit != null) return hit;
-        }
-
-        if (msl.Track.Count < 2) return null;
-
-        // Цель определяем по последней точке трека: ракета заканчивает полёт у цели
-        // (попадание, подрыв рядом или промах в непосредственной близости). Поиск
-        // «минимальной дистанции за весь полёт» даёт ложные срабатывания на пролетающих бортах.
-        DebriefSample endPoint = msl.GetStateAt(msl.LastTime);
-        if (endPoint != null)
-        {
-            DebriefEntity pointTarget = null;
-            double pointBest = double.MaxValue;
-            foreach (DebriefEntity cand in s.Entities)
-            {
-                if (cand == msl || cand.Track.Count == 0) continue;
-                if (cand.Coalition == msl.Coalition) continue;
-                if (cand.Class == "Missile") continue;
-                DebriefSample b = cand.GetStateAt(msl.LastTime);
-                if (b == null) continue;
-                double d = BeamDist3D(endPoint, b);
-                if (d < pointBest) { pointBest = d; pointTarget = cand; }
-            }
-            if (pointTarget != null && pointBest <= 3000.0) return pointTarget;
-        }
-
-        DebriefEntity endTarget = null;
-        double endBest = double.MaxValue;
-        double tEndFrom = Math.Max(msl.FirstTime, msl.LastTime - 2.0);
-        for (double t = tEndFrom; t <= msl.LastTime + 0.01; t += 0.5)
-        {
-            DebriefSample a = msl.GetStateAt(t);
-            if (a == null) continue;
-            foreach (DebriefEntity cand in s.Entities)
-            {
-                if (cand == msl || cand.Track.Count == 0) continue;
-                if (cand.Coalition == msl.Coalition) continue;
-                if (cand.Class == "Missile") continue;
-                DebriefSample b = cand.GetStateAt(t);
-                if (b == null) continue;
-                double d = BeamDist3D(a, b);
-                if (d < endBest) { endBest = d; endTarget = cand; }
-            }
-        }
-        if (endTarget != null && endBest <= 3000.0) return endTarget;
-
-        // Резерв: последние 20% полёта, только очень близкое сближение
-        double tFrom = msl.FirstTime + (msl.LastTime - msl.FirstTime) * 0.8;
-        double best = double.MaxValue;
-        DebriefEntity bestEnt = null;
-
-        foreach (DebriefEntity cand in s.Entities)
-        {
-            if (cand == msl || cand.Track.Count == 0) continue;
-            // Кинематика ищет только реальную цель: своя техника и соседние ракеты из залпа
-            // летят рядом и дают ложное «сближение».
-            if (cand.Coalition == msl.Coalition) continue;
-            if (cand.Class == "Missile") continue;
-            if (cand.LastTime < tFrom || cand.FirstTime > msl.LastTime) continue;
-
-            for (double t = tFrom; t <= msl.LastTime + 0.01; t += 1.0)
-            {
-                DebriefSample a = msl.GetStateAt(t);
-                DebriefSample b = cand.GetStateAt(t);
-                if (a == null || b == null) continue;
-                double d = BeamDist3D(a, b);
-                if (d < best) { best = d; bestEnt = cand; }
-            }
-        }
-
-        return best <= 2000.0 ? bestEnt : null;
-    }
-
-    // Резерв для ракет, которые не попали: цель определяется по начальному направлению
-    // пуска (продолжение вектора полёта на первые секунды). Так ИИ-пуски по кораблям/РЛС
-    // получают пунктир захвата даже при промахе.
-    private static DebriefEntity FindTargetByHeading(DebriefSession s, DebriefEntity msl)
-    {
-        if (msl.Track.Count < 3) return null;
-        DebriefSample p0 = msl.Track[0];
-        DebriefSample p1 = null;
-        for (int i = 1; i < msl.Track.Count; i++)
-        {
-            if (msl.Track[i].Time >= msl.FirstTime + 3.0) { p1 = msl.Track[i]; break; }
-        }
-        if (p1 == null) p1 = msl.Track[msl.Track.Count - 1];
-
-        double dx = p1.X - p0.X, dy = p1.Y - p0.Y;
-        double len = Math.Sqrt(dx * dx + dy * dy);
-        if (len < 100.0) return null;
-        dx /= len; dy /= len;
-
-        DebriefEntity best = null;
-        double bestPerp = double.MaxValue;
-        foreach (DebriefEntity cand in s.Entities)
-        {
-            if (cand == msl || cand.Track.Count == 0) continue;
-            if (cand.Coalition == msl.Coalition) continue;
-            if (cand.Class == "Missile") continue;
-
-            DebriefSample b = cand.GetStateAt(msl.FirstTime);
-            if (b == null && cand.Track.Count > 0) b = cand.Track[0];
-            if (b == null) continue;
-
-            double rx = b.X - p0.X, ry = b.Y - p0.Y;
-            double proj = rx * dx + ry * dy;
-            if (proj < 1000.0 || proj > 120000.0) continue;
-
-            double perp = Math.Abs(rx * (-dy) + ry * dx);
-            if (perp > Math.Max(3000.0, proj * 0.15)) continue;
-            if (perp < bestPerp) { bestPerp = perp; best = cand; }
-        }
-        return best;
-    }
+    // Цель ракеты берётся ТОЛЬКО из авторитетных источников реплея — см. FindLauncherLockTarget
+    // (родной лок носителя в момент пуска) и FindConfirmedHitTarget (подтверждённое попадание).
+    // Прежние кинематические догадки (ближайший враг в конце трека / минимальное сближение /
+    // продолжение курса) удалены: они и давали пунктиры, нацеленные не в ту цель.
 
     // =====================================================================
-    // === Аэродромы ========================================================
-    // В штатном .vtr статических объектов карты нет. Восстанавливаем аэродромы
-    // по трекам бортов: точки, где самолёт/вертолёт стоял или катился по земле
-    // (малая высота и малая скорость) в начале либо в конце трека.
-    // =====================================================================
-    private static void DetectAirfields(DebriefSession s)
-    {
-        if (s == null) return;
-        s.Airfields.Clear();
-        if (s.Entities == null || s.Entities.Count == 0) return;
-
-        List<double[]> candidates = new List<double[]>();
-        bool haveTerrain = s.TerrainHeights != null && s.MapSizeMeters > 100.0;
-
-        foreach (DebriefEntity ent in s.Entities)
-        {
-            if (ent.Class != "Air" && ent.Class != "Chopper") continue;
-            if (ent.Track.Count < 5) continue;
-
-            TryAddAirfieldPoint(s, ent, 0, 1, candidates, haveTerrain);
-            TryAddAirfieldPoint(s, ent, ent.Track.Count - 1, -1, candidates, haveTerrain);
-        }
-
-        if (candidates.Count == 0) return;
-
-        // Жадная кластеризация: одна точка на аэродром
-        const double clusterR = 2500.0;
-        List<double[]> clusters = new List<double[]>();   // x, y, sumSin, sumCos, count
-        foreach (double[] c in candidates)
-        {
-            bool merged = false;
-            for (int i = 0; i < clusters.Count; i++)
-            {
-                double dx = clusters[i][0] - c[0];
-                double dy = clusters[i][1] - c[1];
-                if (dx * dx + dy * dy <= clusterR * clusterR)
-                {
-                    double n = clusters[i][4];
-                    clusters[i][0] = (clusters[i][0] * n + c[0]) / (n + 1.0);
-                    clusters[i][1] = (clusters[i][1] * n + c[1]) / (n + 1.0);
-                    clusters[i][2] += Math.Sin(c[2] * Math.PI / 180.0);
-                    clusters[i][3] += Math.Cos(c[2] * Math.PI / 180.0);
-                    clusters[i][4] = n + 1.0;
-                    merged = true;
-                    break;
-                }
-            }
-            if (!merged)
-                clusters.Add(new double[] { c[0], c[1], Math.Sin(c[2] * Math.PI / 180.0), Math.Cos(c[2] * Math.PI / 180.0), 1.0 });
-        }
-
-        int idx = 0;
-        foreach (double[] cl in clusters)
-        {
-            double hdg = Math.Atan2(cl[2], cl[3]) * 180.0 / Math.PI;
-            if (hdg < 0.0) hdg += 360.0;
-            idx++;
-            s.Airfields.Add(new MapPoiMarker
-            {
-                Kind = "Airfield",
-                Label = "АЭРОДРОМ " + idx,
-                Coalition = "Neutral",
-                X = cl[0],
-                Y = cl[1],
-                Heading = hdg
-            });
-        }
-    }
-
-    // Аэродром — ровная площадка: перепад высот в радиусе r не должен превышать maxDelta
-    private static bool IsFlatArea(DebriefSession s, double x, double y, double r, double maxDelta)
-    {
-        double mn = double.MaxValue, mx = double.MinValue;
-        for (int i = 0; i < 8; i++)
-        {
-            double a = i * Math.PI / 4.0;
-            double h = s.GetGroundAltitudeAt(x + Math.Cos(a) * r, y + Math.Sin(a) * r);
-            if (h < mn) mn = h;
-            if (h > mx) mx = h;
-        }
-        double hc = s.GetGroundAltitudeAt(x, y);
-        if (hc < mn) mn = hc;
-        if (hc > mx) mx = hc;
-        return (mx - mn) <= maxDelta;
-    }
-
-    private static void TryAddAirfieldPoint(DebriefSession s, DebriefEntity ent, int startIdx, int step,
-        List<double[]> candidates, bool haveTerrain)
-    {
-        int count = ent.Track.Count;
-        int limit = Math.Min(10, count);
-        for (int k = 0; k < limit; k++)
-        {
-            int i = startIdx + k * step;
-            if (i < 0 || i >= count) return;
-            DebriefSample smp = ent.Track[i];
-            if (smp.Speed > 100.0) continue;     // уже в разбеге/пробеге на большой скорости
-            double ground = haveTerrain ? s.GetGroundAltitudeAt(smp.X, smp.Y) : 0.0;
-            if (haveTerrain && ground < 1.5) return;   // над водой аэродрома нет
-            if (smp.Alt - ground > 45.0) continue;     // «на земле», а не пролёт над горой
-            if (haveTerrain && !IsFlatArea(s, smp.X, smp.Y, 700.0, 140.0)) continue;
-
-            // Курс ВПП: по направлению движения, если борт успел переместиться
-            double hdg = smp.Heading;
-            int j0 = Math.Max(0, i - 4);
-            int j1 = Math.Min(count - 1, i + 4);
-            double bx = ent.Track[j0].X, by = ent.Track[j0].Y;
-            for (int j = j1; j >= j0; j--)
-            {
-                double dx = ent.Track[j].X - bx;
-                double dy = ent.Track[j].Y - by;
-                if (dx * dx + dy * dy > 300.0 * 300.0)
-                {
-                    hdg = Math.Atan2(dx, dy) * 180.0 / Math.PI;
-                    if (hdg < 0.0) hdg += 360.0;
-                    break;
-                }
-            }
-            candidates.Add(new double[] { smp.X, smp.Y, hdg });
-            return;
-        }
-    }
 
     private static void SynthesizeMissingLockBeams(DebriefSession s)
     {
@@ -4463,122 +4504,110 @@ public static class DebriefEngine
 
         // Что уже восстановлено штатно (customTracks/лог) — не дублируем
         HashSet<string> existingFrom = new HashSet<string>();
-        HashSet<string> existingPair = new HashSet<string>();
         foreach (TacticalBeam bm in s.Beams)
         {
             if (string.IsNullOrEmpty(bm.FromId)) continue;
             existingFrom.Add(bm.FromId);
-            existingPair.Add(bm.FromId + "|" + (bm.ToId ?? ""));
         }
 
-        // 6.1 Ракеты с радиолокационным наведением: пунктир «ракета → цель»
+        // 6.1 Ракеты БЕЗ родного лока: цель берём ТОЛЬКО из авторитетных данных реплея:
+        //   (а) лок носителя в момент пуска (LockingRadar.actorId = носитель, targetId в это время);
+        //   (б) подтверждённое попадание (трек цели оборвался точно в конце трека ракеты).
+        // Кинематические догадки («ближайший по курсу/дальности») убраны — они и давали
+        // пунктиры, нацеленные не в ту цель.
         foreach (DebriefEntity msl in s.Entities)
         {
-            if (!IsRadarGuidedMissile(msl) || msl.Track.Count < 2) continue;
+            if (msl.Type != "Missile" || msl.Track.Count < 2) continue;
             if (msl.LastTime <= msl.FirstTime + 0.5) continue;
             if (existingFrom.Contains(msl.Id)) continue;
 
-            DebriefEntity tgt = FindMissileTarget(s, msl);
-            if (tgt == null) tgt = FindTargetByHeading(s, msl);
+            DebriefEntity tgt = FindLauncherLockTarget(s, msl);
+            if (tgt == null) tgt = FindConfirmedHitTarget(s, msl);
             if (tgt == null) continue;
-            if (existingPair.Contains(msl.Id + "|" + tgt.Id)) continue;
 
             AddSyntheticBeam(s, msl, tgt, msl.FirstTime, msl.LastTime, BeamKindFor(msl), "[АРЛ] " + msl.Name);
             existingFrom.Add(msl.Id);
-            existingPair.Add(msl.Id + "|" + tgt.Id);
 
-            // Подсветка цели наземным/надводным носителем (ЗРК/корабль) в момент пуска
-            DebriefEntity launcher = FindEntityByName(s, msl.Pilot);
+            // Подсветка цели наземным/надводным носителем (ЗРК/корабль) — только если этот носитель
+            // действительно имеет родной лок-трек (то есть его РЛС записана в реплее).
+            DebriefEntity launcher = FindEntityByName(s, LauncherNameOf(msl));
             if (launcher != null && launcher != msl && IsSurfaceRadarUnit(launcher) &&
-                !existingFrom.Contains(launcher.Id) &&
-                !existingPair.Contains(launcher.Id + "|" + tgt.Id))
+                HasNativeLockTrack(s, launcher))
             {
                 double tStart = Math.Max(launcher.FirstTime, msl.FirstTime - 2.0);
                 double tEnd = Math.Min(Math.Min(launcher.LastTime, tgt.LastTime), msl.FirstTime + 4.0);
                 AddSyntheticBeam(s, launcher, tgt, tStart, tEnd, BeamKindFor(launcher), launcher.Name);
-                existingPair.Add(launcher.Id + "|" + tgt.Id);
             }
         }
 
-        // 6.2 Наземные/надводные РЛС без штатных лучей: пунктир «РЛС → цель»
-        foreach (DebriefEntity radar in s.Entities)
+        // 6.2 Наземные/надводные РЛС без родных луча — НЕ синтезируем.
+        // Раньше здесь изобретались лучи «радар → цель» по одной лишь дальности: это давало
+        // сотни ложных пунктиров (1466 вместо ~71 родных). В реплее реальные захваты
+        // записываются как LockingRadar (customTracks) и уже добавлены выше как родные лучи.
+    }
+
+    // Имя носителя ракеты (для «своих» ракет Pilot = "MY_MISSILE:<носитель>").
+    private static string LauncherNameOf(DebriefEntity msl)
+    {
+        string n = msl != null ? (msl.Pilot ?? "") : "";
+        if (n.StartsWith("MY_MISSILE:")) n = n.Substring("MY_MISSILE:".Length);
+        return n;
+    }
+
+    // Есть ли у юнита родной лок-трек из customTracks (то есть его РЛС реально записана).
+    private static bool HasNativeLockTrack(DebriefSession s, DebriefEntity ent)
+    {
+        if (s == null || ent == null) return false;
+        foreach (TacticalBeam bm in s.Beams)
+            if (bm.FromId == ent.Id && !string.IsNullOrEmpty(bm.ToId)) return true;
+        return false;
+    }
+
+    // (а) Цель ракеты из лока её носителя в момент пуска — авторитетный источник.
+    private static DebriefEntity FindLauncherLockTarget(DebriefSession s, DebriefEntity msl)
+    {
+        string ln = LauncherNameOf(msl);
+        if (string.IsNullOrEmpty(ln)) return null;
+        DebriefEntity launcher = FindEntityByNameAtTime(s, ln, msl.FirstTime);
+        if (launcher == null) launcher = FindEntityByName(s, ln);
+        if (launcher == null) return null;
+
+        DebriefEntity best = null;
+        double bestDt = double.MaxValue;
+        foreach (TacticalBeam bm in s.Beams)
         {
-            if (!IsSurfaceRadarUnit(radar) || radar.Track.Count == 0) continue;
-            if (existingFrom.Contains(radar.Id)) continue;
-
-            double range = 45000.0;
-            string rn = radar.Name ?? "";
-            if (rn.IndexOf("Early Warning", StringComparison.OrdinalIgnoreCase) >= 0) range = 90000.0;
-            else if (radar.Class == "Sea" || radar.RoleTag == "Ship") range = 60000.0;
-
-            DebriefEntity bestTgt = null;
-            double bestLen = 0, bestStart = 0, bestEnd = 0;
-
-            foreach (DebriefEntity cand in s.Entities)
-            {
-                if (cand == radar || cand.Track.Count == 0) continue;
-                if (cand.Coalition == radar.Coalition) continue;
-                if (cand.Class != "Air" && cand.Class != "Chopper" && cand.Class != "Missile") continue;
-
-                double t0 = Math.Max(radar.FirstTime, cand.FirstTime);
-                double t1 = Math.Min(radar.LastTime, cand.LastTime);
-                if (t1 <= t0 + 1.0) continue;
-
-                double segStart = -1, segEnd = 0;
-                double firstD = -1, lastD = -1;
-                double candBestLen = 0, candBestStart = 0, candBestEnd = 0;
-
-                for (double t = t0; t <= t1 + 0.01; t += 2.0)
-                {
-                    DebriefSample a = radar.GetStateAt(t);
-                    DebriefSample b = cand.GetStateAt(t);
-                    bool inRange = a != null && b != null && BeamDist3D(a, b) <= range;
-                    if (inRange)
-                    {
-                        if (segStart < 0) { segStart = t; firstD = BeamDist3D(a, b); }
-                        lastD = BeamDist3D(a, b);
-                        segEnd = Math.Min(t + 2.0, t1);
-                    }
-                    else if (segStart >= 0)
-                    {
-                        if (segEnd - segStart > candBestLen)
-                        { candBestLen = segEnd - segStart; candBestStart = segStart; candBestEnd = segEnd; }
-                        segStart = -1;
-                    }
-                }
-                if (segStart >= 0 && segEnd - segStart > candBestLen)
-                { candBestLen = segEnd - segStart; candBestStart = segStart; candBestEnd = segEnd; }
-                if (candBestLen < 2.0) continue;
-
-                // Ракета — только если реально летит на РЛС, а не пролетает мимо в зоне
-                if (cand.Class == "Missile" && firstD > 0 && lastD > 0 && lastD > firstD * 0.8) continue;
-
-                if (candBestLen > bestLen)
-                {
-                    bestLen = candBestLen;
-                    bestStart = candBestStart;
-                    bestEnd = candBestEnd;
-                    bestTgt = cand;
-                }
-            }
-
-            if (bestTgt == null) continue;
-            if (existingPair.Contains(radar.Id + "|" + bestTgt.Id)) continue;
-
-            // Долгий захват режем на сегменты: радар «обновляет» засветку, а не тянет
-            // сплошную линию через весь реплей. Шаг растёт на длинных захватах,
-            // чтобы не плодить сотни лучей.
-            double segLen = Math.Max(12.0, bestLen / 30.0);
-            double segGap = Math.Max(3.0, segLen * 0.25);
-            for (double ts = bestStart; ts < bestEnd - 0.5; ts += segLen + segGap)
-            {
-                double te = Math.Min(bestEnd, ts + segLen);
-                if (te - ts < 1.5) break;
-                AddSyntheticBeam(s, radar, bestTgt, ts, te, BeamKindFor(radar), radar.Name);
-            }
-            existingFrom.Add(radar.Id);
-            existingPair.Add(radar.Id + "|" + bestTgt.Id);
+            if (bm.FromId != launcher.Id) continue;
+            if (string.IsNullOrEmpty(bm.ToId)) continue;
+            // Лок должен накрывать момент пуска (допуск на дискретизацию трека).
+            if (bm.StartTime > msl.FirstTime + 1.5) continue;
+            if (bm.EndTime < msl.FirstTime - 1.5) continue;
+            double dt = Math.Abs(bm.StartTime - msl.FirstTime);
+            if (dt >= bestDt) continue;
+            DebriefEntity e = null;
+            foreach (DebriefEntity cand in s.Entities) if (cand.Id == bm.ToId) { e = cand; break; }
+            if (e == null || e.Id == msl.Id || e.Type == "Missile") continue;
+            best = e;
+            bestDt = dt;
         }
+        return best;
+    }
+
+    // (б) Подтверждённое попадание: в аналитике пусков есть имя поражённой цели.
+    private static DebriefEntity FindConfirmedHitTarget(DebriefSession s, DebriefEntity msl)
+    {
+        if (s.Launches == null) return null;
+        foreach (DebriefLaunch dl in s.Launches)
+        {
+            if (dl.MissileId != msl.Id) continue;
+            if (string.IsNullOrEmpty(dl.TargetName)) continue;
+            if (dl.Result != "ПОПАДАНИЕ") continue;
+            // Цель ищем среди живых в момент попадания экземпляров: при респавне
+            // FindEntityByName мог вернуть мёртвый борт, и луч уходил в старый спавн.
+            DebriefEntity e = FindEntityByNameAtTime(s, dl.TargetName, msl.LastTime);
+            if (e == null) e = FindEntityByName(s, dl.TargetName);
+            return e;
+        }
+        return null;
     }
 
 
@@ -4839,6 +4868,544 @@ public static class DebriefEngine
             LastVtrDiagnostic += " | HMErr=" + ex.Message;
         }
     }
+    public static void FindGameTypes(string filter, string outPath)
+    {
+        StringBuilder sb = new StringBuilder();
+        try
+        {
+            string root = FindVtolRootDir();
+            if (string.IsNullOrEmpty(root)) { File.WriteAllText(outPath, "root not found", Encoding.UTF8); return; }
+            string managed = Path.Combine(root, @"VTOLVR_Data\Managed");
+            AppDomain.CurrentDomain.AssemblyResolve += (s, a) =>
+            {
+                string n = new System.Reflection.AssemblyName(a.Name).Name + ".dll";
+                string p = Path.Combine(managed, n);
+                return File.Exists(p) ? System.Reflection.Assembly.LoadFrom(p) : null;
+            };
+            System.Reflection.Assembly gAsm = System.Reflection.Assembly.LoadFrom(Path.Combine(managed, "Assembly-CSharp.dll"));
+            System.Reflection.BindingFlags bf = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.DeclaredOnly;
+            foreach (Type t in SafeGetTypes(gAsm))
+            {
+                try
+                {
+                    if (t.FullName == null) continue;
+                    if (t.FullName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    sb.AppendLine("TYPE " + t.FullName + (t.BaseType != null ? " : " + t.BaseType.Name : ""));
+                    foreach (System.Reflection.FieldInfo f in t.GetFields(bf))
+                        sb.AppendLine("   F  " + f.FieldType.Name + " " + f.Name);
+                    foreach (System.Reflection.PropertyInfo p in t.GetProperties(bf))
+                        sb.AppendLine("   P  " + p.PropertyType.Name + " " + p.Name);
+                    foreach (System.Reflection.MethodInfo m in t.GetMethods(bf))
+                    {
+                        StringBuilder ps = new StringBuilder();
+                        foreach (System.Reflection.ParameterInfo pi in m.GetParameters()) ps.Append(pi.ParameterType.Name + " " + pi.Name + ", ");
+                        sb.AppendLine("   M  " + (m.IsStatic ? "static " : "") + m.ReturnType.Name + " " + m.Name + "(" + ps + ")");
+                    }
+                    sb.AppendLine();
+                }
+                catch { }
+            }
+        }
+        catch (Exception ex) { sb.AppendLine("ERR " + ex.Message); }
+        try { File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); } catch { }
+    }
+
+    // Превращает файл сценария (.vts/.vtsb) в читаемый текст родным API игры:
+    // VTScenarioInfo.ReadConfigNode(path) -> ConfigNode -> VTScenarioInfo.WriteConfigFile(node, out).
+    // Запуск: VTOL_QoL.exe --scenario-text <файл.vtsb> <out.txt>
+    // Дамп IL: для всех методов типа собираем строковые литералы (ldstr) и ссылки на члены.
+    // Запуск: VTOL_QoL.exe --il-dump <ИмяТипа> <out.txt>
+    public static void DumpTypeIL(string typeName, string outPath)
+    {
+        StringBuilder sb = new StringBuilder();
+        try
+        {
+            string root = FindVtolRootDir();
+            if (string.IsNullOrEmpty(root)) { File.WriteAllText(outPath, "root not found", Encoding.UTF8); return; }
+            string managed = Path.Combine(root, @"VTOLVR_Data\Managed");
+            AppDomain.CurrentDomain.AssemblyResolve += (s, a) =>
+            {
+                string n = new System.Reflection.AssemblyName(a.Name).Name + ".dll";
+                string p = Path.Combine(managed, n);
+                return File.Exists(p) ? System.Reflection.Assembly.LoadFrom(p) : null;
+            };
+            System.Reflection.Assembly asm = System.Reflection.Assembly.LoadFrom(Path.Combine(managed, "Assembly-CSharp.dll"));
+            System.Reflection.BindingFlags bf = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
+                                                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static |
+                                                System.Reflection.BindingFlags.DeclaredOnly;
+            foreach (Type t in SafeGetTypes(asm))
+            {
+                if (t.Name != typeName) continue;
+                sb.AppendLine("=== " + t.FullName + " ===");
+                foreach (System.Reflection.MethodInfo m in t.GetMethods(bf))
+                {
+                    System.Reflection.MethodBody body;
+                    try { body = m.GetMethodBody(); } catch { continue; }
+                    if (body == null) continue;
+                    byte[] il = body.GetILAsByteArray();
+                    if (il == null) continue;
+                    sb.AppendLine("-- " + m.Name);
+                    for (int i = 0; i < il.Length - 4; i++)
+                    {
+                        byte op = il[i];
+                        if (op != 0x72 && op != 0x28 && op != 0x6F && op != 0x7B && op != 0x7D && op != 0x7E && op != 0x80 && op != 0xD0) continue;
+                        int tok = BitConverter.ToInt32(il, i + 1);
+                        try
+                        {
+                            if (op == 0x72) { sb.AppendLine("     str \"" + m.Module.ResolveString(tok) + "\""); continue; }
+                            System.Reflection.MemberInfo mem = m.Module.ResolveMember(tok);
+                            if (mem != null && mem.DeclaringType != null)
+                                sb.AppendLine("     " + mem.DeclaringType.Name + "." + mem.Name);
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { sb.AppendLine("ERR " + ex.Message); }
+        try { File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); } catch { }
+    }
+
+    // =====================================================================
+    // === РАЗБОР СЦЕНАРИЯ: принадлежность юнита к стороне ==================
+    // Правило взято из самой игры (IL UnitSpawner.LoadFromSpawnerNode):
+    //   if (node.HasValue("team")) team = node["team"];
+    //   else                        team = Unit.teamIdx;   // из каталога по unitID
+    // Значит: явный ключ "team" приоритетен, иначе сторона задаётся префабом.
+    // =====================================================================
+    public class ScenarioUnitInfo
+    {
+        public int InstanceId = -1;
+        public string UnitId = "";
+        public string UnitGroup = "";
+        // Явный ключ "team" (пишется игрой при сохранении сценария в редакторе — версии 1.13+).
+        public string Team = "";
+        public List<double[]> Positions = new List<double[]>();
+    }
+
+    private static string ConfValue(string line)
+    {
+        int p = line.IndexOf('=');
+        return p < 0 ? "" : line.Substring(p + 1).Trim();
+    }
+
+    private static double[] ConfVector(string s)
+    {
+        int p = s.IndexOf('(');
+        int q = s.LastIndexOf(')');
+        if (p < 0 || q <= p) return null;
+        string[] parts = s.Substring(p + 1, q - p - 1).Split(',');
+        if (parts.Length < 3) return null;
+        double[] res = new double[3];
+        System.Globalization.CultureInfo inv = System.Globalization.CultureInfo.InvariantCulture;
+        for (int i = 0; i < 3; i++)
+            if (!double.TryParse(parts[i].Trim(), System.Globalization.NumberStyles.Float, inv, out res[i])) return null;
+        return res;
+    }
+
+    public static List<ScenarioUnitInfo> ParseScenarioUnits(string text)
+    {
+        List<ScenarioUnitInfo> list = new List<ScenarioUnitInfo>();
+        if (string.IsNullOrEmpty(text)) return list;
+        ScenarioUnitInfo cur = null;
+        bool inAlt = false;
+        foreach (string raw in text.Split('\n'))
+        {
+            string t = raw.Trim();
+            if (t.Length == 0) continue;
+            if (t == "UnitSpawner") { cur = new ScenarioUnitInfo(); inAlt = false; continue; }
+            if (cur == null) continue;
+
+            if (t.StartsWith("globalPosition=") || t.StartsWith("globalPosition =") || t.StartsWith("lastValidPlacement"))
+            {
+                double[] v = ConfVector(t);
+                if (v != null) cur.Positions.Add(new double[] { v[0], v[2] });
+                continue;
+            }
+            if (t == "altSpawn") { inAlt = true; continue; }
+            if (inAlt && (t.StartsWith("globalPos=") || t.StartsWith("globalPos =")))
+            {
+                double[] v = ConfVector(t);
+                if (v != null) cur.Positions.Add(new double[] { v[0], v[2] });
+                continue;
+            }
+            if (t.StartsWith("unitInstanceID"))
+            {
+                int n;
+                if (int.TryParse(ConfValue(t), out n)) cur.InstanceId = n;
+                continue;
+            }
+            if (t.StartsWith("unitID")) { cur.UnitId = ConfValue(t); continue; }
+            if (t.StartsWith("unitGroup")) { cur.UnitGroup = ConfValue(t); continue; }
+            if (t.StartsWith("team")) { cur.Team = ConfValue(t); continue; }
+            if (t == "}")
+            {
+                if (inAlt) { inAlt = false; continue; }
+                if (cur.InstanceId >= 0) list.Add(cur);
+                cur = null;
+            }
+        }
+        return list;
+    }
+
+    // Сторона по правилу игры: явный unitGroup/team → иначе префаб (собираем из сгруппированных юнитов).
+    public static Dictionary<int, string> ResolveScenarioTeams(List<ScenarioUnitInfo> units)
+    {
+        Dictionary<int, string> res = new Dictionary<int, string>();
+        if (units == null) return res;
+
+        // 1. Префаб -> сторона, выведенная из юнитов с явной группой (данные одного файла).
+        Dictionary<string, string> prefabTeam = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, string> prefabConflict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (ScenarioUnitInfo u in units)
+        {
+            string mapped = NormTeamValue(u.Team);
+            if (mapped == null) mapped = NormTeamValue(GroupTeam(u.UnitGroup));
+            if (mapped == null) continue;
+            string key = u.UnitId ?? "";
+            if (prefabTeam.ContainsKey(key) && prefabTeam[key] != mapped) prefabConflict[key] = "1";
+            prefabTeam[key] = mapped;
+        }
+
+        // 2. Проставляем каждому юниту: явный team → unitGroup → сторона префаба.
+        foreach (ScenarioUnitInfo u in units)
+        {
+            string team = NormTeamValue(u.Team);
+            if (team == null) team = NormTeamValue(GroupTeam(u.UnitGroup));
+            if (team == null && !prefabConflict.ContainsKey(u.UnitId ?? ""))
+            {
+                string pt;
+                if (prefabTeam.TryGetValue(u.UnitId ?? "", out pt)) team = pt;
+            }
+            if (team != null) res[u.InstanceId] = team;
+        }
+        return res;
+    }
+
+    // "Enemy"/"Enemies"/"Allied"/"Allies" -> "Enemies"/"Allies", иначе null.
+    private static string NormTeamValue(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return null;
+        s = s.Trim();
+        if (s.Length == 0) return null;
+        if (s.Equals("Enemy", StringComparison.OrdinalIgnoreCase) || s.Equals("Enemies", StringComparison.OrdinalIgnoreCase)) return "Enemies";
+        if (s.Equals("Allied", StringComparison.OrdinalIgnoreCase) || s.Equals("Allies", StringComparison.OrdinalIgnoreCase)) return "Allies";
+        return null;
+    }
+
+    // "Allied:Sierra" -> "Allied"; "Enemy:Kilo" -> "Enemy"; иначе сама строка.
+    private static string GroupTeam(string group)
+    {
+        if (string.IsNullOrEmpty(group)) return null;
+        int c = group.IndexOf(':');
+        return c > 0 ? group.Substring(0, c) : group;
+    }
+
+    public static void DumpScenarioTeams(string scenarioTextPath, string outPath)
+{
+    StringBuilder sb = new StringBuilder();
+    try
+    {
+        List<ScenarioUnitInfo> units = ParseScenarioUnits(File.ReadAllText(scenarioTextPath, Encoding.UTF8));
+        Dictionary<int, string> teams = ResolveScenarioTeams(units);
+        sb.AppendLine("iid;prefab;group;explicitTeam;resolvedTeam;positions");
+        int withTeam = 0;
+        foreach (ScenarioUnitInfo u in units)
+        {
+            string team;
+            if (!teams.TryGetValue(u.InstanceId, out team)) team = "?";
+            else withTeam++;
+            sb.AppendLine(u.InstanceId + ";" + u.UnitId + ";" + u.UnitGroup + ";" + u.Team + ";" + team + ";" + u.Positions.Count);
+        }
+        sb.AppendLine("TOTAL units=" + units.Count + " withTeam=" + withTeam);
+    }
+    catch (Exception ex) { sb.AppendLine("ERR " + ex.Message); }
+    try { File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); } catch { }
+}
+
+    // Быстрый поиск подстроки в бинарном файле (для Unity-ассетов). Выводит смещения + контекст.
+    public static void FindInFile(string path, string needle, string outPath)
+    {
+        StringBuilder sb = new StringBuilder();
+        try
+        {
+            byte[] pat = Encoding.ASCII.GetBytes(needle);
+            sb.AppendLine("file=" + path + " size=" + new FileInfo(path).Length);
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                byte[] buf = new byte[1 << 20];
+                long baseOff = 0;
+                int carryLen = pat.Length - 1;
+                byte[] carry = new byte[carryLen];
+                int found = 0;
+                while (found < 20)
+                {
+                    int n = fs.Read(buf, 0, buf.Length);
+                    if (n <= 0) break;
+                    byte[] hay = new byte[n + carryLen];
+                    Array.Copy(carry, 0, hay, 0, carryLen);
+                    Array.Copy(buf, 0, hay, carryLen, n);
+                    for (int i = 0; i <= hay.Length - pat.Length; i++)
+                    {
+                        bool ok = true;
+                        for (int j = 0; j < pat.Length; j++) { if (hay[i + j] != pat[j]) { ok = false; break; } }
+                        if (!ok) continue;
+                        long off = baseOff + i - carryLen;
+                        int ctxStart = Math.Max(0, i - 32);
+                        int ctxLen = Math.Min(hay.Length - ctxStart, 80);
+                        sb.Append("off=0x" + off.ToString("X") + " | ");
+                        for (int k = ctxStart; k < ctxStart + ctxLen; k++)
+                        {
+                            byte b = hay[k];
+                            sb.Append(b >= 32 && b < 127 ? (char)b : '.');
+                        }
+                        sb.AppendLine();
+                        if (++found >= 20) break;
+                    }
+                    if (n > carryLen) Array.Copy(buf, n - carryLen, carry, 0, carryLen);
+                    baseOff += n;
+                }
+                if (found == 0) sb.AppendLine("НЕ НАЙДЕНО");
+            }
+        }
+        catch (Exception ex) { sb.AppendLine("ERR " + ex.Message); }
+        try { File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); } catch { }
+    }
+
+    // Дамп участка бинарного файла: ascii + int32-интерпретации (для поиска teamIdx в Unity-ассетах).
+    public static void HexDump(string path, long offset, int length, string outPath)
+    {
+        StringBuilder sb = new StringBuilder();
+        try
+        {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                fs.Seek(offset, SeekOrigin.Begin);
+                byte[] buf = new byte[length];
+                int n = fs.Read(buf, 0, length);
+                sb.AppendLine("file=" + path + " offset=0x" + offset.ToString("X") + " len=" + n);
+                for (int row = 0; row < n; row += 16)
+                {
+                    StringBuilder asc = new StringBuilder();
+                    StringBuilder ints = new StringBuilder();
+                    for (int i = row; i < Math.Min(row + 16, n); i++)
+                    {
+                        byte b = buf[i];
+                        asc.Append(b >= 32 && b < 127 ? (char)b : '.');
+                    }
+                    for (int i = row; i + 3 < Math.Min(row + 16, n); i += 4)
+                    {
+                        int v = BitConverter.ToInt32(buf, i);
+                        ints.Append(v + " ");
+                    }
+                    sb.AppendLine((offset + row).ToString("X8") + "  " + asc.ToString().PadRight(16) + "  | ints: " + ints);
+                }
+            }
+        }
+        catch (Exception ex) { sb.AppendLine("ERR " + ex.Message); }
+        try { File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); } catch { }
+    }
+
+    // Сканируем Unity-ассет на встроенные текстовые сценарии (ConfigNode) и собираем
+    // карту "префаб (unitID) -> сторона" из их unitGroup. Это данные самой игры, не эвристика.
+    public static void ScanAssetForPrefabTeams(string path, string outPath)
+    {
+        StringBuilder sb = new StringBuilder();
+        Dictionary<string, int> allied = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, int> enemy = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        int blocks = 0, units = 0;
+
+        Action<string> process = delegate(string text)
+        {
+            if (text.IndexOf("UnitSpawner", StringComparison.Ordinal) < 0) return;
+            if (text.IndexOf("unitGroup", StringComparison.Ordinal) < 0) return;
+            blocks++;
+            List<ScenarioUnitInfo> list = ParseScenarioUnits(text);
+            foreach (ScenarioUnitInfo u in list)
+            {
+                if (string.IsNullOrEmpty(u.UnitGroup)) continue;
+                int c = u.UnitGroup.IndexOf(':');
+                string g = (c > 0 ? u.UnitGroup.Substring(0, c) : u.UnitGroup).Trim();
+                string key = u.UnitId ?? "";
+                if (key.Length == 0) continue;
+                units++;
+                if (g == "Allied") { allied[key] = (allied.ContainsKey(key) ? allied[key] : 0) + 1; }
+                else if (g == "Enemy") { enemy[key] = (enemy.ContainsKey(key) ? enemy[key] : 0) + 1; }
+            }
+        };
+
+        try
+        {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                byte[] buf = new byte[1 << 20];
+                byte[] run = new byte[4 << 20];
+                int runLen = 0;
+                int n;
+                while ((n = fs.Read(buf, 0, buf.Length)) > 0)
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        byte b = buf[i];
+                        bool printable = (b == 9 || b == 10 || b == 13 || (b >= 32 && b < 127));
+                        if (printable)
+                        {
+                            if (runLen < run.Length) run[runLen++] = b;
+                        }
+                        else
+                        {
+                            if (runLen > 512) process(Encoding.ASCII.GetString(run, 0, runLen));
+                            runLen = 0;
+                        }
+                    }
+                }
+                if (runLen > 512) process(Encoding.ASCII.GetString(run, 0, runLen));
+            }
+
+            HashSet<string> all = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string k in allied.Keys) all.Add(k);
+            foreach (string k in enemy.Keys) all.Add(k);
+            sb.AppendLine("prefab;allied;enemy;verdict;blocks=" + blocks + ";units=" + units);
+            foreach (string k in all)
+            {
+                int a = allied.ContainsKey(k) ? allied[k] : 0;
+                int e = enemy.ContainsKey(k) ? enemy[k] : 0;
+                string v = (a > 0 && e > 0) ? "CONFLICT" : (a > 0 ? "Allies" : "Enemies");
+                sb.AppendLine(k + ";" + a + ";" + e + ";" + v);
+            }
+        }
+        catch (Exception ex) { sb.AppendLine("ERR " + ex.Message); }
+        try { File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); } catch { }
+    }
+
+    // =====================================================================
+    // === СОПОСТАВЛЕНИЕ реплей -> сценарий по координатам ==================
+    // Координаты совпадают 1:1 (проверено): реплей X = сценарий globalPosition.x,
+    // Y = globalPosition.z. Статические юниты стоят точно, у динамики совпадает
+    // первая точка трека (точка спавна).
+    // =====================================================================
+    public static void ApplyScenarioTeamsByPosition(DebriefSession s, List<ScenarioUnitInfo> units, Dictionary<int, string> teamById)
+    {
+        if (s == null || units == null || units.Count == 0) return;
+        const double tol = 22.0;         // метров: допуск на погрешность спавна
+        const double tolSq = tol * tol;
+
+        foreach (DebriefEntity e in s.Entities)
+        {
+            DebriefSample first = e.Track != null && e.Track.Count > 0 ? e.Track[0] : null;
+            if (first == null) { e.Coalition = "Neutral"; continue; }
+
+            ScenarioUnitInfo best = null;
+            double bestSq = double.MaxValue;
+            foreach (ScenarioUnitInfo u in units)
+            {
+                if (u.Positions == null) continue;
+                foreach (double[] p in u.Positions)
+                {
+                    if (p == null || p.Length < 2) continue;
+                    double dx = p[0] - first.X;
+                    double dy = p[1] - first.Y;
+                    double d2 = dx * dx + dy * dy;
+                    if (d2 < bestSq) { bestSq = d2; best = u; }
+                }
+            }
+
+            string team;
+            if (best != null && bestSq <= tolSq && teamById.TryGetValue(best.InstanceId, out team) && team != null)
+                e.Coalition = team;
+            else
+                e.Coalition = "Neutral";
+        }
+    }
+
+    // Тест: загрузить реплей, применить сторону из сценария, выгрузить таблицу.
+    public static void TestScenarioTeams(string replayPath, string scenarioTextPath, string pilot, string outPath)
+    {
+        StringBuilder sb = new StringBuilder();
+        try
+        {
+            DebriefSession s = LoadSession(replayPath, pilot ?? "");
+            List<ScenarioUnitInfo> units = ParseScenarioUnits(File.ReadAllText(scenarioTextPath, Encoding.UTF8));
+            Dictionary<int, string> teamById = ResolveScenarioTeams(units);
+            ApplyScenarioTeamsByPosition(s, units, teamById);
+
+            sb.AppendLine("id;type;class;name;coalition");
+            int allies = 0, enemies = 0, neutral = 0;
+            foreach (DebriefEntity e in s.Entities)
+            {
+                if (e.Coalition == "Allies") allies++;
+                else if (e.Coalition == "Enemies") enemies++;
+                else neutral++;
+                sb.AppendLine(e.Id + ";" + e.Type + ";" + e.Class + ";" + e.Name + ";" + e.Coalition);
+            }
+            sb.AppendLine("TOTAL entities=" + s.Entities.Count + " allies=" + allies + " enemies=" + enemies + " unknown=" + neutral);
+        }
+        catch (Exception ex) { sb.AppendLine("ERR " + ex.Message); }
+        try { File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); } catch { }
+    }
+
+    public static void ScenarioToText(string vtsPath, string outTxt)
+    {
+        try
+        {
+            string root = FindVtolRootDir();
+            if (string.IsNullOrEmpty(root)) { File.WriteAllText(outTxt, "VTOL root not found", Encoding.UTF8); return; }
+            string managed = Path.Combine(root, @"VTOLVR_Data\Managed");
+            if (AppDomain.CurrentDomain.GetData("VTOL_ResolveHooked") == null)
+            {
+                AppDomain.CurrentDomain.SetData("VTOL_ResolveHooked", true);
+                AppDomain.CurrentDomain.AssemblyResolve += (s, a) =>
+                {
+                    string n = new System.Reflection.AssemblyName(a.Name).Name + ".dll";
+                    string p = Path.Combine(managed, n);
+                    return File.Exists(p) ? System.Reflection.Assembly.LoadFrom(p) : null;
+                };
+            }
+            System.Reflection.Assembly gAsm = System.Reflection.Assembly.LoadFrom(Path.Combine(managed, "Assembly-CSharp.dll"));
+            // Отключаем логгер Unity: Debug.Log уходит в нативный ECall, которого у нас нет.
+            try
+            {
+                string uCore = Path.Combine(managed, "UnityEngine.CoreModule.dll");
+                if (File.Exists(uCore))
+                {
+                    System.Reflection.Assembly uAsm = System.Reflection.Assembly.LoadFrom(uCore);
+                    Type dbgType = uAsm.GetType("UnityEngine.Debug");
+                    if (dbgType != null)
+                    {
+                        System.Reflection.PropertyInfo pLogger = dbgType.GetProperty("unityLogger");
+                        object loggerObj = pLogger != null ? pLogger.GetValue(null, null) : null;
+                        if (loggerObj != null)
+                        {
+                            System.Reflection.PropertyInfo pEn = loggerObj.GetType().GetProperty("logEnabled");
+                            if (pEn != null) pEn.SetValue(loggerObj, false, null);
+                        }
+                    }
+                }
+            }
+            catch { }
+            Type tInfo = gAsm.GetType("VTScenarioInfo");
+            if (tInfo == null) { File.WriteAllText(outTxt, "VTScenarioInfo not found", Encoding.UTF8); return; }
+            System.Reflection.BindingFlags bf = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+            System.Reflection.MethodInfo mRead = tInfo.GetMethod("ReadConfigNode", bf);
+            System.Reflection.MethodInfo mWrite = tInfo.GetMethod("WriteConfigFile", bf);
+            if (mRead == null) { File.WriteAllText(outTxt, "ReadConfigNode not found", Encoding.UTF8); return; }
+            object node = mRead.Invoke(null, new object[] { vtsPath });
+            if (node == null) { File.WriteAllText(outTxt, "ReadConfigNode -> null", Encoding.UTF8); return; }
+            if (mWrite != null)
+            {
+                mWrite.Invoke(null, new object[] { node, outTxt });
+            }
+            else
+            {
+                File.WriteAllText(outTxt, "WriteConfigFile not found; node type=" + node.GetType().FullName, Encoding.UTF8);
+            }
+        }
+        catch (Exception ex)
+        {
+            try { File.WriteAllText(outTxt, "ERR: " + ex, Encoding.UTF8); } catch { }
+        }
+    }
+
     private static bool ParseBinaryVtrData(DebriefSession session, string dataPath, double mapSize, string preferredPilot)
     {
         string nativeDiag;
@@ -4849,6 +5416,328 @@ public static class DebriefEngine
         }
         LastVtrDiagnostic = nativeDiag;
         return false;
+    }
+
+    // =====================================================================
+    // === ДИАГНОСТИКА СТРУКТУРЫ РЕПЛЕЯ (изучение полей team/parent/targetId) ==
+    // Запуск: VTOL_QoL.exe --dump-vtr <путь к replay.vtr> [выходной файл]
+    // =====================================================================
+    private static Type[] SafeGetTypes(System.Reflection.Assembly asm)
+    {
+        try { return asm.GetTypes(); }
+        catch (System.Reflection.ReflectionTypeLoadException ex)
+        {
+            List<Type> list = new List<Type>();
+            if (ex.Types != null) foreach (Type t in ex.Types) if (t != null) list.Add(t);
+            return list.ToArray();
+        }
+        catch { return new Type[0]; }
+    }
+
+    private static void DumpFields(StringBuilder sb, object obj, string indent)
+    {
+        if (obj == null) return;
+        System.Reflection.BindingFlags bf = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        for (Type bt = obj.GetType(); bt != null && bt != typeof(object); bt = bt.BaseType)
+        {
+            foreach (System.Reflection.FieldInfo f in bt.GetFields(bf | System.Reflection.BindingFlags.DeclaredOnly))
+            {
+                object v = null;
+                try { v = f.GetValue(obj); } catch { v = "<err>"; }
+                sb.Append(indent + bt.Name + "." + f.Name + " : " + f.FieldType.Name +
+                          (f.FieldType.IsEnum ? " (enum)" : "") + " = " + (v == null ? "null" : v.ToString()) + "\r\n");
+            }
+        }
+    }
+
+    private static void DumpObjectFields(StringBuilder sb, Type t, object obj, System.Reflection.BindingFlags bf)
+    {
+        for (Type bt = t; bt != null && bt != typeof(object); bt = bt.BaseType)
+        {
+            foreach (System.Reflection.FieldInfo f in bt.GetFields(bf | System.Reflection.BindingFlags.DeclaredOnly))
+            {
+                string desc;
+                object v;
+                try { v = f.GetValue(obj); }
+                catch { sb.AppendLine("  " + bt.Name + "." + f.Name + " : " + f.FieldType.Name + " = <err>"); continue; }
+                if (v == null) desc = "null";
+                else if (v is string) desc = "\"" + v + "\"";
+                else if (f.FieldType.IsPrimitive || f.FieldType.IsEnum) desc = v.ToString();
+                else if (v is System.Collections.IDictionary)
+                {
+                    System.Collections.IDictionary d = (System.Collections.IDictionary)v;
+                    StringBuilder ks = new StringBuilder();
+                    int n = 0;
+                    foreach (object k in d.Keys) { if (n++ >= 6) { ks.Append(" ..."); break; } ks.Append(k + " "); }
+                    desc = "Dict[" + d.Count + "] keys: " + ks;
+                }
+                else if (v is System.Collections.IEnumerable)
+                {
+                    int c = 0;
+                    object first = null;
+                    foreach (object o in (System.Collections.IEnumerable)v) { if (c == 0) first = o; c++; if (c > 500000) break; }
+                    desc = "List[" + c + "] first=" + (first != null ? first.GetType().Name : "null");
+                }
+                else desc = v.GetType().Name;
+                sb.AppendLine("  " + bt.Name + "." + f.Name + " : " + f.FieldType.Name + " = " + desc);
+            }
+        }
+    }
+
+    public static void DumpNativeStructure(string vtrFilePath, string outPath, string preferredPilot = "")
+    {
+        StringBuilder sb = new StringBuilder();
+        System.Reflection.BindingFlags bf = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        try
+        {
+            string root = FindVtolRootDir();
+            if (string.IsNullOrEmpty(root)) { sb.AppendLine("VTOL root not found"); File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); return; }
+            string managed = Path.Combine(root, @"VTOLVR_Data\Managed");
+            string gameDllPath = Path.Combine(managed, "Assembly-CSharp.dll");
+            if (!File.Exists(gameDllPath)) { sb.AppendLine("Assembly-CSharp.dll not found"); File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); return; }
+
+            AppDomain.CurrentDomain.AssemblyResolve += (s, a) =>
+            {
+                string dllName = new System.Reflection.AssemblyName(a.Name).Name + ".dll";
+                string p = Path.Combine(managed, dllName);
+                return File.Exists(p) ? System.Reflection.Assembly.LoadFrom(p) : null;
+            };
+
+            System.Reflection.Assembly gAsm = System.Reflection.Assembly.LoadFrom(gameDllPath);
+            Type serType = gAsm.GetType("ReplaySystem.ReplaySerializer");
+            Type recType = gAsm.GetType("ReplaySystem.ReplayRecorder");
+            if (serType == null || recType == null) { sb.AppendLine("Replay types not found"); File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); return; }
+
+            sb.AppendLine("VTOL root: " + root);
+            sb.AppendLine("Save: " + vtrFilePath);
+            Type[] allTypes = SafeGetTypes(gAsm);
+
+            // 1. Перечисления Teams/Team
+            sb.AppendLine("\r\n=== ENUMS (Teams/Team) ===");
+            foreach (Type t in allTypes)
+            {
+                try
+                {
+                    if (!t.IsEnum) continue;
+                    if (t.Name != "Teams" && t.Name != "Team" && t.Name.IndexOf("Team", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    sb.AppendLine("ENUM " + t.FullName);
+                    foreach (object v in Enum.GetValues(t))
+                        sb.AppendLine("   " + v + " = " + Convert.ToInt32(v));
+                }
+                catch { }
+            }
+
+            // 2. Описание типов сущностей/метаданных/кадров ReplaySystem
+            sb.AppendLine("\r\n=== TYPES ReplaySystem (поля с типами) ===");
+            foreach (Type t in allTypes)
+            {
+                try
+                {
+                    string ns;
+                    try { ns = t.Namespace; } catch { continue; }  // тип из несобранной x86-сборки (FlatBuffers)
+                    if (string.IsNullOrEmpty(ns)) continue;
+                    if (ns.IndexOf("ReplaySystem", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    string n = t.Name;
+                    bool relevant = n.IndexOf("ReplayEntity", StringComparison.OrdinalIgnoreCase) >= 0
+                                 || n.IndexOf("Metadata", StringComparison.OrdinalIgnoreCase) >= 0
+                                 || n.IndexOf("Keyframe", StringComparison.OrdinalIgnoreCase) >= 0
+                                 || n.IndexOf("Projectile", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!relevant) continue;
+                    sb.AppendLine("TYPE " + t.FullName + " : " + (t.BaseType != null ? t.BaseType.Name : "-"));
+                    for (Type bt = t; bt != null && bt != typeof(object); bt = bt.BaseType)
+                        foreach (System.Reflection.FieldInfo f in bt.GetFields(bf | System.Reflection.BindingFlags.DeclaredOnly))
+                            sb.AppendLine("    " + bt.Name + "." + f.Name + " : " + f.FieldType.Name + (f.FieldType.IsEnum ? " (enum " + f.FieldType.FullName + ")" : ""));
+                }
+                catch { }
+            }
+
+            // 3. Десериализация
+            object serializer = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(serType);
+            object recorder = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(recType);
+            foreach (System.Reflection.FieldInfo fi in serType.GetFields(bf))
+            {
+                if (fi.GetValue(serializer) != null) continue;
+                try
+                {
+                    if (fi.FieldType == typeof(byte[])) fi.SetValue(serializer, new byte[4 * 1024 * 1024]);
+                    else if (fi.FieldType.IsGenericType || fi.FieldType.GetConstructor(Type.EmptyTypes) != null) fi.SetValue(serializer, Activator.CreateInstance(fi.FieldType));
+                }
+                catch { }
+            }
+            foreach (System.Reflection.FieldInfo fi in recType.GetFields(bf))
+            {
+                if (fi.GetValue(recorder) != null) continue;
+                try { if (fi.FieldType.IsGenericType || fi.FieldType.GetConstructor(Type.EmptyTypes) != null) fi.SetValue(recorder, Activator.CreateInstance(fi.FieldType)); } catch { }
+            }
+            try
+            {
+                string uCoreDll = Path.Combine(managed, "UnityEngine.CoreModule.dll");
+                if (File.Exists(uCoreDll))
+                {
+                    System.Reflection.Assembly uAsm = System.Reflection.Assembly.LoadFrom(uCoreDll);
+                    Type dbgType = uAsm.GetType("UnityEngine.Debug");
+                    if (dbgType != null)
+                    {
+                        System.Reflection.PropertyInfo pLogger = dbgType.GetProperty("unityLogger");
+                        object loggerObj = pLogger != null ? pLogger.GetValue(null, null) : null;
+                        if (loggerObj != null)
+                        {
+                            System.Reflection.PropertyInfo pEn = loggerObj.GetType().GetProperty("logEnabled");
+                            if (pEn != null) pEn.SetValue(loggerObj, false, null);
+                        }
+                    }
+                }
+            }
+            catch { }
+            System.Reflection.MethodInfo mCreateDict = serType.GetMethod("CreateTypeDictionary", bf);
+            if (mCreateDict != null) mCreateDict.Invoke(serializer, null);
+            System.Reflection.MethodInfo deser = serType.GetMethod("Deserialize", new Type[] { typeof(string), recType });
+            if (deser == null) deser = serType.GetMethod("LoadFromFile", new Type[] { typeof(string), recType });
+            if (deser == null) { sb.AppendLine("Deserialize not found"); File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); return; }
+            object okObj = deser.Invoke(serializer, new object[] { vtrFilePath, recorder });
+            sb.AppendLine("\r\n=== DESERIALIZE ok=" + ((okObj is bool) && (bool)okObj) + " ===");
+
+            // 3.0 Перечисляем ВСЕ поля recorder/serializer — ищем, где реально хранится команда.
+            sb.AppendLine("\r\n=== RECORDER FIELDS ===");
+            DumpObjectFields(sb, recType, recorder, bf);
+            sb.AppendLine("\r\n=== SERIALIZER FIELDS ===");
+            DumpObjectFields(sb, serType, serializer, bf);
+
+            // 3.1 entityDict: таблица id;entityType;identity;label по ВСЕМ сущностям
+            System.Collections.IDictionary entDict = recType.GetField("entityDict", bf).GetValue(recorder) as System.Collections.IDictionary;
+            if (entDict != null)
+            {
+                sb.AppendLine("\r\n=== ENTITY TABLE (id;entityType;identity;label) всего " + entDict.Count + " ===");
+                Dictionary<int, int> typeHist = new Dictionary<int, int>();
+                Dictionary<int, int> idHist = new Dictionary<int, int>();
+                foreach (System.Collections.DictionaryEntry ede in entDict)
+                {
+                    object re = ede.Value;
+                    if (re == null) continue;
+                    Type ret = re.GetType();
+                    object idv = ret.GetField("id", bf).GetValue(re);
+                    object etv = ret.GetField("entityType", bf).GetValue(re);
+                    object meta = ret.GetField("metaData", bf).GetValue(re);
+                    int etype = etv != null ? Convert.ToInt32(etv) : -1;
+                    int identity = -1;
+                    string label = "";
+                    if (meta != null)
+                    {
+                        object iv = meta.GetType().GetField("identity", bf).GetValue(meta);
+                        object lv = meta.GetType().GetField("label", bf).GetValue(meta);
+                        if (iv != null) identity = Convert.ToInt32(iv);
+                        label = lv as string ?? "";
+                    }
+                    sb.AppendLine(string.Format("{0};ET={1};ID={2};{3}", idv, etype, identity, label));
+                    if (!typeHist.ContainsKey(etype)) typeHist[etype] = 0;
+                    typeHist[etype]++;
+                    if (!idHist.ContainsKey(identity)) idHist[identity] = 0;
+                    idHist[identity]++;
+                }
+                sb.Append("\r\nHIST entityType: ");
+                foreach (KeyValuePair<int, int> kv in typeHist) sb.Append(kv.Key + "=" + kv.Value + "  ");
+                sb.AppendLine();
+                sb.Append("HIST identity: ");
+                foreach (KeyValuePair<int, int> kv in idHist) sb.Append(kv.Key + "=" + kv.Value + "  ");
+                sb.AppendLine();
+            }
+
+            // 3.2 customTracks: все локи/джаммеры/снаряды
+            System.Reflection.FieldInfo fCustom = recType.GetField("customTracks", bf);
+            System.Collections.IDictionary customDict = fCustom != null ? fCustom.GetValue(recorder) as System.Collections.IDictionary : null;
+            if (customDict != null)
+            {
+                sb.AppendLine("\r\n=== CUSTOM TRACKS SUMMARY (всего " + customDict.Count + ") ===");
+                foreach (System.Collections.DictionaryEntry cde in customDict)
+                {
+                    object cTrack = cde.Value;
+                    if (cTrack == null) continue;
+                    object meta = null;
+                    System.Collections.IList kfList = null;
+                    for (Type walk = cTrack.GetType(); walk != null && walk != typeof(object); walk = walk.BaseType)
+                    {
+                        foreach (System.Reflection.FieldInfo fi in walk.GetFields(bf | System.Reflection.BindingFlags.DeclaredOnly))
+                        {
+                            object v = fi.GetValue(cTrack);
+                            if (fi.Name == "metadata" || fi.Name == "meta") meta = v;
+                            else if (v is System.Collections.IList) kfList = (System.Collections.IList)v;
+                        }
+                    }
+                    string mt = meta != null ? meta.GetType().Name : "-";
+                    int actorId = -1;
+                    if (meta != null)
+                        foreach (System.Reflection.FieldInfo mf in meta.GetType().GetFields(bf))
+                            if (mf.FieldType == typeof(int) && (mf.Name.IndexOf("actor", StringComparison.OrdinalIgnoreCase) >= 0))
+                                actorId = Convert.ToInt32(mf.GetValue(meta));
+
+                    if (mt == "RadarLockReplayMetadata")
+                    {
+                        sb.Append("LOCK actor=" + actorId + " kfs=" + (kfList != null ? kfList.Count : 0) + ": ");
+                        if (kfList != null)
+                            for (int k = 0; k < kfList.Count; k++)
+                            {
+                                object kf = kfList[k];
+                                if (kf == null) continue;
+                                object tv = kf.GetType().GetField("targetId", bf).GetValue(kf);
+                                object ttv = kf.GetType().GetField("t", bf).GetValue(kf);
+                                sb.Append("[" + Convert.ToDouble(ttv).ToString("F1", System.Globalization.CultureInfo.InvariantCulture) + "->" + tv + "]");
+                            }
+                        sb.AppendLine();
+                    }
+                    else if (mt == "ReplayMetadata")
+                    {
+                        sb.AppendLine("JAMMER actor=" + actorId + " kfs=" + (kfList != null ? kfList.Count : 0));
+                    }
+                    else if (mt == "PooledProjectileMetadata")
+                    {
+                        sb.AppendLine("PROJECTILE key=" + cde.Key + " kfs=" + (kfList != null ? kfList.Count : 0));
+                    }
+                    else
+                    {
+                        sb.AppendLine("OTHER " + mt + " key=" + cde.Key + " kfs=" + (kfList != null ? kfList.Count : 0));
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            sb.AppendLine("DUMP ERROR: " + ex);
+        }
+        // 4. Сверка: вычисленная коалиция из LoadSession против entityType
+        try
+        {
+            sb.AppendLine("\r\n=== COMPUTED COALITION (C;entityId;Type;Class;Coalition;RoleTag;Name) ===");
+            DebriefSession sess = LoadSession(vtrFilePath, preferredPilot ?? "");
+            if (sess != null)
+            {
+                foreach (DebriefEntity e in sess.Entities)
+                {
+                    sb.AppendLine(string.Format("C;{0};{1};{2};{3};{4};{5};{6}", e.Id, e.Type, e.Class, e.Coalition, e.RoleTag, e.Name, e.Pilot ?? ""));
+                }
+                sb.AppendLine("TOTAL entities=" + sess.Entities.Count + " missiles=" +
+                    sess.Entities.FindAll(de => de.Type == "Missile").Count + " neutral=" +
+                    sess.Entities.FindAll(de => de.Coalition == "Neutral").Count +
+                    " beams=" + sess.Beams.Count + " launches=" + sess.Launches.Count);
+
+                // Диагностика лучей: вид, кто -> кого, окно времени. Для сверки с customTracks.
+                sb.AppendLine("\r\n=== BEAMS (B;Kind;From -> To;t0..t1) ===");
+                Dictionary<string, int> beamKinds = new Dictionary<string, int>();
+                foreach (TacticalBeam bm in sess.Beams)
+                {
+                    string k = bm.Kind ?? "?";
+                    if (!beamKinds.ContainsKey(k)) beamKinds[k] = 0;
+                    beamKinds[k]++;
+                    sb.AppendLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "B;{0};{1} -> {2};{3:F1}..{4:F1}", k, bm.FromName ?? "?", bm.ToName ?? "?", bm.StartTime, bm.EndTime));
+                }
+                sb.Append("BEAMKINDS: ");
+                foreach (KeyValuePair<string, int> kv in beamKinds) sb.Append(kv.Key + "=" + kv.Value + "  ");
+                sb.AppendLine();
+            }
+            else sb.AppendLine("LoadSession returned null");
+        }
+        catch (Exception ex2) { sb.AppendLine("COALITION VERIFY ERROR: " + ex2.Message); }
+        try { File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8); } catch { }
     }
 }
 

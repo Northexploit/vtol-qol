@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -34,14 +34,49 @@ public class LogPatterns
         return Path.Combine(dir, "log_patterns.ini");
     }
 
+    // Версия формата шаблонов. Если в файле версии нет/она старее — файл перезаписывается
+    // актуальными дефолтами (со бэкапом), иначе старая копия с нерабочими шаблонами
+    // (${NICK}$ и "was killed by") молча ломает распознавание смертей/киллов.
+    public const int PatternsVersion = 2;
+
     public void LoadOrCreateDefault()
     {
         string filePath = GetPath();
-        if (!File.Exists(filePath))
+        bool needWrite = !File.Exists(filePath);
+        if (!needWrite)
         {
-            try { File.WriteAllText(filePath, DefaultContent(), Encoding.UTF8); } catch { }
+            try
+            {
+                string head = File.ReadAllText(filePath, Encoding.UTF8);
+                int at = head.IndexOf("Version=", StringComparison.Ordinal);
+                int ver = -1;
+                if (at >= 0)
+                {
+                    int eol = head.IndexOfAny(new char[] { '\r', '\n' }, at);
+                    string num = head.Substring(at + 8, (eol < 0 ? head.Length : eol) - at - 8).Trim();
+                    int.TryParse(num, out ver);
+                }
+                if (ver < PatternsVersion) needWrite = true;
+            }
+            catch { }
         }
-        try { Parse(File.ReadAllLines(filePath, Encoding.UTF8)); } catch { ParseDefaultFallback(); }
+
+        if (needWrite)
+        {
+            try
+            {
+                if (File.Exists(filePath))
+                {
+                    try { File.Copy(filePath, filePath + ".old", true); } catch { }
+                }
+                File.WriteAllText(filePath, DefaultContent(), Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        try { Parse(File.ReadAllLines(filePath, Encoding.UTF8)); }
+        catch { ParseDefaultFallback(); }
+        if (EjectTemplates.Count == 0 || KillTemplates.Count == 0) ParseDefaultFallback();
     }
 
     private void ParseDefaultFallback()
@@ -54,6 +89,7 @@ public class LogPatterns
         StringBuilder sb = new StringBuilder();
         sb.AppendLine("; Паттерны распознавания строк Player.log. Можно редактировать вручную.");
         sb.AppendLine("; Используйте {NICK} как заполнитель позывного пилота.");
+        sb.AppendLine("; Version=2");
         sb.AppendLine("[Aircraft:FA-26B]");
         sb.AppendLine("Pattern=FA-26B|FA26B|F/A-26B|F/A26B");
         sb.AppendLine("[Aircraft:F-45A]");
@@ -69,10 +105,16 @@ public class LogPatterns
         sb.AppendLine("[Callsign]");
         sb.AppendLine("Pattern1=((?:Alpha|Bravo|Charlie|Delta|Echo|Foxtrot|Golf|Hotel|India|Juliet|Kilo|Lima|Mike|November|Oscar|Papa|Quebec|Romeo|Sierra|Tango|Uniform|Victor|Whiskey|X-?ray|Yankee|Zulu)\\s+\\d+-\\d+)");
         sb.AppendLine("[Kill]");
-        sb.AppendLine("Pattern1=was killed by {NICK}");
+        // Игра пишет: "FlightLogger: shutze killed Z20x2 Anti-Air Artillery with AGM-65."
+        sb.AppendLine(@"Pattern1=(?:^|\s){NICK} killed\s+");
+        // Старый формат (на случай смены): "X was killed by shutze"
+        sb.AppendLine(@"Pattern2=was killed by {NICK}");
         sb.AppendLine("[Eject]");
-        sb.AppendLine(@"Pattern1=\${NICK}\$ ejected");
-        sb.AppendLine(@"Pattern2=\${NICK}\$ was killed");
+        // Игра пишет: "FlightLogger: F/A-26B (shutze) was killed." и "... (shutze) ejected"
+        sb.AppendLine(@"Pattern1=\({NICK}\)\s+ejected");
+        sb.AppendLine(@"Pattern2=\({NICK}\)\s+was killed");
+        sb.AppendLine(@"Pattern3=\b{NICK}\s+ejected");
+        sb.AppendLine(@"Pattern4=\b{NICK}\s+was killed");
         sb.AppendLine("[Diagnostics]");
         sb.AppendLine("Keyword1=spawn");
         sb.AppendLine("Keyword2=vehicle");
@@ -106,10 +148,21 @@ public class LogPatterns
                 list.AddRange(alts);
             }
             else if (section == "Callsign") CallsignPatterns.Add(val);
-            else if (section == "Kill") KillTemplates.Add(val);
-            else if (section == "Eject") EjectTemplates.Add(val);
+            else if (section == "Kill") KillTemplates.Add(NormalizeTemplate(val));
+            else if (section == "Eject") EjectTemplates.Add(NormalizeTemplate(val));
             else if (section == "Diagnostics") DiagnosticKeywords.Add(val);
         }
+    }
+
+    // В старых ini использовалась запись "${NICK}$" — после подстановки ника получался
+    // регэксп вида "$shutze$", где "$" работает как якорь конца строки, поэтому шаблон
+    // не совпадал НИКОГДА. Приводим к нормальному виду.
+    private static string NormalizeTemplate(string tpl)
+    {
+        if (string.IsNullOrEmpty(tpl)) return tpl;
+        string t = tpl.Replace("${NICK}$", "{NICK}");
+        t = t.Replace("\\${NICK}\\$", "{NICK}");
+        return t;
     }
 
     public string NormalizeAircraft(string raw)

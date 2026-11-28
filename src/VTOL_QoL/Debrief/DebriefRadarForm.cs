@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -103,6 +103,24 @@ public class DebriefRadarForm : Form
     private Dictionary<string, PointF> smoothBadgeOffsets = new Dictionary<string, PointF>();
     private float beamDashPhase = 0f;
     private System.Diagnostics.Stopwatch frameSw = System.Diagnostics.Stopwatch.StartNew();
+    // === ПРОФИЛИРОВАНИЕ 2D (флаг --perf-test) ===
+    public static bool PerfTestActive = false;
+    private static DateTime perfTestStartUtc = DateTime.MinValue;
+    private static string perfTestLogPath = null;
+    private long perfPaints = 0;
+    private double perfPaintSumMs = 0.0;
+    private double perfPaintMaxMs = 0.0;
+    private long perfTicks = 0;
+    private double perfTickSumMs = 0.0;
+    private double perfTickMaxMs = 0.0;
+    private double perfBeamsMs = 0.0;
+    private double perfEntitiesMs = 0.0;
+    private double perfRestMs = 0.0;
+    private double perfTerrainMs = 0.0;
+    private double perfGridMs = 0.0;
+    private double perfPoiMs = 0.0;
+    private double perfFxMs = 0.0;
+    private System.Diagnostics.Stopwatch perfFlushSw = System.Diagnostics.Stopwatch.StartNew();
     private double lastTickSec = 0.0;
     private double lastJamSurgeTime = -99.0;
     private string lastJamBannerActor = "";
@@ -596,6 +614,8 @@ public class DebriefRadarForm : Form
         playTimer.Interval = 16; // 60 FPS
         playTimer.Tick += (s, e) =>
         {
+            System.Diagnostics.Stopwatch tickSw = PerfTestActive ? System.Diagnostics.Stopwatch.StartNew() : null;
+            if (PerfTestActive) DrivePerfTest();
             double nowSec = frameSw.Elapsed.TotalSeconds;
             double dt = nowSec - lastTickSec;
             lastTickSec = nowSec;
@@ -629,6 +649,7 @@ public class DebriefRadarForm : Form
                 btnPlayPause.Text = "▶ ПУСК";
             }
             UpdateFrame();
+            if (tickSw != null) { tickSw.Stop(); PerfRecordTick(tickSw.Elapsed.TotalMilliseconds); PerfFlushIfDue(); }
         };
         playTimer.Start();
         this.FormClosing += (s, e) =>
@@ -918,15 +939,19 @@ public class DebriefRadarForm : Form
         if (idx < 0 || idx >= replayFiles.Count) return;
         isPlaying = false;
         btnPlayPause.Text = "▶ ПУСК";
-        if (session != null && session.TerrainBitmap != null)
-        {
-            session.TerrainBitmap.Dispose();
-            session.TerrainBitmap = null;
-        }
         try
         {
             string myNick = SettingsManager.Get("LastPilotNick", "");
-            session = DebriefEngine.LoadSession(replayFiles[idx], myNick);
+            DebriefSession loaded = DebriefEngine.LoadSession(replayFiles[idx], myNick);
+
+            // Успех загрузки: освобождаем рельеф старой сессии и подменяем на новую.
+            // При ошибке загрузки session не трогаем — иначе UI останется в полусломанном состоянии.
+            if (session != null && session.TerrainBitmap != null)
+            {
+                session.TerrainBitmap.Dispose();
+                session.TerrainBitmap = null;
+            }
+            session = loaded;
             currentTime = 0;
             smoothBadgeOffsets.Clear();
             triggeredJamEvents.Clear();
@@ -1185,6 +1210,8 @@ public class DebriefRadarForm : Form
         int w = pnlRadar.Width;
         int h = pnlRadar.Height;
         if (w <= 10 || h <= 10 || double.IsNaN(camCenterX) || double.IsNaN(camCenterY) || pixelsPerMeter <= 0) return;
+        System.Diagnostics.Stopwatch paintSw = PerfTestActive ? System.Diagnostics.Stopwatch.StartNew() : null;
+        System.Diagnostics.Stopwatch sectionSw = PerfTestActive ? System.Diagnostics.Stopwatch.StartNew() : null;
         try
         {
             Graphics g = e.Graphics;
@@ -1197,13 +1224,54 @@ public class DebriefRadarForm : Form
                 double tMinX = session.TerrainSizeMeters > 100.0 ? session.TerrainMinX : session.MapMinX;
                 double tMinY = session.TerrainSizeMeters > 100.0 ? session.TerrainMinY : session.MapMinY;
                 double tSize = session.TerrainSizeMeters > 100.0 ? session.TerrainSizeMeters : session.MapSizeMeters;
+
+                // Рисуем только видимый фрагмент тайла. При сильном зуме полный прямоугольник
+                // растягивается до сотен тысяч пикселей, и GDI+ жёстко тормозит на его масштабировании.
+                double ppm = pixelsPerMeter;
+                double visMinX = camCenterX - (w * 0.5) / ppm;
+                double visMaxX = camCenterX + (w * 0.5) / ppm;
+                double visMinY = camCenterY - (h * 0.5) / ppm;
+                double visMaxY = camCenterY + (h * 0.5) / ppm;
+
+                double cMinX = Math.Max(visMinX, tMinX);
+                double cMaxX = Math.Min(visMaxX, tMinX + tSize);
+                double cMinY = Math.Max(visMinY, tMinY);
+                double cMaxY = Math.Min(visMaxY, tMinY + tSize);
+
+                if (cMaxX > cMinX && cMaxY > cMinY)
+                {
+                    int bmpW = session.TerrainBitmap.Width;
+                    int bmpH = session.TerrainBitmap.Height;
+                    // Соответствие пикселей: колонка 0 = запад, строка 0 = север (как в полном DrawImage ниже).
+                    int srcX = (int)Math.Floor((cMinX - tMinX) / tSize * bmpW);
+                    int srcY = (int)Math.Floor((tMinY + tSize - cMaxY) / tSize * bmpH);
+                    int srcW = Math.Max(1, (int)Math.Ceiling((cMaxX - cMinX) / tSize * bmpW));
+                    int srcH = Math.Max(1, (int)Math.Ceiling((cMaxY - cMinY) / tSize * bmpH));
+                    if (srcX < 0) srcX = 0;
+                    if (srcY < 0) srcY = 0;
+                    if (srcX + srcW > bmpW) srcW = bmpW - srcX;
+                    if (srcY + srcH > bmpH) srcH = bmpH - srcY;
+                    if (srcW > 0 && srcH > 0)
+                    {
+                        PointF tl = WorldToScreen(cMinX, cMaxY, w, h);
+                        PointF br = WorldToScreen(cMaxX, cMinY, w, h);
+                        float dstW = br.X - tl.X;
+                        float dstH = br.Y - tl.Y;
+                        if (dstW > 0.5f && dstH > 0.5f)
+                            g.DrawImage(session.TerrainBitmap,
+                                new RectangleF(tl.X, tl.Y, dstW, dstH),
+                                new Rectangle(srcX, srcY, srcW, srcH),
+                                GraphicsUnit.Pixel);
+                    }
+                }
+
+                // Рамка полного тайла карты (рисуем всегда, даже если центр за пределами тайла)
                 PointF topLeft = WorldToScreen(tMinX, tMinY + tSize, w, h);
                 PointF botRight = WorldToScreen(tMinX + tSize, tMinY, w, h);
                 float mapW = botRight.X - topLeft.X;
                 float mapH = botRight.Y - topLeft.Y;
                 if (mapW > 10 && mapH > 10)
                 {
-                    g.DrawImage(session.TerrainBitmap, topLeft.X, topLeft.Y, mapW, mapH);
                     using (Pen borderPen = new Pen(Color.FromArgb(65, 0, 255, 140), 1f))
                         g.DrawRectangle(borderPen, topLeft.X, topLeft.Y, mapW, mapH);
                 }
@@ -1306,6 +1374,7 @@ public class DebriefRadarForm : Form
             }
 
 
+            if (sectionSw != null) { perfTerrainMs += sectionSw.Elapsed.TotalMilliseconds; sectionSw.Restart(); }
             // 1. Координатная сетка (уровень моря Z=0)
             double gridStepMeters = 10000.0;
             if (pixelsPerMeter > 0.04) gridStepMeters = 2000.0;
@@ -1345,8 +1414,17 @@ public class DebriefRadarForm : Form
                          "• Справа доступен полный разбор событий, пусков, RWR и ошибок пилота.\n" +
                          "• Для отображения 2D-карты загрузите файл Tacview (.acmi) или сохранённый в игре повтор (.vtr).";
             using (SolidBrush warnBr = new SolidBrush(Color.FromArgb(200, 255, 210, 90)))
-                g.DrawString(msg, new Font("Consolas", 10.5f, FontStyle.Bold), warnBr, 36, h * 0.42f);
+            using (Font warnFont = new Font("Consolas", 10.5f, FontStyle.Bold))
+                g.DrawString(msg, warnFont, warnBr, 36, h * 0.42f);
             return;
+        }
+        // Единый кэш "entity id -> состояние в текущий момент" на кадр: считаем GetStateAt один раз,
+        // чтобы не выполнять интерполяцию (и аллокацию) по 3-4 раза на каждый юнит в кадре.
+        Dictionary<string, DebriefSample> liveById = new Dictionary<string, DebriefSample>();
+        foreach (DebriefEntity ent in session.Entities)
+        {
+            DebriefSample st = ent.GetStateAt(currentTime);
+            if (st != null) liveById[ent.Id] = st;
         }
         // Плавное инерционное размещение тактических HUD-плашек без рывков + плавное затухание (alpha)
         List<RectangleF> occupiedRects = new List<RectangleF>();
@@ -1461,6 +1539,7 @@ public class DebriefRadarForm : Form
             }
         };
 
+        if (sectionSw != null) { perfGridMs += sectionSw.Elapsed.TotalMilliseconds; sectionSw.Restart(); }
         // 1.5 Базы, авианосцы, зоны ПВО и Bullseye
         using (Font poiFont = new Font("Consolas", 7.5f, FontStyle.Bold))
         {
@@ -1478,8 +1557,29 @@ public class DebriefRadarForm : Form
                         {
                             if (!is3DMode)
                             {
-                                float rPx = (float)(poi.RadiusMeters * pixelsPerMeter);
-                                g.DrawEllipse(zPen, pt.X - rPx, pt.Y - rPx, rPx * 2, rPx * 2);
+                                // World-space cull: кольцо видно, только если камера у самой окружности зоны.
+                                // Экранный bounding-box с кламп-координатами (±15000) при большом зуме
+                                // пропускал ВСЕ далёкие зоны ПВО и рисовал гигантские пунктирные полигоны.
+                                double ddx = poi.X - camCenterX;
+                                double ddy = poi.Y - camCenterY;
+                                double distM = Math.Sqrt(ddx * ddx + ddy * ddy);
+                                double viewRadiusM = (Math.Sqrt((double)w * w + (double)h * h) * 0.5) / pixelsPerMeter;
+                                if (Math.Abs(distM - poi.RadiusMeters) < viewRadiusM + 3000.0)
+                                {
+                                    // Проецируем каждую точку кольца из мира (не рисуем через центр —
+                                    // иначе clamp центра при зуме сместит окружность).
+                                    int segs = 64;
+                                    PointF[] ring = new PointF[segs + 1];
+                                    for (int k = 0; k < segs; k++)
+                                    {
+                                        double a = k * (Math.PI * 2.0 / segs);
+                                        double rx = poi.X + Math.Cos(a) * poi.RadiusMeters;
+                                        double ry = poi.Y + Math.Sin(a) * poi.RadiusMeters;
+                                        ring[k] = WorldToScreen3D(rx, ry, 0.0, w, h);
+                                    }
+                                    ring[segs] = ring[0];
+                                    g.DrawPolygon(zPen, ring);
+                                }
                             }
                             else
                             {
@@ -1527,6 +1627,8 @@ public class DebriefRadarForm : Form
                     foreach (MapPoiMarker af in session.Airfields)
                     {
                         afIdx++;
+                        Color afCol = af.Coalition == "Enemies" ? Color.FromArgb(255, 155, 35)
+                                    : (af.Coalition == "Allies" ? Color.DeepSkyBlue : Color.FromArgb(200, 210, 205));
                         double hdg = af.Heading * Math.PI / 180.0;
                         double fx = Math.Sin(hdg), fz = Math.Cos(hdg);
                         double rx = Math.Cos(hdg), rz = -Math.Sin(hdg);
@@ -1539,13 +1641,13 @@ public class DebriefRadarForm : Form
                         PointF[] strip = new PointF[] { a0, a1, a2, a3 };
                         using (SolidBrush fill = new SolidBrush(Color.FromArgb(190, 52, 56, 58)))
                             g.FillPolygon(fill, strip);
-                        using (Pen edge = new Pen(Color.FromArgb(190, 200, 210, 205), 1.3f))
+                        using (Pen edge = new Pen(Color.FromArgb(190, afCol), 1.3f))
                             g.DrawPolygon(edge, strip);
                         // Осевая
-                        using (Pen mid = new Pen(Color.FromArgb(150, 235, 240, 235), 1.1f) { DashStyle = DashStyle.Dash, DashPattern = new float[] { 6f, 5f } })
+                        using (Pen mid = new Pen(Color.FromArgb(150, afCol), 1.1f) { DashStyle = DashStyle.Dash, DashPattern = new float[] { 6f, 5f } })
                             g.DrawLine(mid, afPt(-L * 0.45, 0), afPt(L * 0.45, 0));
                         // Пороги
-                        using (Pen thr = new Pen(Color.FromArgb(190, 240, 245, 240), 1.6f))
+                        using (Pen thr = new Pen(Color.FromArgb(190, afCol), 1.6f))
                         {
                             g.DrawLine(thr, afPt(-L * 0.46, -W * 0.28), afPt(-L * 0.40, -W * 0.28));
                             g.DrawLine(thr, afPt(-L * 0.46, W * 0.28), afPt(-L * 0.40, W * 0.28));
@@ -1554,12 +1656,13 @@ public class DebriefRadarForm : Form
                         }
                         PointF center = afPt(0, 0);
                         drawSmartBadge("af_" + afIdx, "🛫 " + af.Label, afFont,
-                            Color.FromArgb(225, 220, 230), Color.FromArgb(170, 200, 215), center.X, center.Y, false, 1.0f);
+                            Color.FromArgb(225, afCol), Color.FromArgb(170, afCol), center.X, center.Y, false, 1.0f);
                     }
                 }
             }
         }
 
+        if (sectionSw != null) { perfPoiMs += sectionSw.Elapsed.TotalMilliseconds; sectionSw.Restart(); }
         // 1.75 Реальные взрывы из eventTrack реплея: короткая вспышка в момент t,
         // затем затухающий маркер, чтобы было видно, где именно сработало.
         if (session != null && session.Explosions != null && session.Explosions.Count > 0)
@@ -1641,6 +1744,7 @@ public class DebriefRadarForm : Form
             }
         }
 
+        if (sectionSw != null) { perfFxMs += sectionSw.Elapsed.TotalMilliseconds; sectionSw.Restart(); }
         // 1.8 Анимированные лучи радаров, захватов АРЛ-ракет с индикатором дистанции (km) и подлётного времени (TTI)
         float pulse01 = (float)(0.5 + 0.5 * Math.Sin(currentTime * 6.5));
             Dictionary<string, string> jammedTargets = new Dictionary<string, string>(); // EntityId -> уровень помех
@@ -1648,13 +1752,6 @@ public class DebriefRadarForm : Form
             {
                 using (Font beamTagFont = new Font("Consolas", 6.6f, FontStyle.Bold))
                 {
-                    Dictionary<string, DebriefSample> liveById = new Dictionary<string, DebriefSample>();
-                    foreach (DebriefEntity ent in session.Entities)
-                    {
-                        DebriefSample st = ent.GetStateAt(currentTime);
-                        if (st != null) liveById[ent.Id] = st;
-                    }
-
                     foreach (TacticalBeam bm in session.Beams)
                     {
                         if (currentTime < bm.StartTime || currentTime > bm.EndTime) continue;
@@ -1673,6 +1770,11 @@ public class DebriefRadarForm : Form
                         {
                             fx = sFrom.X;
                             fy = sFrom.Y;
+                        }
+                        else if (bm.Kind != "JAMMER" && !string.IsNullOrEmpty(bm.FromId))
+                        {
+                            // Источник луча уже мёртв — не рисуем пунктир в устаревшую точку.
+                            continue;
                         }
                         if (bm.Kind == "JAMMER")
                         {
@@ -1829,6 +1931,11 @@ public class DebriefRadarForm : Form
                             tx = sTo.X;
                             ty = sTo.Y;
                         }
+                        else if (bm.Kind != "JAMMER" && !string.IsNullOrEmpty(bm.ToId))
+                        {
+                            // Цель луча уже мёртва — не рисуем пунктир «в никуда».
+                            continue;
+                        }
 
                         double fz = sFrom != null ? sFrom.Alt : session.GetGroundAltitudeAt(fx, fy);
                         double tz = fz;
@@ -1864,6 +1971,18 @@ public class DebriefRadarForm : Form
                         
                         PointF p1 = WorldToScreen3D(fx, fy, fz, w, h);
                         PointF p2 = WorldToScreen3D(tx, ty, tz, w, h);
+
+                        // Screen-space cull: если весь луч (с кольцами/конусом) за экраном — не рисуем.
+                        // При большом зуме отсекает подавляющее большинство из сотен активных лучей,
+                        // у которых концы уходят на десятки тысяч пикселей за границы экрана.
+                        {
+                            float bMinX = Math.Min(p1.X, p2.X) - 140f;
+                            float bMaxX = Math.Max(p1.X, p2.X) + 140f;
+                            float bMinY = Math.Min(p1.Y, p2.Y) - 140f;
+                            float bMaxY = Math.Max(p1.Y, p2.Y) + 140f;
+                            if (bMaxX < 0 || bMinX > w || bMaxY < 0 || bMinY > h)
+                                continue;
+                        }
 
                         Color tagColor = Color.Empty;
                         if (bm.Kind == "RWR_SPIKE")
@@ -1984,7 +2103,7 @@ public class DebriefRadarForm : Form
                         }
 
                         // На лучах ракет ([АРЛ]) рисуем компактный индикатор дистанции (km) и подлётного времени (TTI)
-                        if (!tagColor.IsEmpty && bm.FromName.StartsWith("[АРЛ]") && pixelsPerMeter > 0.005)
+                        if (!tagColor.IsEmpty && !string.IsNullOrEmpty(bm.FromName) && bm.FromName.StartsWith("[АРЛ]") && pixelsPerMeter > 0.005)
                         {
                             double distMeters = Math.Sqrt(Math.Pow(tx - fx, 2) + Math.Pow(ty - fy, 2));
                             double distKm = distMeters / 1000.0;
@@ -2011,6 +2130,7 @@ public class DebriefRadarForm : Form
         }
 
 
+            if (sectionSw != null) { perfBeamsMs += sectionSw.Elapsed.TotalMilliseconds; sectionSw.Restart(); }
             // 2. Отрисовка траекторий, иконок, реального сектора БРЛС и одиночных непересекающихся плашек
             using (Font acFont = new Font("Consolas", 7.8f, FontStyle.Bold))
             using (Font wpnFont = new Font("Consolas", 6.8f, FontStyle.Italic))
@@ -2043,8 +2163,8 @@ public class DebriefRadarForm : Form
                 foreach (DebriefEntity ent in session.Entities)
                 {
                     if (!showAllies && !ent.IsPlayer && ent.Coalition == "Allies") continue;
-                DebriefSample cur = ent.GetStateAt(currentTime);
-                if (cur == null) continue;
+                DebriefSample cur;
+                if (!liveById.TryGetValue(ent.Id, out cur)) continue;
                 bool isMyMissile = (ent.Type == "Missile" && ent.Pilot != null && ent.Pilot.StartsWith("MY_MISSILE:"));
                 Color col = ent.IsPlayer || isMyMissile
                     ? Color.FromArgb(55, 255, 85)
@@ -2156,10 +2276,18 @@ public class DebriefRadarForm : Form
                 double hotWindow = ent.Type == "Missile" ? 4.0 : (isSelectedUnit ? 22.0 : 14.0);
 
 
-                    for (int i = 0; i < ent.Track.Count; i++)
+                    // Бинарный поиск первого индекса трека >= minTrailT (трек отсортирован по времени),
+                    // чтобы не перебирать весь трек целиком на каждом кадре.
+                    int tLo = 0, tHi = ent.Track.Count - 1, startIdx = ent.Track.Count;
+                    while (tLo <= tHi)
+                    {
+                        int mid = (tLo + tHi) >> 1;
+                        if (ent.Track[mid].Time < minTrailT) tLo = mid + 1;
+                        else { startIdx = mid; tHi = mid - 1; }
+                    }
+                    for (int i = startIdx; i < ent.Track.Count; i++)
                     {
                         DebriefSample s = ent.Track[i];
-                        if (s.Time < minTrailT) continue;
                         if (s.Time > currentTime) break;
                         PointF pt = WorldToScreen3D(s.X, s.Y, s.Alt, w, h);
                         trail.Add(pt);
@@ -2196,8 +2324,8 @@ public class DebriefRadarForm : Form
                     if (pass == 1 && ent.Type != "Missile") continue;
                     if (!showAllies && !ent.IsPlayer && ent.Coalition == "Allies") continue;
 
-                        DebriefSample cur = ent.GetStateAt(currentTime);
-                        if (cur == null) continue;
+                        DebriefSample cur;
+                        if (!liveById.TryGetValue(ent.Id, out cur)) continue;
                         PointF pos = WorldToScreen3D(cur.X, cur.Y, cur.Alt, w, h);
                         if (pos.X < -40 || pos.X > w + 40 || pos.Y < -40 || pos.Y > h + 40) continue;
 
@@ -2325,6 +2453,7 @@ new PointF(pos.X - rSize, pos.Y)
                 }
             }
         }
+        if (sectionSw != null) { perfEntitiesMs += sectionSw.Elapsed.TotalMilliseconds; sectionSw.Restart(); }
         // 4. Живой тактический HUD-виджет в левом верхнем углу планшета
         int myActiveMsl = 0, allyActiveMsl = 0, enemyActiveMsl = 0;
         DebriefEntity activeTracked = null;
@@ -2332,8 +2461,8 @@ new PointF(pos.X - rSize, pos.Y)
 
         foreach (DebriefEntity ent in session.Entities)
         {
-            DebriefSample st = ent.GetStateAt(currentTime);
-            if (st == null) continue;
+            DebriefSample st;
+            if (!liveById.TryGetValue(ent.Id, out st)) continue;
             if (!string.IsNullOrEmpty(followEntityId) && ent.Id == followEntityId)
             {
                 activeTracked = ent;
@@ -2360,7 +2489,7 @@ new PointF(pos.X - rSize, pos.Y)
             foreach (TacticalBeam bm in session.Beams)
             {
                 if (currentTime >= bm.StartTime && currentTime <= bm.EndTime &&
-                    bm.Kind == "RWR_SPIKE" && bm.ToName.Equals(activeTracked.Name, StringComparison.OrdinalIgnoreCase))
+                    bm.Kind == "RWR_SPIKE" && bm.ToName != null && bm.ToName.Equals(activeTracked.Name, StringComparison.OrdinalIgnoreCase))
                     activeRwrLocks++;
             }
         }
@@ -2572,6 +2701,8 @@ new PointF(pos.X - rSize, pos.Y)
             }
         }
         catch { /* Защита от редких OverflowException GDI+ при экстремальном зуме */ }
+        if (sectionSw != null) perfRestMs += sectionSw.Elapsed.TotalMilliseconds;
+        if (paintSw != null) { paintSw.Stop(); PerfRecordPaint(paintSw.Elapsed.TotalMilliseconds); }
     }
     private void PnlTimeline_Paint(object sender, PaintEventArgs e)
     {
@@ -2632,13 +2763,15 @@ new PointF(pos.X - rSize, pos.Y)
                     "🔍 ИНСПЕКТОР ЮНИТА:\r\n" +
                     "Имя: {0} ({1})\r\n" +
                     "Тип / Роль: {2} / {3} ({4})\r\n" +
+                    "entityType из реплея: {13}   ·   Сторона: {4}\r\n" +
                     "Время жизни: {5} .. {6}\r\n" +
                     "Координаты: X={7:F0} м, Y={8:F0} м\r\n" +
                     "Высота: {9:F0} м | Скорость: {10:F0} км/ч | Курс: {11:F0}°\r\n" +
                     "Точек в треке: {12}",
                     ent.Name, ent.Pilot ?? "-", ent.Type, ent.RoleTag ?? "-", ent.Coalition,
                     FormatSec(ent.FirstTime), FormatSec(ent.LastTime),
-                    st.X, st.Y, st.Alt, st.Speed * 3.6, st.Heading, ent.Track.Count);
+                    st.X, st.Y, st.Alt, st.Speed * 3.6, st.Heading, ent.Track.Count,
+                    ent.NativeType >= 0 ? ent.NativeType.ToString() : "нет (не .vtr)");
 
                 // Дистанция и азимут до борта игрока — только по координатам из трека
                 DebriefEntity playerEnt = null;
@@ -2742,6 +2875,111 @@ new PointF(pos.X - rSize, pos.Y)
         };
         dlg.Controls.Add(txtDump);
         dlg.ShowDialog(this);
+    }
+
+    // =========================================================================
+    // === ПРОФИЛИРОВАНИЕ 2D: лог в %LOCALAPPDATA%\VTOL_QoL\perf2d.log =========
+    // =========================================================================
+    private void PerfRecordPaint(double ms)
+    {
+        perfPaints++;
+        perfPaintSumMs += ms;
+        if (ms > perfPaintMaxMs) perfPaintMaxMs = ms;
+        PerfFlushIfDue();
+    }
+
+    private void PerfRecordTick(double ms)
+    {
+        perfTicks++;
+        perfTickSumMs += ms;
+        if (ms > perfTickMaxMs) perfTickMaxMs = ms;
+    }
+
+    private void PerfFlushIfDue()
+    {
+        if (perfFlushSw.Elapsed.TotalSeconds >= 1.0) PerfFlush();
+    }
+
+    private void PerfFlush()
+    {
+        perfFlushSw.Restart();
+        try
+        {
+            if (perfTestLogPath == null)
+            {
+                perfTestLogPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "perf2d.log");
+                File.WriteAllText(perfTestLogPath, "=== VTOL_QoL 2D PERF TEST ===\r\n", Encoding.UTF8);
+            }
+            double paintAvg = perfPaints > 0 ? perfPaintSumMs / perfPaints : 0.0;
+            double terrainAvg = perfPaints > 0 ? perfTerrainMs / perfPaints : 0.0;
+            double gridAvg = perfPaints > 0 ? perfGridMs / perfPaints : 0.0;
+            double poiAvg = perfPaints > 0 ? perfPoiMs / perfPaints : 0.0;
+            double fxAvg = perfPaints > 0 ? perfFxMs / perfPaints : 0.0;
+            double beamsAvg = perfPaints > 0 ? perfBeamsMs / perfPaints : 0.0;
+            double entsAvg = perfPaints > 0 ? perfEntitiesMs / perfPaints : 0.0;
+            double restAvg = perfPaints > 0 ? perfRestMs / perfPaints : 0.0;
+            string line = string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "{0:HH:mm:ss.fff} | ppm={1:F5} | paint={2:F2} | terr={3:F2} grid={4:F2} poi={5:F2} fx={6:F2} beams={7:F2} ents={8:F2} rest={9:F2} | ev={10} | t={11:F0}s",
+                DateTime.Now, pixelsPerMeter, paintAvg, terrainAvg, gridAvg, poiAvg, fxAvg, beamsAvg, entsAvg, restAvg,
+                session != null ? session.Events.Count : 0,
+                currentTime);
+            File.AppendAllText(perfTestLogPath, line + Environment.NewLine, Encoding.UTF8);
+        }
+        catch { }
+        perfPaints = 0; perfPaintSumMs = 0.0; perfPaintMaxMs = 0.0;
+        perfTicks = 0; perfTickSumMs = 0.0; perfTickMaxMs = 0.0;
+        perfBeamsMs = 0.0; perfEntitiesMs = 0.0; perfRestMs = 0.0;
+        perfTerrainMs = 0.0; perfGridMs = 0.0; perfPoiMs = 0.0; perfFxMs = 0.0;
+    }
+
+    private void DrivePerfTest()
+    {
+        if (session == null) return;
+        if (perfTestStartUtc == DateTime.MinValue)
+        {
+            perfTestStartUtc = DateTime.UtcNow;
+            currentTime = session.Duration > 10.0 ? session.Duration * 0.5 : 0.0;
+            ResetJamEvents();
+            try
+            {
+                if (perfTestLogPath == null)
+                {
+                    perfTestLogPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "perf2d.log");
+                    File.WriteAllText(perfTestLogPath, "=== VTOL_QoL 2D PERF TEST ===\r\n", Encoding.UTF8);
+                }
+                string hdr = string.Format("Session={0} | ExactTelemetry={1} | FullRadarCoords={2} | Duration={3:F0}s | Entities={4} | Beams={5} | Events={6}\r\n",
+                    session.Title ?? "?", session.HasExactTelemetry, session.HasFullRadarCoords, session.Duration,
+                    session.Entities.Count, session.Beams.Count, session.Events.Count);
+                File.AppendAllText(perfTestLogPath, hdr, Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        double t = (DateTime.UtcNow - perfTestStartUtc).TotalSeconds;
+        if (t > 1.0 && !isPlaying)
+        {
+            isPlaying = true;
+            btnPlayPause.Text = "⏸ ПАУЗА";
+        }
+
+        if (t < 3.0) pixelsPerMeter = 0.0085;
+        else if (t < 8.0) pixelsPerMeter = 0.03;
+        else if (t < 13.0) pixelsPerMeter = 0.25;
+        else if (t < 18.0) pixelsPerMeter = 1.2;
+        else if (t < 23.0) pixelsPerMeter = 0.002;
+        else
+        {
+            PerfFlush();
+            PerfTestActive = false;
+            isPlaying = false;
+            try { File.AppendAllText(perfTestLogPath, "=== PERF TEST DONE ===\r\n", Encoding.UTF8); } catch { }
+            if (playTimer != null) playTimer.Stop();
+            Application.Exit();
+            return;
+        }
+
+        if (is3DMode) glRadar3D.Invalidate();
+        else pnlRadar.Invalidate();
     }
 
     private string FormatSec(double sec)

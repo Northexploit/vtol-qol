@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -40,6 +40,8 @@ public class MainForm : Form
     private bool optAudioSwitch;
     private bool optDiagnostics;
     private bool optKillSound;
+    // Диагностические режимы (--perf-test / --dump-vtr) не должны трогать Steam и его конфиги.
+    private static bool diagnosticMode = false;
     private Button btnInstall;
     private Label lblStatus;
     private ProgressBar progressBar;
@@ -48,6 +50,7 @@ public class MainForm : Form
     private Button btnServers;
     private volatile Process currentWorkerProcess = null;
     private volatile bool isCancelRequested = false;
+    private volatile bool isDownloadBusy = false;
     private GameTracker tracker = new GameTracker();
     private Label lblIndDiscord;
     private Label lblIndMusic;
@@ -390,33 +393,39 @@ public class MainForm : Form
         lblIndSteam = new Label() { Left = 8, Top = 41, Width = 245, Height = 16, Font = indFontNormal, ForeColor = Color.Silver, Text = "● Steam: проверка... ⚙", Cursor = Cursors.Hand };
 
         lblIndSteam.Click += (s, e) => {
-            if (Process.GetProcessesByName("steam").Length == 0)
+            RefreshStatusIndicators();
+            if (IsSteamRunning()) return;   // Steam уже работает — просто обновили индикатор
+
+            // Запускать Steam из админского процесса нельзя: Steam унаследует повышенные права
+            // и потеряет доступ к своему разделу реестра.
+            if (IsRunningAsAdmin())
             {
-                try
-                {
-                    string sp = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamExe", "") as string;
-                    if (string.IsNullOrEmpty(sp) || !File.Exists(sp))
-                    {
-                        string sDir = (Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamPath", "") as string ?? "").Replace('/', '\\');
-                        sp = Path.Combine(sDir, "steam.exe");
-                    }
-                    if (File.Exists(sp))
-                    {
-                        lblIndSteam.Text = "● Steam: запуск клиента...";
-                        lblIndSteam.ForeColor = Color.Gold;
-                        Process.Start(sp);
-                        return;
-                    }
-                    Process.Start(new ProcessStartInfo("steam://open/main") { UseShellExecute = true });
-                }
-                catch { }
+                MessageBox.Show(this,
+                    "VTOL QoL запущен от имени администратора.\n\nЗапустите Steam вручную обычным ярлыком (меню «Пуск»). Если запустить его из программы с правами администратора, Steam теряет доступ к своим настройкам и реестру.",
+                    "Запустите Steam вручную", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            ThreadPool.QueueUserWorkItem(delegate { SilentSync(true); });
+
+            // Обычный режим: запускаем Steam так же, как это делает ярлык — через оболочку Windows.
+            // Но только если наш процесс вообще имеет право писать в раздел Steam:
+            // иначе клиент унаследует ограничение и покажет фатальную ошибку реестра.
+            if (!CanWriteSteamRegistry() && !PrepareSafeSteamLaunch()) return;
+
+            try
+            {
+                lblIndSteam.Text = "● Steam: запуск клиента...";
+                lblIndSteam.ForeColor = Color.Gold;
+                Process.Start(new ProcessStartInfo("steam://open/main") { UseShellExecute = true });
+            }
+            catch
+            {
+                lblIndSteam.Text = "● Steam: запустите вручную ⚙";
+                lblIndSteam.ForeColor = Color.Gold;
+            }
         };
         lblIndSteam.MouseEnter += (s, e) => { lblIndSteam.Font = indFontUnderline; };
         lblIndSteam.MouseLeave += (s, e) => { lblIndSteam.Font = indFontNormal; };
-        indTip.SetToolTip(lblIndSteam, "Нажмите, чтобы запустить Steam или проверить интеграцию");
+        indTip.SetToolTip(lblIndSteam, "Нажмите, чтобы проверить интеграцию со Steam");
 
         lblIndNet = new Label() { Left = 260, Top = 41, Width = 250, Height = 16, Font = indFontNormal, ForeColor = Color.Silver, Text = "● Сеть: проверка... ↻", Cursor = Cursors.Hand };
         lblIndNet.Click += (s, e) => {
@@ -504,6 +513,12 @@ public class MainForm : Form
     }
     private void MainForm_Shown(object sender, EventArgs e)
     {
+        if (DebriefRadarForm.PerfTestActive)
+        {
+            // Режим автотеста производительности 2D: сразу открываем разбор боя,
+            // он сам загрузит повтор, снимет с паузы и прогонит цикл зума с логированием.
+            BtnDebrief_Click(null, null);
+        }
         ThreadPool.QueueUserWorkItem(delegate { SilentSync(true); });
         TriggerNetworkCheck();
         tracker.DiscordEnabled = optDiscord;
@@ -620,9 +635,7 @@ public class MainForm : Form
                 bgDiscordRunning = dc.Length > 0;
                 foreach (Process p in dc) p.Dispose();
 
-                Process[] st = Process.GetProcessesByName("steam");
-                bgSteamRunning = st.Length > 0;
-                foreach (Process p in st) p.Dispose();
+                bgSteamRunning = IsSteamRunning();
 
                 if (!string.IsNullOrEmpty(mDir) && Directory.Exists(mDir))
                 {
@@ -737,8 +750,16 @@ public class MainForm : Form
             bool steamRunning = bgSteamRunning;
             string appBat = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL", "Shuffle.bat");
             bool batReady = File.Exists(appBat);
+            // Программа в ограниченном режиме: сама запустить Steam она не может —
+            // клиент унаследует ограничения и покажет ошибку реестра. Подсказываем заранее.
+            bool steamLaunchRestricted = !CanWriteSteamRegistry();
 
-            if (steamRunning && batReady)
+            if (steamLaunchRestricted && !steamRunning)
+            {
+                lblIndSteam.Text = "● Steam: запустите вручную (ограниченный режим) ⚙";
+                lblIndSteam.ForeColor = Color.Gold;
+            }
+            else if (steamRunning && batReady)
             {
                 lblIndSteam.Text = "● Steam: подключён ✔";
                 lblIndSteam.ForeColor = Color.FromArgb(0, 255, 102);
@@ -836,8 +857,141 @@ public class MainForm : Form
     private void BtnInstall_Click(object sender, EventArgs e)
     {
         SaveCheckboxSettings();
-        SilentSync(false);
-        Process.Start("steam://rungameid/667970");
+        // Синхронизацию делаем в фоне, чтобы не подвешивать окно на время работы с файлами.
+        ThreadPool.QueueUserWorkItem(delegate { SilentSync(false); });
+
+        bool steamRunning = IsSteamRunning();
+        bool elevated = IsRunningAsAdmin();
+        bool steamWritable = CanWriteSteamRegistry();
+        AppLogger.Log("STEAM", "Кнопка СТАРТ VTOL VR: Steam запущен=" + steamRunning
+            + ", программа под админом=" + elevated
+            + ", раздел Steam в реестре доступен для записи=" + steamWritable);
+
+        // Сначала приводим Steam в известное состояние: клиент либо рабочий, либо его нет.
+        // Бывает, что steam.exe запущен, но так и не записал свои данные в реестр —
+        // такой клиент команд не обрабатывает, а пользователю показывает ошибку
+        // «Путь к разделу Steam в реестре недоступен для записи».
+        if (steamRunning && !CheckRunningSteamIsUsable())
+        {
+            UpdateStatus("Запустите Steam обычным ярлыком и нажмите кнопку снова.", 0);
+            return;
+        }
+        steamRunning = IsSteamRunning();   // клиент мог быть закрыт при перезапуске
+
+        // Опасно только ЗАПУСКАТЬ Steam из админского процесса: тогда Steam стартует
+        // с повышенными правами и теряет доступ к своему реестру.
+        // Если Steam уже работает — просьба «запусти игру» ему безвредна:
+        // новый процесс не создаётся, права никуда не наследуются.
+        if (!steamRunning && elevated)
+        {
+            UpdateStatus("Запустите Steam обычным ярлыком (не от имени администратора).", 0);
+            MessageBox.Show(this,
+                "Steam не запущен, а программа работает от имени администратора.\n\n"
+                + "Сначала запустите Steam обычным ярлыком (меню «Пуск», не от имени администратора). "
+                + "После этого кнопка будет запускать игру нормально.",
+                "Сначала запустите Steam", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        // Второй случай того же вреда: у нашего процесса нет права записи в раздел
+        // Steam в реестре. Причины две — урезанный токен (песочница, AppContainer,
+        // низкий уровень целостности) или испорченные права самого раздела.
+        // Steam, запущенный из такого процесса, наследует ограничение и показывает
+        // «Путь к разделу Steam в реестре недоступен для записи»; игра не стартует.
+        if (!steamRunning && !steamWritable && !PrepareSafeSteamLaunch())
+        {
+            UpdateStatus("Steam запустите вручную и нажмите кнопку снова.", 0);
+            return;
+        }
+
+        // Steam бывает «полузапущенным»: steam.exe есть, а steamwebhelper нет.
+        // В таком состоянии клиент не обрабатывает команды — игра просто не стартует,
+        // и со стороны это выглядит как «кнопка ничего не делает».
+        if (steamRunning && Process.GetProcessesByName("steamwebhelper").Length == 0)
+        {
+            AppLogger.Log("STEAM", "Steam в некорректном состоянии: steam.exe есть, steamwebhelper нет");
+            if (elevated)
+            {
+                UpdateStatus("Steam работает некорректно. Перезапустите его вручную.", 0);
+                MessageBox.Show(this,
+                    "Steam запущен некорректно (нет процесса steamwebhelper), поэтому команда запуска игры до него не доходит.\n\n"
+                    + "Перезапустите Steam вручную: закройте его и откройте обычным ярлыком.",
+                    "Steam работает некорректно", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            DialogResult fix = MessageBox.Show(this,
+                "Steam запущен некорректно (нет процесса steamwebhelper), поэтому команда запуска игры до него не доходит.\n\n"
+                + "Перезапустить Steam автоматически? Он будет закрыт и открыт заново обычным способом.",
+                "Steam работает некорректно", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (fix != DialogResult.Yes)
+            {
+                UpdateStatus("Перезапустите Steam вручную и нажмите кнопку снова.", 0);
+                return;
+            }
+
+            UpdateStatus("Перезапускаю Steam...", 40);
+            try
+            {
+                foreach (Process sp in Process.GetProcessesByName("steam")) { try { sp.Kill(); } catch { } sp.Dispose(); }
+                foreach (Process sp in Process.GetProcessesByName("steamwebhelper")) { try { sp.Kill(); } catch { } sp.Dispose(); }
+                Thread.Sleep(3000);
+                Process.Start(new ProcessStartInfo("steam://open/main") { UseShellExecute = true });
+
+                for (int i = 0; i < 60; i++)
+                {
+                    Thread.Sleep(1000);
+                    if (Process.GetProcessesByName("steamwebhelper").Length > 0) break;
+                }
+                AppLogger.Log("STEAM", "После перезапуска: steam=" + Process.GetProcessesByName("steam").Length
+                    + " webhelper=" + Process.GetProcessesByName("steamwebhelper").Length);
+            }
+            catch (Exception exRestart) { AppLogger.Error("STEAM", "Перезапуск Steam", exRestart); }
+        }
+
+        UpdateStatus(steamRunning ? "Запускаю VTOL VR через Steam..." : "Запускаю Steam и VTOL VR...", 60);
+
+        try
+        {
+            Process.Start(new ProcessStartInfo("steam://rungameid/667970") { UseShellExecute = true });
+        }
+        catch (Exception exStart)
+        {
+            AppLogger.Error("STEAM", "Запуск steam://rungameid/667970", exStart);
+            UpdateStatus("Не удалось запустить игру: " + exStart.Message, 0);
+            MessageBox.Show(this, "Не удалось запустить VTOL VR:\n" + exStart.Message,
+                "Ошибка запуска", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        // Проверяем по факту: появился ли процесс игры. Иначе говорим прямо, что не сработало.
+        // 90 секунд, а не 20: холодный старт Steam + SteamVR (vrmonitor, шлем) занимает
+        // заметно больше, и раньше программа успевала объявить «игра не запустилась»,
+        // хотя клиент в этот момент как раз поднимал VR.
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            for (int i = 0; i < 90; i++)
+            {
+                Thread.Sleep(1000);
+                if (Process.GetProcessesByName("VTOLVR").Length > 0)
+                {
+                    AppLogger.Log("STEAM", "VTOL VR запустился (через " + (i + 1) + " c)");
+                    UpdateStatus("VTOL VR запускается...", 100);
+                    return;
+                }
+                // Игра может стартовать под именем процесса, которое Steam задал сам:
+                // проверяем ещё и окно SteamVR-сессии, чтобы не ругаться преждевременно.
+                if (i == 30 && Process.GetProcessesByName("steam").Length == 0
+                    && Process.GetProcessesByName("steamwebhelper").Length == 0)
+                {
+                    AppLogger.Log("STEAM", "Через 30 секунд после steam://rungameid клиент Steam так и не поднялся");
+                    UpdateStatus("Steam не отвечает. Запустите его вручную и нажмите кнопку снова.", 0);
+                    return;
+                }
+            }
+            AppLogger.Log("STEAM", "VTOL VR не появился за 90 секунд после steam://rungameid");
+            UpdateStatus("Игра не запустилась. Проверьте Steam.", 0);
+        });
     }
 
     private void BtnServers_Click(object sender, EventArgs e)
@@ -905,6 +1059,14 @@ public class MainForm : Form
     private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
     {
         SaveCheckboxSettings();
+        // Гасим дочерний процесс загрузки/записи (ffmpeg/yt-dlp), чтобы не оставлять его осиротевшим.
+        try
+        {
+            isCancelRequested = true;
+            if (currentWorkerProcess != null && !currentWorkerProcess.HasExited)
+                currentWorkerProcess.Kill();
+        }
+        catch { }
         if (uiStatusTimer != null)
         {
             uiStatusTimer.Stop();
@@ -1002,7 +1164,15 @@ public class MainForm : Form
             try
             {
                 Process pUpd = Process.Start(new ProcessStartInfo(ytdlpPath, "-U") { WindowStyle = ProcessWindowStyle.Hidden, CreateNoWindow = true });
-                if (pUpd != null) { pUpd.WaitForExit(15000); pUpd.Dispose(); }
+                if (pUpd != null)
+                {
+                    if (!pUpd.WaitForExit(15000))
+                    {
+                        // Не оставляем осиротевший yt-dlp, перезаписывающий свой же exe.
+                        try { pUpd.Kill(); pUpd.WaitForExit(3000); } catch { }
+                    }
+                    pUpd.Dispose();
+                }
                 SettingsManager.Set("LastYtDlpSelfUpdate", DateTime.UtcNow.ToString("o"));
                 SettingsManager.Save();
             }
@@ -1131,6 +1301,13 @@ public class MainForm : Form
         string[] droppedItems = (string[])e.Data.GetData(DataFormats.FileDrop);
         if (droppedItems == null || droppedItems.Length == 0) return;
 
+        if (isDownloadBusy)
+        {
+            UpdateStatus("Уже идёт загрузка/обработка. Дождитесь завершения.", 0);
+            return;
+        }
+        isDownloadBusy = true;
+
         SetControlsEnabled(false);
         ThreadPool.QueueUserWorkItem(delegate {
             try
@@ -1201,7 +1378,7 @@ public class MainForm : Form
                 if (!isCancelRequested) UpdateStatus(string.Format("Готово! Обработано треков: {0}", filesToProcess.Count), 100);
             }
             catch (Exception ex) { UpdateStatus("Ошибка: " + ex.Message, 0); }
-            finally { SetControlsEnabled(true); }
+            finally { isDownloadBusy = false; SetControlsEnabled(true); }
         });
     }
 
@@ -1236,6 +1413,13 @@ public class MainForm : Form
             MessageBox.Show("Сначала укажите папку RadioMusic!", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
+
+        if (isDownloadBusy)
+        {
+            UpdateStatus("Уже идёт загрузка/обработка. Дождитесь завершения.", 0);
+            return;
+        }
+        isDownloadBusy = true;
 
         SetControlsEnabled(false);
         UpdateStatus("Подготовка загрузчика...", 20);
@@ -1283,7 +1467,7 @@ public class MainForm : Form
                 else UpdateStatus("Загрузка завершена!", 100);
             }
             catch (Exception ex) { UpdateStatus("Ошибка загрузки: " + ex.Message, 0); }
-            finally { SetControlsEnabled(true); }
+            finally { isDownloadBusy = false; SetControlsEnabled(true); }
         });
     }
     private string GetToolsDir()
@@ -1299,48 +1483,27 @@ public class MainForm : Form
         try { this.Invoke(new Action(delegate { gameDir = txtPath.Text.Trim('"'); })); } catch { }
         if (string.IsNullOrEmpty(gameDir) || !Directory.Exists(gameDir)) { UpdateStatus("Укажите папку RadioMusic через Обзор...", 0); return; }
 
+        string step = "подготовка";
         try
         {
             UpdateStatus("Синхронизация модулей VTOL QoL...", 30);
             string toolsDir = GetToolsDir();
+            step = "извлечение ffmpeg/yt-dlp";
             ExtractResource("ffmpeg.exe", Path.Combine(toolsDir, "ffmpeg.exe"), false);
             ExtractResource("yt-dlp.exe", Path.Combine(toolsDir, "yt-dlp.exe"), false);
 
+            step = "папка приложения";
             string appFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL");
             Directory.CreateDirectory(appFolder);
-            string installedExe = Path.Combine(appFolder, "VTOL_QoL.exe");
+            step = "определение путей";
             string currentExe = Process.GetCurrentProcess().MainModule.FileName;
+            // ВАЖНО: больше НЕ копируем exe в AppData и НЕ запускаем оттуда.
+            // Раньше Shuffle.bat (автозапуск из Steam) указывал на копию в AppData, и она
+            // навсегда оставалась СТАРОЙ сборкой: именно она самоповышалась до администратора
+            // и ломала Steam, а обновить её мешала блокировка запущенного файла.
+            // Теперь bat всегда указывает на реально запущенный exe.
             string targetExeForBat = currentExe;
-
-            if (!string.Equals(currentExe, installedExe, StringComparison.OrdinalIgnoreCase))
-            {
-                bool copied = false;
-                try
-                {
-                    File.Copy(currentExe, installedExe, true);
-                    copied = true;
-                }
-                catch
-                {
-                    try
-                    {
-                        using (EventWaitHandle stopEv = new EventWaitHandle(false, EventResetMode.ManualReset, @"Local\VTOL_QoL_StopBgTracker"))
-                            stopEv.Set();
-                    }
-                    catch { }
-                    Thread.Sleep(600);
-                    try
-                    {
-                        File.Copy(currentExe, installedExe, true);
-                        copied = true;
-                    }
-                    catch (Exception exCopy)
-                    {
-                        AppLogger.Error("SYNC", "Не удалось обновить копию exe в AppData, используем текущий путь", exCopy);
-                    }
-                }
-                if (copied) targetExeForBat = installedExe;
-            }
+            step = "подготовка пути";
 
             string legacyBat = Path.Combine(gameDir, "Shuffle.bat");
             if (File.Exists(legacyBat))
@@ -1348,16 +1511,58 @@ public class MainForm : Form
                 try { File.Delete(legacyBat); } catch { }
             }
 
-            string batPath = Path.Combine(appFolder, "Shuffle.bat");
-            File.WriteAllText(batPath,
-                "@echo off\r\nstart \"\" /b \"" + targetExeForBat + "\" --shuffle \"" + gameDir + "\"\r\n",
-                Encoding.ASCII);
+            step = "запись Shuffle.bat";
+            string batBody = "@echo off\r\nstart \"\" /b \"" + targetExeForBat + "\" --shuffle \"" + gameDir + "\"\r\n";
+            // Пишем bat РЯДОМ С EXE (папка программы обычно доступна на запись),
+            // а не в AppData: там запись может быть запрещена, и раньше это давало
+            // «Ошибка синхронизации: Отказано в доступе по пути».
+            string batPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Shuffle.bat");
+            try
+            {
+                File.WriteAllText(batPath, batBody, Encoding.ASCII);
+            }
+            catch (Exception exBat)
+            {
+                AppLogger.Error("SYNC", "Запись Shuffle.bat рядом с exe", exBat);
+                batPath = Path.Combine(appFolder, "Shuffle.bat");
+                File.WriteAllText(batPath, batBody, Encoding.ASCII);
+            }
 
-            ConfigureSteam(batPath);
+            // Ошибки интеграции со Steam не должны валить всю синхронизацию:
+            // показываем понятный текст вместо сырого «Отказано в доступе по пути».
+            // Steam: только ТИХОЕ лечение уже испорченного конфига. Свои параметры
+// запуска больше не пишем вообще (шафл делает фоновый трекер), диалогов нет.
+            try
+            {
+                RepairSteamConfig();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                AppLogger.Log("STEAM", "Нет прав на запись в папку Steam (userdata/localconfig.vdf)");
+            }
+            catch (Exception exSteam)
+            {
+                AppLogger.Error("STEAM", "RepairSteamConfig", exSteam);
+            }
 
             UpdateStatus("VTOL QoL готов к работе.", 100);
         }
-        catch (Exception ex) { UpdateStatus("Ошибка синхронизации: " + ex.Message, 0); }
+        catch (Exception ex)
+        {
+            AppLogger.Error("SYNC", "SilentSync, этап: " + step, ex);
+            // Гарантированный лог рядом с exe: app_debug.log по какой-то причине может не писаться,
+            // а этот файл всегда доступен (папка программы).
+            try
+            {
+                File.AppendAllText(
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sync_error.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " | этап: " + step + " | " +
+                    ex.GetType().Name + ": " + ex.Message + Environment.NewLine + ex.StackTrace + Environment.NewLine + Environment.NewLine,
+                    Encoding.UTF8);
+            }
+            catch { }
+            UpdateStatus("Ошибка синхронизации (" + step + "): " + ex.Message, 0);
+        }
     }
 
     private string UnescapeVdfString(string s)
@@ -1433,26 +1638,89 @@ public class MainForm : Form
         return false;
     }
 
+    // Чистит параметры запуска от наших прежних вставок и НИЧЕГО не добавляет.
+    // Шафл теперь делает фоновый трекер, поэтому Steam-параметры не нужны вообще.
+    // Возвращает очищенное значение (может быть пустым — это значит «без параметров»).
+    // Определяем кодировку localconfig.vdf. Файл Steam часто НЕ utf-8 (ANSI/cp1251).
+    // Читать его как UTF-8 и записывать обратно в UTF-8 нельзя: русский текст
+    // перекодируется, файл раздувается и Steam его ломает.
+    private static System.Text.Encoding DetectVdfEncoding(string path)
+    {
+        try
+        {
+            byte[] head = new byte[Math.Min(65536, (int)new FileInfo(path).Length)];
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                fs.Read(head, 0, head.Length);
+
+            if (head.Length >= 3 && head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF)
+                return new System.Text.UTF8Encoding(true);
+
+            try
+            {
+                System.Text.UTF8Encoding strict = new System.Text.UTF8Encoding(false, true);
+                strict.GetString(head);
+                return new System.Text.UTF8Encoding(false);   // валидный UTF-8 без BOM
+            }
+            catch { }
+        }
+        catch { }
+        return System.Text.Encoding.Default;              // ANSI (cp1251 на русской системе)
+    }
+
+    // Убирает порчу, которую оставляли прежние версии: мусорный ключ "\" со значением
+    // параметров запуска, оборванные строки с путём к Shuffle.bat и "%command%".
+    private static string CleanVdfCorruption(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+
+        string[] lines = Regex.Split(text, "\r\n|\n|\r");
+        StringBuilder sb = new StringBuilder(text.Length);
+        bool changed = false;
+
+        foreach (string line in lines)
+        {
+            string t = line.Trim();
+            bool junk = false;
+
+            if (Regex.IsMatch(t, @"^""\\\\""\s+""")) junk = true;                                  // ключ "\"
+            else if (Regex.IsMatch(t, @"^""[^""]*Shuffle\.bat""\s+""&\s*$", RegexOptions.IgnoreCase)) junk = true;
+            else if (Regex.IsMatch(t, @"^""%command%""\s+""\s*$", RegexOptions.IgnoreCase)) junk = true;
+            else if (Regex.IsMatch(t, @"^""LaunchOptions""\s+""[^""]*Shuffle\.bat", RegexOptions.IgnoreCase)) junk = true;
+
+            if (junk) { changed = true; continue; }
+            sb.Append(line).Append("\r\n");
+        }
+
+        return changed ? sb.ToString() : text;
+    }
+
     private string MergeLaunchOptions(string existingRaw, string batPath)
     {
         string unescaped = UnescapeVdfString(existingRaw).Trim();
-        string ourPrefix = "cmd /c \"\"" + batPath + "\" & ";
 
-        // Если наши параметры уже прописаны — ничего не меняем
-        if (unescaped.IndexOf(batPath, StringComparison.OrdinalIgnoreCase) >= 0)
-            return null;
+        // Убираем все «cmd /c ""...Shuffle.bat" & » — включая ссылки на уже удалённый
+        // RadioMusic\Shuffle.bat. Именно из-за такой ссылки игра не стартовала,
+        // а Steam показывал ошибку при нажатии «СТАРТ VTOL VR».
+        string cleaned = Regex.Replace(
+            unescaped,
+            @"cmd\s+/c\s+""[^""]*Shuffle\.bat"".{0,8}?\s*&\s*",
+            "",
+            RegexOptions.IgnoreCase);
 
-        if (string.IsNullOrEmpty(unescaped))
-            return ourPrefix + "%command%\"";
+        // На всякий случай: любое одиночное упоминание нашего bat тоже убираем.
+        cleaned = Regex.Replace(cleaned, @"""?""[^""]*Shuffle\.bat""?""", "", RegexOptions.IgnoreCase);
 
-        if (unescaped.IndexOf("%command%", StringComparison.OrdinalIgnoreCase) >= 0)
-            return Regex.Replace(unescaped, "%command%", "cmd /c \"\"" + batPath + "\" & %command%\"", RegexOptions.IgnoreCase);
+        cleaned = cleaned.Trim();
+        while (cleaned.StartsWith("&")) cleaned = cleaned.Substring(1).Trim();
+        cleaned = cleaned.Trim('"').Trim();
 
-        // Если у пользователя были только флаги (например "-vrmode oculus"), сохраняем их после %command%
-        return ourPrefix + "%command% " + unescaped + "\"";
+        // Если остался только огрызок "%command%" без параметров — трактуем как «пусто».
+        if (cleaned.Equals("%command%", StringComparison.OrdinalIgnoreCase)) cleaned = "";
+
+        return cleaned;
     }
 
-    private void CreateVersionedBackup(string vdfPath)
+    private static void CreateVersionedBackup(string vdfPath)
     {
         try
         {
@@ -1471,8 +1739,55 @@ public class MainForm : Form
         catch { }
     }
 
+    // =====================================================================
+    // === ЛЕЧЕНИЕ КОНФИГА STEAM (без записи своих параметров) ==============
+    // Программа больше НЕ добавляет ничего в Steam: только убирает свою
+    // прежнюю порчу (мусорный ключ "\", оборванные строки, LaunchOptions
+    // со ссылкой на удалённый Shuffle.bat). Никаких диалогов.
+    // Вызывается тихо; шафл работает через фоновый трекер.
+    // =====================================================================
+    private static void RepairSteamConfig()
+    {
+        try
+        {
+            string steamPath = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamPath", "") as string;
+            if (string.IsNullOrEmpty(steamPath)) return;
+            steamPath = steamPath.Replace('/', '\\');
+            string userdata = Path.Combine(steamPath, "userdata");
+            if (!Directory.Exists(userdata)) return;
+
+            foreach (string vdf in Directory.GetFiles(userdata, "localconfig.vdf", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    System.Text.Encoding enc = DetectVdfEncoding(vdf);
+                    string text = File.ReadAllText(vdf, enc);
+                    string cleaned = CleanVdfCorruption(text);
+                    if (string.Equals(cleaned, text, StringComparison.Ordinal)) continue;
+
+                    // Санитарная проверка: структура должна остаться целой.
+                    int bo = Regex.Matches(cleaned, "\\{").Count, bc = Regex.Matches(cleaned, "\\}").Count;
+                    if (bo != bc || cleaned.IndexOf("\"667970\"") < 0)
+                    {
+                        AppLogger.Log("STEAM", "Починка VDF отменена проверкой структуры: " + vdf);
+                        continue;
+                    }
+
+                    CreateVersionedBackup(vdf);
+                    WriteVdfAtomic(vdf, cleaned, enc);
+                    AppLogger.Log("STEAM", "Конфиг Steam вычищен от старых параметров автозапуска: " + vdf);
+                }
+                catch (Exception exOne) { AppLogger.Error("STEAM", "RepairSteamConfig: " + vdf, exOne); }
+            }
+        }
+        catch (Exception ex) { AppLogger.Error("STEAM", "RepairSteamConfig", ex); }
+    }
+
     private void ConfigureSteam(string batPath)
     {
+        // Диагностические режимы не должны ни закрывать Steam, ни править его конфиги.
+        if (diagnosticMode) return;
+
         string steamPath = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamPath", "") as string;
         if (steamPath == null) steamPath = "";
         steamPath = steamPath.Replace('/', '\\');
@@ -1483,17 +1798,25 @@ public class MainForm : Form
         bool needsUpdate = false;
         foreach (string vdf in vdfFiles)
         {
-            string text = File.ReadAllText(vdf, Encoding.UTF8);
+            System.Text.Encoding enc = DetectVdfEncoding(vdf);
+            string text = CleanVdfCorruption(File.ReadAllText(vdf, enc));
             int bStart, bEnd;
             if (FindVdfBlockBounds(text, "667970", out bStart, out bEnd))
             {
                 string block = text.Substring(bStart, bEnd - bStart + 1);
                 Match mLo = Regex.Match(block, "\"LaunchOptions\"\\s+\"((?:\\\\.|[^\"\\\\])*)\"");
                 string curLo = mLo.Success ? mLo.Groups[1].Value : "";
-                if (MergeLaunchOptions(curLo, batPath) != null)
+                if (mLo.Success)
                 {
-                    needsUpdate = true;
-                    break;
+                    string cleanedNow = MergeLaunchOptions(curLo, batPath);
+                    // Нужно обновить, если в параметрах остались наши вставки
+                    // (в т.ч. ссылка на удалённый RadioMusic\Shuffle.bat) или лишние кавычки.
+                    string curUn = UnescapeVdfString(curLo).Trim();
+                    if (!string.Equals(cleanedNow, curUn, StringComparison.Ordinal))
+                    {
+                        needsUpdate = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1504,66 +1827,382 @@ public class MainForm : Form
         {
             this.Invoke(new Action(delegate {
                 confirm = MessageBox.Show(this,
-                    "Для автозапуска шафла и трекера нужно один раз перезапустить Steam и добавить параметры запуска VTOL VR (ваши текущие параметры будут сохранены).\nЗакрыть Steam сейчас и внести изменения?",
+                    "Добавить параметры автозапуска VTOL QoL к игре VTOL VR в Steam?\nВаши текущие параметры запуска будут сохранены.\n\nПеред этим Steam нужно закрыть вручную (меню Steam → Выход). Программа не закрывает и не перезапускает Steam, чтобы не повредить его настройки.",
                     "Настройка интеграции со Steam", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             }));
         }
         catch { return; }
         if (confirm != DialogResult.Yes) return;
 
-        bool steamWasRunning = false;
+        // БЕЗОПАСНО: никогда не закрываем и не перезапускаем Steam.
+        // Раньше приложение вызывало steam://exit и затем запускало steam.exe — из-за этого
+        // у пользователей ломался Steam («путь к разделу Steam в реестре недоступен для записи»):
+        // оставались steamwebhelper, державшие блокировки, а новый steam.exe стартовал поверх них.
+        // Плюс правка конфига работающего Steam бесполезна — Steam перезапишет её при выходе.
+        int steamRunning;
         Process[] steamProcs = Process.GetProcessesByName("steam");
-        if (steamProcs.Length > 0)
+        steamRunning = steamProcs.Length;
+        foreach (Process sp in steamProcs) sp.Dispose();
+
+        if (steamRunning > 0)
         {
-            steamWasRunning = true;
-            foreach (Process sp in steamProcs) sp.Dispose();
-            try { Process.Start(new ProcessStartInfo("steam://exit") { UseShellExecute = true }); } catch { }
-
-            DateTime waitDeadline = DateTime.UtcNow.AddSeconds(20);
-            while (DateTime.UtcNow < waitDeadline)
+            try
             {
-                Process[] cur = Process.GetProcessesByName("steam");
-                int cnt = cur.Length;
-                foreach (Process p in cur) p.Dispose();
-                if (cnt == 0) break;
-                Thread.Sleep(500);
+                this.Invoke(new Action(delegate {
+                    MessageBox.Show(this,
+                        "Steam сейчас запущен.\n\nПолностью закройте Steam (меню Steam → Выход), затем нажмите кнопку ещё раз — изменения применятся.\n\nSteam не закрывается автоматически, чтобы не повредить его настройки и реестр.",
+                        "Нужно закрыть Steam вручную", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }));
             }
-
-            Process[] stillRunning = Process.GetProcessesByName("steam");
-            if (stillRunning.Length > 0)
-            {
-                foreach (Process p in stillRunning) p.Dispose();
-                UpdateStatus("Steam не успел закрыться за 20 сек. Закройте Steam вручную и повторите.", 0);
-                return;
-            }
-            Thread.Sleep(800);
+            catch { }
+            UpdateStatus("Закройте Steam вручную и повторите.", 0);
+            return;
         }
 
         foreach (string vdf in vdfFiles)
         {
-            string text = File.ReadAllText(vdf, Encoding.UTF8);
+            string text;
+            try { text = CleanVdfCorruption(File.ReadAllText(vdf, DetectVdfEncoding(vdf))); }
+            catch (Exception exR) { AppLogger.Error("STEAM", "Чтение VDF пропущено: " + vdf, exR); continue; }
+
             int startIdx, endIdx;
-            if (FindVdfBlockBounds(text, "667970", out startIdx, out endIdx))
+            if (!FindVdfBlockBounds(text, "667970", out startIdx, out endIdx)) continue;
+
+            string appBlock = text.Substring(startIdx, endIdx - startIdx + 1);
+            Match mLo = Regex.Match(appBlock, "\"LaunchOptions\"\\s+\"((?:\\\\.|[^\"\\\\])*)\"");
+            string curLo = mLo.Success ? mLo.Groups[1].Value : "";
+            string merged = MergeLaunchOptions(curLo, batPath);
+            if (merged == null) continue;
+
+            string escapedNew = EscapeVdfString(merged);
+
+            if (merged.Length == 0)
             {
-                string appBlock = text.Substring(startIdx, endIdx - startIdx + 1);
-                Match mLo = Regex.Match(appBlock, "\"LaunchOptions\"\\s+\"((?:\\\\.|[^\"\\\\])*)\"");
-                string curLo = mLo.Success ? mLo.Groups[1].Value : "";
-                string merged = MergeLaunchOptions(curLo, batPath);
-                if (merged == null) continue;
+                // Наших параметров быть не должно. Если строка есть — удаляем её целиком
+                // (именно она с битой ссылкой на удалённый Shuffle.bat ломала запуск игры).
+                if (!mLo.Success) continue;
+                int lineStart = appBlock.LastIndexOf('\n', Math.Max(0, mLo.Index - 1));
+                if (lineStart < 0) lineStart = mLo.Index;
+                int lineEnd = appBlock.IndexOf('\n', mLo.Index + mLo.Length);
+                if (lineEnd < 0) lineEnd = appBlock.Length;
+                appBlock = appBlock.Substring(0, lineStart) + appBlock.Substring(lineEnd);
+            }
+            else if (mLo.Success)
+            {
+                appBlock = appBlock.Substring(0, mLo.Index) + "\"LaunchOptions\"\t\t\"" + escapedNew + "\"" + appBlock.Substring(mLo.Index + mLo.Length);
+            }
+            else
+            {
+                continue;   // добавлять нам больше нечего
+            }
+            string newText = text.Substring(0, startIdx) + appBlock + text.Substring(endIdx + 1);
 
+            // Санитарная проверка: файл не должен «схлопнуться» и обязан сохранить блок приложения.
+            int chkS, chkE;
+            if (newText.Length < text.Length * 0.5 || !FindVdfBlockBounds(newText, "667970", out chkS, out chkE))
+            {
+                AppLogger.Log("STEAM", "Запись VDF отменена санитарной проверкой: " + vdf);
+                continue;
+            }
+
+            try
+            {
                 CreateVersionedBackup(vdf);
-                string escapedNew = EscapeVdfString(merged);
-
-                if (mLo.Success)
-                    appBlock = appBlock.Substring(0, mLo.Index) + "\"LaunchOptions\"\t\t\"" + escapedNew + "\"" + appBlock.Substring(mLo.Index + mLo.Length);
-                else
-                    appBlock = Regex.Replace(appBlock, "^(\"667970\"\\s*\\{)", "\"667970\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"" + escapedNew + "\"");
-                text = text.Substring(0, startIdx) + appBlock + text.Substring(endIdx + 1);
-                File.WriteAllText(vdf, text, new UTF8Encoding(false));
+                WriteVdfAtomic(vdf, newText, DetectVdfEncoding(vdf));
+                AppLogger.Log("STEAM", "Параметры запуска записаны: " + vdf);
+            }
+            catch (Exception exW)
+            {
+                AppLogger.Error("STEAM", "Не удалось обновить VDF: " + vdf, exW);
             }
         }
-        if (steamWasRunning && File.Exists(Path.Combine(steamPath, "steam.exe")))
-            Process.Start(Path.Combine(steamPath, "steam.exe"));
+
+        // Steam не закрывали и не перезапускаем — параметры применятся при следующем запуске
+        // Steam самим пользователем. Так программа физически не может повредить Steam.
+        UpdateStatus("Готово. Параметры применятся при следующем запуске Steam.", 100);
+    }
+
+    // =====================================================================
+    // === ДОСТУП К РАЗДЕЛУ STEAM В РЕЕСТРЕ =================================
+    // Steam пишет свои данные в HKCU\Software\Valve\Steam и без этого не
+    // работает. Запущенный из программы клиент наследует её токен, поэтому
+    // проверять доступ нужно ДО запуска: если запись запрещена, Steam потом
+    // покажет «Путь к разделу Steam в реестре недоступен для записи».
+    // =====================================================================
+    private static bool? steamRegistryWritableCache = null;
+
+    private static bool CanWriteSteamRegistry()
+    {
+        if (steamRegistryWritableCache.HasValue) return steamRegistryWritableCache.Value;
+        string err;
+        bool ok = SteamRegistryRepair.CanWrite(out err);
+        if (!ok) AppLogger.Log("STEAM", "Раздел Steam в реестре недоступен для записи: " + err);
+        steamRegistryWritableCache = ok;
+        return ok;
+    }
+
+    // Steam бывает запущен «вхолостую»: процесс есть, но клиент так и не записал
+    // свои данные в реестр (обычно потому, что его запустила программа с урезанными
+    // правами). Такой клиент не обрабатывает команды запуска, а пользователю
+    // показывает ошибку «Путь к разделу Steam в реестре недоступен для записи».
+    // Возвращает false, если запущенный Steam нерабочий (при согласии — закрывает его).
+    private bool CheckRunningSteamIsUsable()
+    {
+        int pid = 0;
+        try
+        {
+            object pidObj = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam\ActiveProcess", "pid", 0);
+            if (pidObj is int) pid = (int)pidObj;
+        }
+        catch { return true; }   // нет доступа к чтению — не мешаем
+
+        // Клиент записал свой PID и процесс жив — считаем, что Steam рабочий.
+        if (pid > 0)
+        {
+            try
+            {
+                using (Process live = Process.GetProcessById(pid))
+                {
+                    if (!live.HasExited) return true;
+                }
+            }
+            catch { }
+        }
+
+        // pid пуст или ссылается на мёртвый процесс. Совсем свежий запуск не трогаем:
+        // клиент мог просто не успеть записать себя (до ~25 секунд).
+        DateTime oldest = DateTime.MaxValue;
+        foreach (string name in new string[] { "steam", "steamwebhelper" })
+        {
+            Process[] arr = Process.GetProcessesByName(name);
+            foreach (Process p in arr)
+            {
+                try { if (p.StartTime < oldest) oldest = p.StartTime; } catch { }
+                p.Dispose();
+            }
+        }
+        if (oldest == DateTime.MaxValue) return true;                    // процессов нет
+        if ((DateTime.Now - oldest).TotalSeconds < 25) return true;      // ещё стартует
+
+        AppLogger.Log("STEAM", "Запущенный Steam не записал свои данные в реестр (работает "
+            + (int)(DateTime.Now - oldest).TotalSeconds + " c, pid в реестре=" + pid + ")");
+
+        DialogResult res = MessageBox.Show(this,
+            "Steam сейчас запущен, но так и не записал свои данные в реестр — значит, клиент стартовал "
+            + "с урезанными правами и сам не работает. Именно поэтому появляется ошибка про раздел Steam в реестре.\n\n"
+            + "Закрыть этот Steam и запустить его заново обычным способом?",
+            "Steam запущен неправильно", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+        if (res != DialogResult.Yes) return false;
+
+        UpdateStatus("Перезапускаю Steam...", 30);
+        string[] names = new string[] { "steam", "steamwebhelper", "steamerrorreporter64", "steamerrorreporter", "vrdashboard", "vrmonitor", "vrserver", "vrcompositor" };
+        foreach (string name in names)
+        {
+            foreach (Process p in Process.GetProcessesByName(name))
+            {
+                try { p.Kill(); } catch { }
+                p.Dispose();
+            }
+        }
+        Thread.Sleep(4000);
+        AppLogger.Log("STEAM", "Нерабочий Steam закрыт, PID в реестре сброшен");
+        return true;
+    }
+
+    // Может ли программа писать в свой каталог настроек. Если нет — процесс
+    // запущен с урезанным токеном (песочница, AppContainer, низкий уровень
+    // целостности), и это же ограничение унаследует любой запущенный Steam.
+    private static bool CanWriteAppStateFolder()
+    {
+        try
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VTOL_QoL");
+            Directory.CreateDirectory(dir);
+            string probe = Path.Combine(dir, "qol_probe_" + Guid.NewGuid().ToString("N").Substring(0, 6) + ".tmp");
+            File.WriteAllText(probe, "1");
+            File.Delete(probe);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Log("SETTINGS", "Каталог настроек недоступен для записи: " + ex.GetType().Name);
+            return false;
+        }
+    }
+
+    // Можно ли безопасно запускать Steam из этой программы. false — запускать
+    // нельзя (объяснение и, при испорченных правах, ремонт уже выполнены).
+    private bool PrepareSafeSteamLaunch()
+    {
+        // Случай 1: урезанный токен. Права в реестре целы, чинить нечего —
+        // так работает защита, поэтому просто честно объясняем, что делать.
+        if (!CanWriteAppStateFolder())
+        {
+            AppLogger.Log("STEAM", "Ограниченный режим: нет записи ни в раздел Steam в реестре, ни в свой каталог настроек");
+            MessageBox.Show(this,
+                "Программа запущена с урезанными правами: у процесса нет доступа на запись ни к разделу Steam в реестре, "
+                + "ни к своей папке настроек.\n\n"
+                + "Обычно так бывает, когда VTOL_QoL.exe лежит в папке, из которой Windows запускает программы "
+                + "с пониженными правами (рабочая папка агента/песочницы). Любой Steam, запущенный оттуда, "
+                + "получает те же ограничения и показывает ошибку «Путь к разделу Steam в реестре недоступен для записи».\n\n"
+                + "Что сделать:\n"
+                + "1) скопируйте папку с программой в обычное место (например, «Документы» или отдельную папку на диске C) "
+                + "и запускайте VTOL_QoL.exe оттуда — права будут в порядке;\n"
+                + "2) или сначала запустите Steam обычным ярлыком, а уже потом нажмите эту кнопку.\n\n"
+                + "Сам раздел реестра при этом не испорчен: игре и клиенту Steam ничего не грозит.",
+                "Ограниченный режим", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        // Случай 2: раздела Steam в реестре нет вообще — клиент не установлен
+        // или не запускался ни разу. Права тут чинить нечего.
+        using (RegistryKey steamKeyProbe = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam"))
+        {
+            if (steamKeyProbe == null)
+            {
+                AppLogger.Log("STEAM", "Раздел HKCU\\Software\\Valve\\Steam отсутствует: Steam не установлен");
+                MessageBox.Show(this,
+                    "В реестре нет раздела Steam (HKCU\\Software\\Valve\\Steam) — клиент Steam не установлен или ещё ни разу не запускался.\n\n"
+                    + "Установите Steam и один раз запустите его обычным ярлыком — после этого кнопка СТАРТ VTOL VR заработает.",
+                    "Steam не найден", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+        }
+
+        // Случай 3: права раздела Steam действительно испорчены (запреты,
+        // снятое наследование). Предлагаем восстановить.
+        AppLogger.Log("STEAM", "Раздел Steam в реестре защищён от записи, предлагаю восстановление прав");
+        DialogResult fix = MessageBox.Show(this,
+            "Раздел Steam в реестре защищён от записи — из-за этого Steam при запуске показывает ошибку.\n\n"
+            + "Восстановить стандартные права на раздел HKCU\\Software\\Valve\\Steam?\n"
+            + "Потребуется подтверждение администратора (UAC). Настройки и значения Steam не меняются.",
+            "Права на раздел Steam", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (fix != DialogResult.Yes) return false;
+
+        UpdateStatus("Восстанавливаю права на раздел Steam в реестре...", 30);
+        string reportPath = Path.Combine(Path.GetTempPath(), "VTOL_QoL_steam_acl.txt");
+        try { if (File.Exists(reportPath)) File.Delete(reportPath); } catch { }
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath, "--fix-steam-acl \"" + reportPath + "\"");
+            psi.Verb = "runas";
+            psi.UseShellExecute = true;
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
+            using (Process fixProc = Process.Start(psi))
+            {
+                if (fixProc != null) fixProc.WaitForExit(60000);
+            }
+        }
+        catch (Exception exFix)
+        {
+            AppLogger.Error("STEAM", "Запуск восстановления прав раздела Steam", exFix);
+        }
+
+        steamRegistryWritableCache = null;
+        string errNow;
+        if (SteamRegistryRepair.CanWrite(out errNow))
+        {
+            AppLogger.Log("STEAM", "Права на раздел Steam восстановлены");
+            UpdateStatus("Права на раздел Steam восстановлены.", 40);
+            return true;
+        }
+
+        AppLogger.Log("STEAM", "Восстановить права на раздел Steam не удалось: " + errNow);
+        string report = "";
+        try { if (File.Exists(reportPath)) report = File.ReadAllText(reportPath).Trim(); } catch { }
+        MessageBox.Show(this,
+            "Не удалось восстановить права на раздел Steam в реестре.\n\n"
+            + (errNow ?? "")
+            + (string.IsNullOrEmpty(report) ? "" : "\n\n" + report)
+            + "\n\nЧто можно сделать вручную: запустите Steam обычным ярлыком (тогда кнопка работает с уже "
+            + "запущенным клиентом) или запустите VTOL QoL другим способом — не из песочницы и не от администратора.",
+            "Не удалось исправить", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        return false;
+    }
+
+    // Надёжное определение того, запущен ли Steam.
+    // Одного процесса "steam" мало: клиент может держать только steamwebhelper,
+    // окно может быть свёрнуто в трей, а имя процесса зависит от версии клиента.
+    private static bool IsSteamRunning()
+    {
+        try
+        {
+            foreach (string name in new string[] { "steam", "steamwebhelper", "steamservice", "steamerrorreporter" })
+            {
+                Process[] arr = Process.GetProcessesByName(name);
+                if (arr != null && arr.Length > 0)
+                {
+                    foreach (Process p in arr) p.Dispose();
+                    return true;
+                }
+            }
+            // Окно Steam (в т.ч. свёрнутое в трей — заголовок всё равно существует)
+            if (FindWindow(null, "Steam") != IntPtr.Zero) return true;
+            // SteamPID из реестра, если процесс ещё жив
+            object pidObj = Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Valve\Steam", "SteamPID", 0);
+            if (pidObj is int && (int)pidObj > 0)
+            {
+                try
+                {
+                    using (Process p = Process.GetProcessById((int)pidObj))
+                        if (!p.HasExited) return true;
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    // Запущена ли программа с повышенными правами.
+    private static bool IsRunningAsAdmin()
+    {
+        try
+        {
+            using (System.Security.Principal.WindowsIdentity id = System.Security.Principal.WindowsIdentity.GetCurrent())
+                return new System.Security.Principal.WindowsPrincipal(id)
+                    .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch { return false; }
+    }
+
+    // Атомарная запись конфигурации Steam: сначала во временный файл рядом, затем замена.
+    // Обрыв/падение в середине записи не может оставить localconfig.vdf обрезанным.
+    private static void WriteVdfAtomic(string path, string text, System.Text.Encoding enc)
+    {
+        if (enc == null) enc = System.Text.Encoding.Default;
+        string dir = Path.GetDirectoryName(path);
+        if (string.IsNullOrEmpty(dir)) dir = ".";
+        string tmp = Path.Combine(dir, Path.GetFileName(path) + ".tmp_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+        try
+        {
+            using (FileStream fs = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (StreamWriter sw = new StreamWriter(fs, enc))
+            {
+                sw.Write(text);
+                sw.Flush();
+                fs.Flush(true);
+            }
+            if (File.Exists(path))
+            {
+                try { File.Replace(tmp, path, null); }
+                catch
+                {
+                    // ФС без поддержки Replace (сеть, некоторый антивирус) — аккуратная перезапись.
+                    File.Copy(tmp, path, true);
+                    File.Delete(tmp);
+                }
+            }
+            else
+            {
+                File.Move(tmp, path);
+            }
+        }
+        catch
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            throw;
+        }
     }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -1585,10 +2224,115 @@ public class MainForm : Form
             try { File.WriteAllText("crash_last.log", e.ExceptionObject.ToString()); } catch { }
         };
         bool isShuffleMode = (args != null && args.Length >= 1 && args[0] == "--shuffle");
+        if (args != null && args.Length >= 1 && args[0] == "--perf-test")
+            DebriefRadarForm.PerfTestActive = true;
+        if (args != null && args.Length >= 3 && args[0] == "--dump-replay")
+        {
+            // Загружает реплей и пишет диагностический отчёт: удобно проверять
+            // разбор сторон (союз/враг) без запуска окна.
+            diagnosticMode = true;
+            string rpPilot = args.Length >= 4 ? args[3] : "";
+            try { DebriefEngine.DumpReplay(args[1], rpPilot, args[2]); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 3 && args[0] == "--scenario-text")
+        {
+            diagnosticMode = true;
+            try { DebriefEngine.ScenarioToText(args[1], args[2]); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 2 && args[0] == "--find-type")
+        {
+            diagnosticMode = true;
+            string ftOut = args.Length >= 3 ? args[2] : (args[1].Replace(" ", "_") + ".types.txt");
+            try { DebriefEngine.FindGameTypes(args[1], ftOut); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 2 && args[0] == "--livery-fix")
+        {
+            diagnosticMode = true;
+            string lp;
+            try { LiveryManagerForm.RunAutoFix(args[1], out lp); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 4 && args[0] == "--test-teams")
+        {
+            diagnosticMode = true;
+            string tp = args.Length >= 5 ? args[4] : "";
+            try { DebriefEngine.TestScenarioTeams(args[1], args[2], tp, args[3]); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 3 && args[0] == "--prefab-teams")
+        {
+            diagnosticMode = true;
+            try { DebriefEngine.ScanAssetForPrefabTeams(args[1], args[2]); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 4 && args[0] == "--hexdump")
+        {
+            diagnosticMode = true;
+            long off = 0;
+            int len = 512;
+            try { off = Convert.ToInt64(args[2], 16); } catch { }
+            if (args.Length >= 4) { try { len = Convert.ToInt32(args[3]); } catch { } }
+            string ho = args.Length >= 5 ? args[4] : "hexdump.txt";
+            try { DebriefEngine.HexDump(args[1], off, len, ho); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 3 && args[0] == "--grep-file")
+        {
+            diagnosticMode = true;
+            string go = args.Length >= 4 ? args[3] : (args[1] + ".find.txt");
+            try { DebriefEngine.FindInFile(args[1], args[2], go); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 3 && args[0] == "--scenario-teams")
+        {
+            diagnosticMode = true;
+            try { DebriefEngine.DumpScenarioTeams(args[1], args[2]); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 2 && args[0] == "--il-dump")
+        {
+            diagnosticMode = true;
+            string ilOut = args.Length >= 3 ? args[2] : (args[1] + ".il.txt");
+            try { DebriefEngine.DumpTypeIL(args[1], ilOut); } catch { }
+            return;
+        }
+        if (args != null && args.Length >= 2 && args[0] == "--dump-vtr")
+        {
+            diagnosticMode = true;
+            string dumpOut = args.Length >= 3 ? args[2] : (args[1] + ".structure.txt");
+            string dumpPilot = args.Length >= 4 ? args[3] : "";
+            try { DebriefEngine.DumpNativeStructure(args[1], dumpOut, dumpPilot); } catch { }
+            return;
+        }
+        // Восстановление прав на раздел Steam в реестре (запускается с runas из
+        // основной программы, когда раздел защищён от записи). Отчёт — в файл,
+        // потому что окно консоли у winexe нет.
+        if (args != null && args.Length >= 1 && args[0] == "--fix-steam-acl")
+        {
+            diagnosticMode = true;
+            string aclReport;
+            bool aclOk = SteamRegistryRepair.Repair(out aclReport);
+            string aclOut = (args.Length >= 2 && !string.IsNullOrEmpty(args[1]))
+                ? args[1]
+                : Path.Combine(Path.GetTempPath(), "VTOL_QoL_steam_acl.txt");
+            try { File.WriteAllText(aclOut, (aclOk ? "OK" : "FAIL") + Environment.NewLine + aclReport, Encoding.UTF8); } catch { }
+            return;
+        }
+
+        if (args != null && args.Length >= 1 && args[0] == "--perf-test")
+            diagnosticMode = true;
         if (!isShuffleMode)
             AppLogger.InitSession();
 
         AppLogger.Log("CORE", "Запуск приложения. Аргументы: " + (args != null ? string.Join(" ", args) : "нет"));
+        // Сразу фиксируем в логе, в каком контексте работает программа: от этого
+        // зависит, можно ли запускать Steam (см. PrepareSafeSteamLaunch).
+        AppLogger.Log("CORE", "Проверка доступа: раздел Steam в реестре — запись "
+            + (CanWriteSteamRegistry() ? "разрешена" : "ЗАПРЕЩЕНА")
+            + ", каталог настроек — запись " + (CanWriteAppStateFolder() ? "разрешена" : "ЗАПРЕЩЕНА"));
 
         if (isShuffleMode)
         {

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -37,6 +37,10 @@ public static class MusicShuffler
     {
         if (!Directory.Exists(musicDir)) return false;
         if (!forceInGame && IsGameRunning()) return false;
+
+        // Подчищаем осиротевшие временные файлы от прошлых аварийных шафлов,
+        // чтобы они не попадали в список и не получали двойной префикс.
+        CleanupOrphanTemps(musicDir);
 
         string[] files;
         try { files = Directory.GetFiles(musicDir, "*.mp3", SearchOption.TopDirectoryOnly); }
@@ -130,6 +134,18 @@ public static class MusicShuffler
         }
 
         return true;
+    }
+
+    private static void CleanupOrphanTemps(string musicDir)
+    {
+        try
+        {
+            foreach (string f in Directory.GetFiles(musicDir, "__tmp_*.mp3", SearchOption.TopDirectoryOnly))
+            {
+                try { File.Delete(f); } catch { }
+            }
+        }
+        catch { }
     }
 }
 

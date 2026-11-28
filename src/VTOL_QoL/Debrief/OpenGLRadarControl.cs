@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -460,6 +460,8 @@ public class OpenGLRadarControl : Control
     protected override void OnPaint(PaintEventArgs e)
     {
         if (hrc == IntPtr.Zero || this.Width <= 4 || this.Height <= 4) return;
+        try
+        {
         wglMakeCurrent(hdc, hrc);
         int w = this.Width;
         int h = this.Height;
@@ -576,6 +578,11 @@ public class OpenGLRadarControl : Control
                     DebriefSample sFrom = null, sTo = null;
                     if (!string.IsNullOrEmpty(bm.FromId) && liveById.TryGetValue(bm.FromId, out sFrom))
                     { fx = sFrom.X; fy = sFrom.Y; }
+                    else if (bm.Kind != "JAMMER" && !string.IsNullOrEmpty(bm.FromId))
+                    {
+                        // Источник луча мёртв — пунктир в устаревшую точку не рисуем.
+                        continue;
+                    }
                     double fz = sFrom != null ? sFrom.Alt : s.GetGroundAltitudeAt(fx, fy);
                     double tz = fz;
                     if (bm.Kind == "JAMMER")
@@ -760,6 +767,11 @@ public class OpenGLRadarControl : Control
                     {
                         if (!string.IsNullOrEmpty(bm.ToId) && liveById.TryGetValue(bm.ToId, out sTo))
                         { tx = sTo.X; ty = sTo.Y; tz = sTo.Alt; }
+                        else if (!string.IsNullOrEmpty(bm.ToId))
+                        {
+                            // Цель луча мёртва — пунктир «в никуда» не рисуем.
+                            continue;
+                        }
                         glEnable(GL_LINE_STIPPLE);
                         glLineStipple(2, animPattern);
                         glLineWidth(2.0f);
@@ -787,7 +799,7 @@ public class OpenGLRadarControl : Control
                             glEnd();
                         }
                         // Подпись дистанции и TTI на лучах ракет [АРЛ]
-                        if (bm.FromName.StartsWith("[АРЛ]"))
+                        if (!string.IsNullOrEmpty(bm.FromName) && bm.FromName.StartsWith("[АРЛ]"))
                         {
                             double distM = Math.Sqrt(Math.Pow(tx - fx, 2) + Math.Pow(ty - fy, 2) + Math.Pow(tz - fz, 2));
                             int tti = Math.Max(1, (int)Math.Round(distM / 850.0));
@@ -1045,6 +1057,12 @@ public class OpenGLRadarControl : Control
             UpdateJamContinuous(s, curT, isPlaying, showBeams, camXM, camYM, camAltM, liveById);
         }
         SwapBuffers(hdc);
+        }
+        catch
+        {
+            // Исключение при отрисовке (например, битые данные повтора) не должно ронять UI.
+            try { wglMakeCurrent(IntPtr.Zero, IntPtr.Zero); } catch { }
+        }
     }
     // Аэродром на рельефе: ВПП, осевая, пороги и перрон. Данных о полосах в реплее нет,
     // поэтому геометрия типовая, а положение и курс берутся из восстановленных точек взлёта/посадки.
@@ -1053,6 +1071,10 @@ public class OpenGLRadarControl : Control
         if (s.Airfields == null || s.Airfields.Count == 0) return;
         foreach (MapPoiMarker af in s.Airfields)
         {
+            byte ar = 200, ag = 210, ab = 205;   // нейтральная (серая)
+            if (af.Coalition == "Enemies") { ar = 255; ag = 155; ab = 35; }
+            else if (af.Coalition == "Allies") { ar = 0; ag = 191; ab = 255; }
+
             double hdg = af.Heading * Math.PI / 180.0;
             double fwdX = Math.Sin(hdg), fwdZ = -Math.Cos(hdg);
             double rgtX = Math.Cos(hdg), rgtZ = Math.Sin(hdg);
@@ -1082,7 +1104,7 @@ public class OpenGLRadarControl : Control
             glEnd();
 
             glLineWidth(1.4f);
-            glColor4ub(200, 210, 205, 175);
+            glColor4ub(ar, ag, ab, 190);
             glBegin(GL_LINE_LOOP);
             glVertex3d(p0[0], p0[1], p0[2]);
             glVertex3d(p1[0], p1[1], p1[2]);
@@ -1092,7 +1114,7 @@ public class OpenGLRadarControl : Control
 
             // Осевая линия пунктиром
             glLineWidth(1.2f);
-            glColor4ub(235, 240, 235, 160);
+            glColor4ub(ar, ag, ab, 175);
             glBegin(GL_LINES);
             for (int seg = 0; seg < 12; seg++)
             {
@@ -1107,7 +1129,7 @@ public class OpenGLRadarControl : Control
 
             // Пороги (по три полосы с каждого торца)
             glLineWidth(1.6f);
-            glColor4ub(240, 245, 240, 190);
+            glColor4ub(ar, ag, ab, 205);
             glBegin(GL_LINES);
             for (int k = -1; k <= 1; k++)
             {
@@ -1723,8 +1745,8 @@ public class OpenGLRadarControl : Control
                     if (ev.Kind == "RADAR" || ev.Kind == "JAMMER" || ev.Kind == "INFO") continue;
 
                     bool isThreatOnMe = (ev.Kind == "THREAT" || ev.Kind == "RWR" || ev.Kind == "MISTAKE") &&
-                                        (ev.Title.IndexOf("по вам", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                         ev.Title.IndexOf("ваш", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        ((ev.Title ?? "").IndexOf("по вам", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                         (ev.Title ?? "").IndexOf("ваш", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                          ev.Severity == "CRITICAL");
                     if (isThreatOnMe) latestThreatBanner = ev.Title;
 
@@ -1824,7 +1846,7 @@ public class OpenGLRadarControl : Control
                 if (activeTracked != null)
                 {
                     foreach (TacticalBeam bm in s.Beams)
-                        if (curT >= bm.StartTime && curT <= bm.EndTime && bm.Kind == "RWR_SPIKE" && bm.ToName.Equals(activeTracked.Name, StringComparison.OrdinalIgnoreCase))
+                        if (curT >= bm.StartTime && curT <= bm.EndTime && bm.Kind == "RWR_SPIKE" && bm.ToName != null && bm.ToName.Equals(activeTracked.Name, StringComparison.OrdinalIgnoreCase))
                             activeRwr++;
                 }
                 bool hasAlert = activeRwr > 0 || !string.IsNullOrEmpty(latestThreatBanner);
